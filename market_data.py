@@ -7,8 +7,8 @@ where unix_timestamp is the window start time (UTC, rounded to 5-min boundaries)
 Each event has one market with two tokens:
   clobTokenIds[0] = UP token
   clobTokenIds[1] = DOWN token
-  outcomePrices[0] = current UP price = q^(w)
-  outcomePrices[1] = current DOWN price = 1 - q^(w)
+  outcomePrices[] = stale/initial price (DO NOT USE for live trading)
+  Live price: fetch from CLOB /midpoint?token_id=...
 """
 
 import time
@@ -126,9 +126,24 @@ class MarketDataClient:
             self._cache = new_cache
             self._cache_ts = ts
 
+    def _fetch_midpoint(self, token_id: str) -> Optional[float]:
+        """Fetch live order-book midpoint from CLOB for a single token."""
+        try:
+            resp = requests.get(
+                f"{self.clob_host}/midpoint",
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            mid = resp.json().get("mid")
+            return float(mid) if mid is not None else None
+        except Exception as e:
+            logger.warning(f"CLOB midpoint fetch failed for {token_id[:12]}...: {e}")
+            return None
+
     def get_all_prices(self) -> dict[str, dict]:
         """
-        Return current prices for all assets.
+        Return live CLOB midpoint prices for all assets.
 
         Returns dict keyed by asset name e.g. "BTC-UP", "BTC-DOWN":
           {
@@ -137,26 +152,36 @@ class MarketDataClient:
             ...
           }
 
-        Prices come directly from outcomePrices in the gamma API —
-        no separate CLOB midpoint call needed.
+        Token IDs come from gamma API (refreshed on window rollover).
+        Prices are fetched live from CLOB /midpoint — not stale gamma outcomePrices.
         """
         self._refresh_if_needed()
         result = {}
         for coin, market in self._cache.items():
             if market.get("closed") or not market.get("active"):
                 continue
+
+            up_mid = self._fetch_midpoint(market["up_token_id"])
+            if up_mid is None:
+                logger.debug(f"{coin}-UP: no CLOB midpoint — skip")
+                continue
+
+            # DOWN price = 1 - UP price (binary market constraint)
+            down_mid = round(1.0 - up_mid, 4)
+
             result[f"{coin}-UP"] = {
-                "q": market["up_price"],
+                "q": up_mid,
                 "token_id": market["up_token_id"],
                 "coin": coin,
                 "side": "UP",
             }
             result[f"{coin}-DOWN"] = {
-                "q": market["down_price"],
+                "q": down_mid,
                 "token_id": market["down_token_id"],
                 "coin": coin,
                 "side": "DOWN",
             }
+            time.sleep(0.05)  # avoid hammering CLOB
         return result
 
     def seconds_until_next_window(self) -> int:
