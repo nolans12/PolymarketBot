@@ -14,6 +14,7 @@ Monitor:
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -33,20 +34,33 @@ def setup_logging(log_file: str) -> None:
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     fmt = "%(asctime)s | %(levelname)-5s | %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        datefmt=datefmt,
-        handlers=[
-            logging.FileHandler(log_file, mode="a"),
-            logging.StreamHandler(sys.stdout),
-        ],
+    # Rotate at 20 MB, keep 7 backups (~140 MB max for bot.log)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=20 * 1024 * 1024, backupCount=7, encoding="utf-8"
     )
+    file_handler.setFormatter(logging.Formatter(fmt, datefmt))
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter(fmt, datefmt))
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 
 
 def open_jsonl(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return open(path, "a", buffering=1)  # line-buffered: each write flushes
+
+
+def rotate_jsonl(path: str, max_bytes: int = 50 * 1024 * 1024, backups: int = 3) -> None:
+    """Rotate a JSONL file if it exceeds max_bytes. Called at bot startup."""
+    if not os.path.exists(path) or os.path.getsize(path) < max_bytes:
+        return
+    for i in range(backups - 1, 0, -1):
+        src = f"{path}.{i}"
+        dst = f"{path}.{i+1}"
+        if os.path.exists(src):
+            os.replace(src, dst)
+    os.replace(path, f"{path}.1")
+    logger_pre = logging.getLogger(__name__)
+    logger_pre.info(f"Rotated {path} (exceeded {max_bytes // 1024 // 1024} MB)")
 
 
 def write_jsonl(fh, row: dict) -> None:
@@ -133,6 +147,10 @@ def main():
     open_orders: dict[str, str] = {}
     scan_count  = 0
     trade_count = 0
+
+    # Rotate large JSONL files before opening (50 MB cap, 3 backups each)
+    rotate_jsonl(scan_log_path)
+    rotate_jsonl(wallet_log_path)
 
     scan_fh   = open_jsonl(scan_log_path)
     trade_fh  = open_jsonl(trade_log_path)
