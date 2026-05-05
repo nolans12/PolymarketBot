@@ -92,12 +92,14 @@ class MarkovEstimator:
         # p_jj: self-transition probability of current state
         p_jj = float(transition_matrix[current_state, current_state])
 
-        # p_mine: expected next-state probability, computed as the
-        # probability-weighted midpoint of the distribution over next states
-        # given we are in current_state now.
-        next_state_dist = transition_matrix[current_state]  # shape (N_STATES,)
-        midpoints = np.array([state_midpoint(s) for s in range(N_STATES)])
-        p_mine = float(np.dot(next_state_dist, midpoints))
+        # p_mine: Markov-adjusted true probability.
+        # The bin midpoint is the Markov chain's best estimate of the true
+        # probability given we are in this state. q^(w) lands anywhere within
+        # the bin; p_mine anchors to the midpoint, creating a delta = p_mine - q
+        # that is positive when q is below mid (market underpricing) and negative
+        # when q is above mid (market overpricing). Entry fires only when
+        # p_jj is high (state is persistent) AND delta >= epsilon (real edge).
+        p_mine = state_midpoint(current_state)
 
         logger.debug(
             f"Markov | state={current_state} | q={q_current:.3f} | "

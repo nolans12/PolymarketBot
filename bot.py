@@ -11,6 +11,7 @@ Monitor:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -19,8 +20,33 @@ import time
 import config
 from market_data import MarketDataClient
 from markov import MarkovEstimator
-from model import evaluate
+from model import evaluate, classify_mode
 from executor import Executor
+
+
+def open_scan_log(log_file: str):
+    scan_path = log_file.replace(".log", "_scans.jsonl")
+    os.makedirs(os.path.dirname(scan_path), exist_ok=True)
+    return open(scan_path, "a", buffering=1)  # line-buffered
+
+
+def log_scan(fh, ts: float, asset: str, q: float, p_mine: float, p_jj: float,
+             delta: float, obs: int, secs_left: int, signal: bool,
+             mode, wallet: float) -> None:
+    row = {
+        "ts": round(ts, 3),
+        "asset": asset,
+        "q": round(q, 4),
+        "p_mine": round(p_mine, 4),
+        "p_jj": round(p_jj, 4),
+        "delta": round(delta, 4),
+        "obs": obs,
+        "secs_left": secs_left,
+        "signal": signal,
+        "mode": mode,
+        "wallet": round(wallet, 2),
+    }
+    fh.write(json.dumps(row) + "\n")
 
 
 def setup_logging(log_file: str) -> None:
@@ -103,6 +129,8 @@ def main():
     scan_count = 0
     trade_count = 0
 
+    scan_log = open_scan_log(config.LOG_FILE)
+    logger.info(f"Scan log: {config.LOG_FILE.replace('.log', '_scans.jsonl')}")
     logger.info("Entering main loop. Ctrl+C to stop.")
 
     while True:
@@ -143,9 +171,16 @@ def main():
                     wallet_balance_usd=wallet_balance,
                 )
 
+                delta = p_mine - q
+                mode = classify_mode(q)
+                log_scan(
+                    scan_log, time.time(), asset, q, p_mine, p_jj,
+                    delta, estimators[asset].n_observations, secs_left,
+                    signal is not None, mode, wallet_balance,
+                )
                 logger.info(
                     f"SCAN | {asset:<10} | q={q:.3f} | p_mine={p_mine:.3f} | "
-                    f"Δ={p_mine - q:+.3f} | p_jj={p_jj:.3f} | "
+                    f"Δ={delta:+.3f} | p_jj={p_jj:.3f} | "
                     f"wallet=${wallet_balance:.2f} | obs={estimators[asset].n_observations} | "
                     f"win={secs_left}s | {'SIGNAL' if signal else 'no-entry'}"
                 )
@@ -199,6 +234,7 @@ def main():
             logger.info("Sleeping 60s before retry...")
             time.sleep(60)
 
+    scan_log.close()
     logger.info(f"Bot stopped. scans={scan_count} | trades={trade_count}")
 
 
