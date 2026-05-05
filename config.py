@@ -89,8 +89,11 @@ SIZE_MAX = 800.0
 # Bot operational parameters
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
-DRY_RUN       = os.getenv("DRY_RUN", "false").lower() == "true"
+POLL_INTERVAL     = int(os.getenv("POLL_INTERVAL", "5"))
+DRY_RUN           = os.getenv("DRY_RUN", "false").lower() == "true"
+# Used when get_balance_allowance returns 0 (funds not yet in CLOB layer).
+# Set to your actual deposited balance in USD. 0 = disabled (bot skips loops).
+FALLBACK_BALANCE  = float(os.getenv("FALLBACK_BALANCE", "0"))
 
 ASSETS = [
     "BTC-UP",

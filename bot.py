@@ -187,6 +187,12 @@ def main():
                 # Wallet balance
                 # ----------------------------------------------------------
                 wallet_balance = executor.get_wallet_balance()
+                if wallet_balance <= 0 and config.FALLBACK_BALANCE > 0:
+                    logger.warning(
+                        f"Wallet balance API returned 0 — using fallback ${config.FALLBACK_BALANCE:.2f}. "
+                        f"Deposit USDC to Polymarket to fix this."
+                    )
+                    wallet_balance = config.FALLBACK_BALANCE
                 write_jsonl(wallet_fh, {
                     "ts": round(loop_start, 3),
                     "wallet_usd": round(wallet_balance, 4),
@@ -195,7 +201,7 @@ def main():
                 })
 
                 if wallet_balance <= 0 and not dry_run:
-                    logger.warning("Wallet balance is 0 or unavailable — skipping this loop")
+                    logger.warning("Wallet balance is 0 and no fallback set — skipping this loop")
                     time.sleep(config.POLL_INTERVAL)
                     continue
 
