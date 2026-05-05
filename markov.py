@@ -15,16 +15,12 @@ import numpy as np
 import logging
 from collections import deque
 
+import config
+
 logger = logging.getLogger(__name__)
 
-# State bin edges — covers the full operating range of the model.
-# States outside [0.05, 0.98] are considered inactive (no trade).
-BIN_EDGES = np.array([
-    0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35,
-    0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
-    0.80, 0.85, 0.90, 0.95, 1.00
-])
-N_STATES = len(BIN_EDGES) - 1  # 20 states
+BIN_EDGES = np.array(config.MARKOV_BIN_EDGES)
+N_STATES  = len(BIN_EDGES) - 1
 
 
 def digitize(q: float) -> int:
@@ -53,7 +49,7 @@ class MarkovEstimator:
         # Maximum observations in the rolling window
         max_obs = window_seconds // poll_interval + 1
         self._history: deque[float] = deque(maxlen=max_obs)
-        self._min_obs = 10  # need at least this many observations to estimate
+        self._min_obs = config.MARKOV_MIN_OBSERVATIONS
 
     def update(self, q: float) -> None:
         """Add a new market price observation."""
