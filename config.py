@@ -89,7 +89,7 @@ SIZE_MAX = 800.0
 # Bot operational parameters
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 DRY_RUN       = os.getenv("DRY_RUN", "false").lower() == "true"
 
 ASSETS = [
