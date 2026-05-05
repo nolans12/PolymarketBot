@@ -91,15 +91,13 @@ def main():
         for asset in config.ASSETS
     }
 
-    logger.info("Discovering 5-minute market token IDs...")
-    token_ids = market_client.find_5min_markets()
-    if not token_ids:
-        logger.error(
-            "No 5-minute markets found. Run: python3 market_data.py --list\n"
-            "You may need to manually add token IDs to config.py."
-        )
+    # Verify markets are discoverable at startup
+    logger.info("Verifying 5-minute markets are available...")
+    startup_prices = market_client.get_all_prices()
+    if not startup_prices:
+        logger.error("No 5-minute markets found at startup. Check Polymarket API.")
         sys.exit(1)
-    logger.info(f"Found {len(token_ids)} markets: {list(token_ids.keys())}")
+    logger.info(f"Markets ready: {list(startup_prices.keys())}")
 
     open_orders: dict[str, str] = {}
     scan_count = 0
@@ -119,13 +117,18 @@ def main():
                 time.sleep(config.POLL_INTERVAL)
                 continue
 
-            midpoints = market_client.get_all_midpoints(token_ids)
+            # Prices and token IDs come together — window rollover handled inside
+            all_prices = market_client.get_all_prices()
+            secs_left = market_client.seconds_until_next_window()
 
             for asset in config.ASSETS:
-                q = midpoints.get(asset)
-                if q is None:
-                    logger.debug(f"SCAN | {asset} | no price — skip")
+                info = all_prices.get(asset)
+                if info is None:
+                    logger.debug(f"SCAN | {asset} | no market data — skip")
                     continue
+
+                q = info["q"]
+                token_id = info["token_id"]
 
                 estimators[asset].update(q)
                 p_jj, p_mine = estimators[asset].estimate(q)
@@ -144,7 +147,7 @@ def main():
                     f"SCAN | {asset:<10} | q={q:.3f} | p_mine={p_mine:.3f} | "
                     f"Δ={p_mine - q:+.3f} | p_jj={p_jj:.3f} | "
                     f"wallet=${wallet_balance:.2f} | obs={estimators[asset].n_observations} | "
-                    f"{'SIGNAL' if signal else 'no-entry'}"
+                    f"win={secs_left}s | {'SIGNAL' if signal else 'no-entry'}"
                 )
 
                 if signal is None:
@@ -152,11 +155,6 @@ def main():
 
                 if asset in open_orders:
                     logger.info(f"SKIP | {asset} | open order already exists: {open_orders[asset]}")
-                    continue
-
-                token_id = token_ids.get(asset)
-                if not token_id:
-                    logger.warning(f"SKIP | {asset} | no token_id")
                     continue
 
                 if dry_run:

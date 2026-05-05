@@ -1,123 +1,169 @@
 """
-market_data.py — Polymarket CLOB market discovery and price polling.
+market_data.py — Polymarket 5-minute crypto market discovery and price polling.
 
-Responsibilities:
-- Find the correct token IDs for BTC/ETH/SOL/XRP 5-minute up/down markets
-- Poll current mid-market price (q^w) for each token
-- Cache token IDs so we don't re-fetch the market list every poll cycle
+Markets follow the slug pattern: {coin}-updown-5m-{unix_timestamp}
+where unix_timestamp is the window start time (UTC, rounded to 5-min boundaries).
+
+Each event has one market with two tokens:
+  clobTokenIds[0] = UP token
+  clobTokenIds[1] = DOWN token
+  outcomePrices[0] = current UP price = q^(w)
+  outcomePrices[1] = current DOWN price = 1 - q^(w)
 """
 
-import requests
-import logging
 import time
+import logging
+import json
+import requests
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 
-# Known 5-minute crypto market keywords to match against market descriptions.
-# Polymarket market slugs/questions change over time — we search by keyword.
-ASSET_KEYWORDS = {
-    "BTC-UP":   ["btc", "bitcoin", "up", "higher", "above"],
-    "BTC-DOWN": ["btc", "bitcoin", "down", "lower", "below"],
-    "ETH-UP":   ["eth", "ethereum", "up", "higher", "above"],
-    "ETH-DOWN": ["eth", "ethereum", "down", "lower", "below"],
-    "SOL-UP":   ["sol", "solana", "up", "higher", "above"],
-    "SOL-DOWN": ["sol", "solana", "down", "lower", "below"],
-    "XRP-UP":   ["xrp", "ripple", "up", "higher", "above"],
-    "XRP-DOWN": ["xrp", "ripple", "down", "lower", "below"],
+COIN_SLUGS = {
+    "BTC": "btc",
+    "ETH": "eth",
+    "SOL": "sol",
+    "XRP": "xrp",
 }
+
+WINDOW_SECONDS = 300  # 5 minutes
+
+
+def current_window_ts() -> int:
+    """Return the Unix timestamp of the current 5-min window start."""
+    now = int(time.time())
+    return now - (now % WINDOW_SECONDS)
+
+
+def next_window_ts() -> int:
+    return current_window_ts() + WINDOW_SECONDS
+
+
+def fetch_market(coin: str, window_ts: int) -> Optional[dict]:
+    """
+    Fetch a single 5-min market event from the gamma API.
+    Returns the parsed market dict with token IDs and prices, or None.
+    """
+    slug = f"{COIN_SLUGS[coin]}-updown-5m-{window_ts}"
+    try:
+        resp = requests.get(
+            f"{GAMMA_API}/events",
+            params={"slug": slug},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+        if not events:
+            return None
+
+        event = events[0]
+        markets = event.get("markets", [])
+        if not markets:
+            return None
+
+        m = markets[0]
+        token_ids = json.loads(m.get("clobTokenIds", "[]"))
+        outcome_prices = json.loads(m.get("outcomePrices", "[]"))
+        outcomes = json.loads(m.get("outcomes", "[]"))
+
+        if len(token_ids) < 2 or len(outcome_prices) < 2:
+            return None
+
+        # outcomes[0] = "Up", outcomes[1] = "Down"
+        up_idx = 0 if outcomes[0].lower() == "up" else 1
+        down_idx = 1 - up_idx
+
+        return {
+            "coin": coin,
+            "window_ts": window_ts,
+            "slug": slug,
+            "up_token_id": token_ids[up_idx],
+            "down_token_id": token_ids[down_idx],
+            "up_price": float(outcome_prices[up_idx]),    # q^(w) for UP
+            "down_price": float(outcome_prices[down_idx]), # q^(w) for DOWN
+            "end_date": m.get("endDate"),
+            "active": m.get("active", False),
+            "closed": m.get("closed", False),
+            "condition_id": m.get("conditionId"),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to fetch {coin} window {window_ts}: {e}")
+        return None
 
 
 class MarketDataClient:
+    """
+    Fetches and caches the current 5-minute markets for all coins.
+    Automatically detects window rollovers and re-fetches token IDs.
+    """
+
     def __init__(self, clob_host: str = CLOB_HOST):
         self.clob_host = clob_host
-        self._token_cache: dict[str, str] = {}  # asset_name -> token_id
+        self._cache: dict[str, dict] = {}   # coin -> market dict
+        self._cache_ts: int = 0             # window_ts these were fetched for
 
-    def list_markets(self, next_cursor: str = "") -> dict:
-        url = f"{self.clob_host}/markets"
-        params = {"next_cursor": next_cursor} if next_cursor else {}
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+    def _refresh_if_needed(self) -> None:
+        """Re-fetch markets if the window has rolled over."""
+        ts = current_window_ts()
+        if ts != self._cache_ts:
+            logger.info(f"New 5-min window: {ts}. Fetching market token IDs...")
+            new_cache = {}
+            for coin in COIN_SLUGS:
+                market = fetch_market(coin, ts)
+                if market:
+                    new_cache[coin] = market
+                    logger.info(
+                        f"  {coin}: up_token={market['up_token_id'][:12]}... "
+                        f"up_price={market['up_price']:.3f}"
+                    )
+                else:
+                    logger.warning(f"  {coin}: market not found for window {ts}")
+                time.sleep(0.1)
+            self._cache = new_cache
+            self._cache_ts = ts
 
-    def find_5min_markets(self) -> dict[str, str]:
+    def get_all_prices(self) -> dict[str, dict]:
         """
-        Search all active Polymarket markets for 5-minute crypto up/down markets.
-        Returns a dict of asset_name -> token_id for YES outcome tokens.
-        Run this once at startup (or with --list flag) to populate the token cache.
+        Return current prices for all assets.
+
+        Returns dict keyed by asset name e.g. "BTC-UP", "BTC-DOWN":
+          {
+            "BTC-UP":   {"q": 0.595, "token_id": "...", "coin": "BTC", "side": "UP"},
+            "BTC-DOWN": {"q": 0.405, "token_id": "...", "coin": "BTC", "side": "DOWN"},
+            ...
+          }
+
+        Prices come directly from outcomePrices in the gamma API —
+        no separate CLOB midpoint call needed.
         """
-        found: dict[str, str] = {}
-        next_cursor = ""
-
-        while True:
-            data = self.list_markets(next_cursor)
-            markets = data.get("data", [])
-
-            for market in markets:
-                question = (market.get("question") or "").lower()
-                description = (market.get("description") or "").lower()
-                text = question + " " + description
-
-                # Only look at 5-minute markets
-                if "5" not in text and "five" not in text and "5-min" not in text:
-                    continue
-                if "minute" not in text and "min" not in text:
-                    continue
-
-                tokens = market.get("tokens", [])
-                for asset_name, keywords in ASSET_KEYWORDS.items():
-                    if asset_name in found:
-                        continue
-                    coin_kw = keywords[:2]   # e.g. ["btc", "bitcoin"]
-                    direction_kw = keywords[2:]  # e.g. ["up", "higher", "above"]
-                    if (any(k in text for k in coin_kw) and
-                            any(k in text for k in direction_kw)):
-                        # Take the YES token
-                        for token in tokens:
-                            outcome = (token.get("outcome") or "").lower()
-                            if outcome in ("yes", "up", "higher", "above"):
-                                found[asset_name] = token["token_id"]
-                                logger.info(f"Found {asset_name}: token_id={token['token_id']} | {question[:80]}")
-                                break
-
-            next_cursor = data.get("next_cursor", "")
-            if not next_cursor or not markets:
-                break
-
-        return found
-
-    def get_midpoint(self, token_id: str) -> Optional[float]:
-        """
-        Fetch the current best-bid / best-ask midpoint for a token.
-        This is q^(w) — the market-implied probability.
-        Returns None if the orderbook is empty or unreachable.
-        """
-        url = f"{self.clob_host}/midpoint"
-        try:
-            resp = requests.get(url, params={"token_id": token_id}, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            mid = data.get("mid")
-            if mid is None:
-                return None
-            return float(mid)
-        except Exception as e:
-            logger.warning(f"Failed to fetch midpoint for {token_id}: {e}")
-            return None
-
-    def get_all_midpoints(self, token_ids: dict[str, str]) -> dict[str, Optional[float]]:
-        """
-        Fetch midpoints for all tracked assets.
-        token_ids: dict of asset_name -> token_id
-        Returns: dict of asset_name -> q^(w) (or None if unavailable)
-        """
+        self._refresh_if_needed()
         result = {}
-        for asset_name, token_id in token_ids.items():
-            result[asset_name] = self.get_midpoint(token_id)
-            time.sleep(0.1)  # small delay to avoid hammering the API
+        for coin, market in self._cache.items():
+            if market.get("closed") or not market.get("active"):
+                continue
+            result[f"{coin}-UP"] = {
+                "q": market["up_price"],
+                "token_id": market["up_token_id"],
+                "coin": coin,
+                "side": "UP",
+            }
+            result[f"{coin}-DOWN"] = {
+                "q": market["down_price"],
+                "token_id": market["down_token_id"],
+                "coin": coin,
+                "side": "DOWN",
+            }
         return result
+
+    def seconds_until_next_window(self) -> int:
+        """How many seconds until the current window expires."""
+        now = int(time.time())
+        window_end = current_window_ts() + WINDOW_SECONDS
+        return max(0, window_end - now)
 
 
 if __name__ == "__main__":
@@ -125,16 +171,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
     client = MarketDataClient()
+    prices = client.get_all_prices()
+    secs = client.seconds_until_next_window()
 
-    if "--list" in sys.argv:
-        print("Searching for 5-minute crypto markets on Polymarket...")
-        markets = client.find_5min_markets()
-        print(f"\nFound {len(markets)} markets:")
-        for name, token_id in markets.items():
-            print(f"  {name}: {token_id}")
-        if not markets:
-            print("No markets found. The market slugs may have changed.")
-            print("Try: GET https://clob.polymarket.com/markets and search manually.")
-    else:
-        print("Usage: python3 market_data.py --list")
-        print("Lists all discovered 5-minute crypto markets and their token IDs.")
+    print(f"\nCurrent 5-minute window prices ({secs}s remaining):\n")
+    print(f"{'Asset':<12} {'q^(w)':>8}  Token ID (first 20 chars)")
+    print("-" * 55)
+    for asset, info in sorted(prices.items()):
+        print(f"{asset:<12} {info['q']:>8.4f}  {info['token_id'][:20]}...")
