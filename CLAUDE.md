@@ -1,4 +1,4 @@
-# CLAUDE.md — Polymarket 5-Minute Crypto Up/Down Trading Bot
+# CLAUDE.md — Polymarket 5-Minute Crypto Lag-Arbitrage Bot
 
 > **Status:** Planning / pre-implementation. This document is the source of truth for the project's design, architecture, and reasoning. Read it end-to-end before generating any code.
 
@@ -6,22 +6,28 @@
 
 ## 1. Project goal
 
-Build an automated trading bot that takes positions in Polymarket's 5-minute "Bitcoin Up or Down" and "Ethereum Up or Down" binary prediction markets. The bot generates an independent probability estimate `p` of the Yes (Up) outcome and bets whenever the spread between `p` and the Polymarket implied probability `q` exceeds a tier threshold, sized by a tiered Kelly fraction of bankroll.
+Build an automated trading bot that takes positions in Polymarket's 5-minute "Bitcoin Up or Down" and "Ethereum Up or Down" binary prediction markets by exploiting the lag between Coinbase spot price movements and Polymarket order-book repricing. The bot enters when Polymarket has not yet caught up to where Coinbase says fair value is, and exits when Polymarket has caught up — collecting the lag-close as profit, regardless of how the underlying window resolves.
 
-**Two strategies are first-class concerns** and must both be supported by the live data collection and evaluated head-to-head in the 24-hour dry-run backtest:
+**The strategy is cash-out lag arbitrage. There is one model, one edge calculation, one entry rule, one exit rule.**
 
-- **Strategy A — Hold to resolution.** Bet when edge appears, hold until window resolution at T+0. Edge thesis: model probability is more accurate than market probability for the close-time outcome.
-- **Strategy B — Cash-out scalping.** Bet when Polymarket lags spot, sell back into the market when Polymarket catches up. Edge thesis: Polymarket order book takes seconds-to-tens-of-seconds to reprice after Coinbase moves; that lag is exploitable round-trip.
+**Edge thesis.** Coinbase's order book is the leading indicator. Polymarket's CLOB takes some number of seconds to reprice after Coinbase moves. During that interval, Polymarket's quoted probability differs from the spot-implied probability by an amount that exceeds round-trip costs (entry fee + entry slippage + exit fee + exit slippage + spread). When that condition holds, we enter. When the lag closes, we exit. This is the entire bot.
 
-Phase 1 is read-only. We collect 24 hours of tick-level data, run both strategies as hypotheticals against the logged data, and compare which performed better before committing real capital.
+**The bot's job, distilled to one sentence:** *every 10 seconds, compute a single number — the net edge `delta` in probability points after fees and slippage — and feed that number into the tiered Kelly table to produce a bet size.* If `delta` is below the lowest tier threshold, abstain. Otherwise enter at the prescribed size and exit when `delta` collapses (lag closed) or inverts (thesis broken).
 
-**Hard constraint:** Every trade decision is reducible to "model probability `p`, market price `q`, edge `delta = p − q` net of fees and slippage clears tier T's threshold, bet wallet fraction prescribed by tier T." This is true under both strategies; the strategies differ only in *exit* logic and in *which `p` is computed* (resolution probability for A, near-term lag-arb fair value for B).
+**Why not Black-Scholes binary?** Black-Scholes prices an option by assuming GBM with volatility σ; it answers "what's the no-arbitrage probability the underlying ends above K at horizon τ?" That's a forecasting question. We're not forecasting — we're predicting where Polymarket's *quote* will be in N seconds based on where Coinbase's *spot* is right now. That's a regression problem on (Polymarket price) vs (lagged spot features), and modeling it as such is more honest, more accurate, and removes an entire layer of estimation noise (volatility) from the critical path.
+
+**Why not pure latency arbitrage at sub-second timescales?** Polygon-validator-adjacent bots already own that niche. Our edge window is 10-90 seconds, which is achievable with normal infrastructure but invisible to traders who poll Polymarket manually.
+
+Phase 1 is read-only. We collect 24 hours of tick-level data, fit and validate the regression, simulate the strategy across a sweep of exit-rule parameters, and only commit real capital after verifying that the edge actually realizes as P&L.
+
+**Hard constraint.** Every entry decision is reducible to: "regression-predicted settled probability `q_settled`, market price `q_actual` at Polymarket ask, edge `delta = |q_settled − q_actual| − fee − slippage` clears the tier threshold, bet wallet fraction prescribed by Kelly tier T." Every exit decision is reducible to: "Polymarket has caught up (`delta` has compressed below the lag-close threshold → take profit), or spot reversed (`delta` has inverted by more than the stop threshold → cut loss), or τ is small enough to default to resolution."
 
 **Non-goals:**
 
 - We are not building a market-making bot. No quoting both sides.
-- We are not chasing sub-second latency arbitrage. Polygon-validator-adjacent bots already own that niche.
+- We are not chasing sub-second latency arbitrage.
 - We are not building anything that requires placing or cancelling orders faster than ~1 second end-to-end.
+- We are not predicting BTC's close-time price. We are predicting Polymarket's *next several seconds* of quote movement.
 
 ---
 
@@ -35,75 +41,244 @@ Every 5 minutes, Polymarket opens a new market on each of `BTC`, `ETH`. The mark
 - Yes-share price `q ∈ [0, 1]` *is* the implied probability of Up.
 - Window slug is deterministic: `{asset}-updown-5m-{window_open_unix_ts}`.
 
-**Critical:** The strike `K` is the **Chainlink oracle's first observation at or after the window boundary**, not Coinbase or Binance spot at that instant. Subscribe to Polymarket's RTDS WebSocket `crypto_prices_chainlink` channel filtered to `btc/usd` (or `eth/usd`) and capture the first tick at or after each window-open timestamp. This is non-negotiable — wrong K destroys probability calculations near window close.
+**Critical:** The strike `K` is the **Chainlink oracle's first observation at or after the window boundary**, not Coinbase or Binance spot at that instant. Subscribe to Polymarket's RTDS WebSocket `crypto_prices_chainlink` channel filtered to `btc/usd` (or `eth/usd`) and capture the first tick at or after each window-open timestamp. This is non-negotiable — wrong K destroys the regression's K-relative features.
 
-**Cash-out is supported.** A Yes-share position can be exited at any time before window close by selling into the order book at the prevailing bid. This is what makes Strategy B viable.
+**Cash-out is supported.** A Yes-share position can be exited at any time before window close by selling into the order book at the prevailing bid. This is what makes the strategy viable. The exit price is set by the bid, not by resolution — we are exiting *into the market*, not *waiting for the oracle*.
 
 ---
 
-## 3. Two strategies, one decision loop
+## 3. The strategy
 
-The decision loop runs every 10 seconds. Both strategies share the same data inputs and the same edge-detection scaffolding. They diverge only in (a) which probability is being computed and (b) what the exit policy is.
+### 3.1 Conceptual model
 
-### 3.1 Strategy A — Hold to resolution
+Treat Coinbase as ground truth and Polymarket as a delayed function of Coinbase. At any moment `t`:
 
-- **Probability `p_A`:** the probability that the asset closes above K at window resolution, given current spot, time remaining, and volatility. Computed via Black-Scholes binary on midpoint spot.
-- **Entry condition:** edge `|p_A − q| > tier_floor(τ)` net of fees and slippage. One bet per window — once we have a position in this window, we don't add to it.
-- **Exit:** hold to resolution. P&L = (1 − bet_price) on win, −bet_price on loss, per dollar wagered.
-- **Best at:** small τ (high signal-to-noise on the close-time outcome); markets where mispricings persist to resolution.
-- **Failure mode:** at large τ, the model probability is fuzzy (GBM is wrong about crypto tails) and the bet is held through 4 minutes of unmodeled tail risk.
+- `q_actual_t` = what Polymarket *is* quoting (the Yes-share ask).
+- `q_settled_t` = what Polymarket *would* quote if it had finished digesting all spot moves up to time `t`.
+- `delta_t = q_settled_t − q_actual_t` (signed, on the side we're considering).
 
-### 3.2 Strategy B — Cash-out scalping (lag arbitrage)
+When `delta` is large and positive on the Up side, Polymarket is offering Up shares cheaper than fair value. We buy. Some seconds later, Polymarket's book updates to reflect the spot move, `q_actual` rises toward `q_settled`, the lag closes, and we sell back at the new (higher) market price.
 
-- **Probability `p_B`:** the probability that an idealized arbitrageur would assign right now if they had instant access to Coinbase's full microstructure. Computed via Black-Scholes binary on **microprice** (imbalance-weighted fair value) instead of midpoint, which captures impending midpoint movement that hasn't reached the trade tape yet. At small τ, microprice → spot price → near-deterministic outcome.
-- **Entry condition:** edge `|p_B − q| > tier_floor(τ)` net of fees and slippage. The thesis is that Polymarket will catch up to where Coinbase already is. One position per window per asset; do not flip sides.
-- **Exit:** **dynamic, not held to resolution.** Three exit triggers, whichever fires first:
-  1. **Lag closed:** Polymarket has caught up. Specifically, `|p_B − q| < lag_close_threshold` (e.g., 0.005). Sell back into the bid for realized round-trip profit.
-  2. **Lag widened against us / thesis broken:** spot reversed and `p_B` has moved decisively *against* our position, by more than `stop_threshold` (e.g., 0.03). Cut the loss.
-  3. **Resolution fallback:** if neither (1) nor (2) fires before τ < 10s, default to hold-to-resolution (the Strategy A exit). At small τ the lag-arb interpretation merges with the resolution interpretation anyway.
-- **Best at:** any τ where Polymarket lag is observable and round-trip costs (2× spread + 2× fee + 2× slippage) are smaller than raw edge.
-- **Failure mode:** every leg pays spread and fees, so the per-trip cost floor is ~2-6% of bet size; lag must exceed this to be net positive. Adverse selection at the moment of "lag closed" — many bots try to exit simultaneously, exit fills can be worse than entry.
+The model's job is to compute `q_settled_t` from observable spot data. That's what the lead-lag regression does.
 
-### 3.3 Decision loop (per 10s tick, both strategies in parallel)
+### 3.2 Why microprice, not midpoint
+
+The spot-side input we use is **microprice**, the imbalance-weighted fair value:
 
 ```
-1. Is there an active 5m market? If no, idle.
-2. Compute time_remaining τ = window_close - now.
-3. Read inputs (always):
-     - S_mid (Coinbase midpoint)
-     - microprice (Coinbase imbalance-weighted price)
-     - K (captured at window open from Chainlink RTDS)
-     - σ (per-second EWMA on midpoint log returns)
-     - Polymarket book: q_up_bid, q_up_ask, q_down_bid, q_down_ask
-4. Compute probabilities:
-     - p_A = black_scholes_binary(S_mid, K, σ, τ)
-     - p_B = black_scholes_binary(microprice, K, σ, τ)
-5. Compute edges (per side, per strategy):
-     - edge_A_up = p_A - q_up_ask - fee(q_up_ask) - slip
-     - edge_A_down = (1 - p_A) - q_down_ask - fee(q_down_ask) - slip
-     - edge_B_up = p_B - q_up_ask - fee(q_up_ask) - slip
-     - edge_B_down = (1 - p_B) - q_down_ask - fee(q_down_ask) - slip
-6. Apply microstructure adjustments (as logit-space additions to p_A and p_B):
-     OFI on Coinbase, Polymarket book imbalance, spot-PM lead-lag residual,
-     cross-asset BTC↔ETH momentum, multi-horizon momentum (5s/15s/30s).
-7. Resolve action per strategy independently:
-     For each strategy S in {A, B}:
-       If we already have an open position from S in this window:
-         (Strategy A) abstain on entry side; do nothing.
-         (Strategy B) re-evaluate exit conditions (3.2), close if triggered.
-       Else if max(edge_S_up, edge_S_down) > tier_floor(τ):
-         Mark as would-bet, compute size from Kelly tier table.
-       Else:
-         Abstain with reason.
-8. Persist decision row (one per 10s tick, with both strategies' would-be actions).
-9. (Phase 2 only) submit live orders for the strategy chosen as "live" in config.
+microprice = (best_bid × ask_size + best_ask × bid_size) / (bid_size + ask_size)
 ```
 
-In Phase 1 we never submit orders. Both strategies are simulated continuously and logged side-by-side in the same row, so backtest replay can compare them on identical data.
+When the bid is heavy, microprice is closer to the ask (next trade likely lifts the ask). When the ask is heavy, microprice is closer to the bid. This is the cleanest available proxy for "where is spot heading in the next few seconds" using only L1 book data.
 
-### 3.4 Tier floor by τ
+Using microprice rather than midpoint moves our spot signal forward in time by 1-10 seconds. That compounds with Polymarket's 30-90 second lag to produce a larger and earlier edge signal. Midpoint trails microprice; if we used midpoint we'd be racing other lag-arb bots that already use microprice, and we'd lose.
 
-Edge thresholds vary by time-to-close. Full Kelly tier table from the user's spec:
+### 3.3 The lead-lag regression — the only model
+
+We fit a logistic regression that predicts Polymarket's current Yes-share price from Coinbase spot history. The model's parameters are refit every 5 minutes on a rolling 4-hour window of recent (q, features) pairs.
+
+**Target:**
+
+```
+y_t = logit(q_actual_t)        where q_actual_t is the Polymarket Yes-ask at time t
+```
+
+**Features (window-aware — all referenced to the current window's strike K):**
+
+```
+x_now    = log(microprice_t      / K)
+x_15     = log(microprice_{t-15s} / K)
+x_30     = log(microprice_{t-30s} / K)
+x_45     = log(microprice_{t-45s} / K)
+x_60     = log(microprice_{t-60s} / K)
+x_90     = log(microprice_{t-90s} / K)
+x_120    = log(microprice_{t-120s}/ K)
+
+tau      = τ (seconds remaining in window)
+inv_sqrt_tau = 1/√(τ + 1)
+
+# Microstructure features
+ofi_30s          # spot OFI over last 30s
+pm_book_imbalance_t
+momentum_30s
+momentum_60s
+cross_asset_momentum_60s
+```
+
+**Model:**
+
+```
+logit(q_t) = α + Σ βₖ · x_k + γ · tau + δ · inv_sqrt_tau
+                + θ_OFI · ofi_30s + θ_PM · pm_book_imbalance + ...
+```
+
+Ridge regression, regularization chosen by cross-validation. ~12-15 features total, fit on ~14,400 samples per asset (4 hours × 3,600 seconds, downsampled to 1-second observations).
+
+**Two derived predictions are computed at every decision tick:**
+
+```
+# 1. What the model thinks Polymarket SHOULD be quoting given current data.
+#    Useful as a sanity check: if this is far from q_actual, something is wrong
+#    (regime shift, model is stale, feed problem, etc.)
+q_predicted = sigmoid(logit_q  given current-and-lagged spot)
+
+# 2. What Polymarket WILL quote once it has digested current spot.
+#    Substitute current microprice into every lookback slot:
+logit_q_settled = α + (Σ βₖ) · x_now
+                    + γ · tau + δ · inv_sqrt_tau
+                    + θ_OFI · ofi_30s + θ_PM · pm_book_imbalance + ...
+q_settled = sigmoid(logit_q_settled)
+```
+
+`q_settled` is our forecast of where Polymarket will arrive once it finishes processing current spot. This is the single most important output of the model.
+
+### 3.4 The lag is learned, not hard-coded
+
+The fitted β coefficients *are* the lag distribution. They tell us how much of Polymarket's current quote is explained by spot at each lookback horizon. Three patterns the data could show:
+
+**Polymarket is fast (no lag).** β₀ (the `x_now` coefficient) is dominant; β₁..β₆ are near zero. Polymarket's quote is best explained by spot right now — no lag to arbitrage. **Strategy thesis is dead.**
+
+**Polymarket lags by ~60 seconds.** β₀ is small, β₄ (the 60s-ago coefficient) is largest, neighboring β's decay smoothly on either side. This is the regime our strategy needs.
+
+**Mixed / no clear lag.** All β's moderate, no clear peak. Polymarket responds to a weighted average of recent spot. Strategy can still work but edge is smaller and noisier.
+
+We don't have to pick which regime is true — the regression tells us. For a single human-readable summary number, compute the β-weighted average lag at each refit:
+
+```
+estimated_lag_seconds = (15·β₁ + 30·β₂ + 45·β₃ + 60·β₄ + 90·β₅ + 120·β₆)
+                       / (β₁ + β₂ + β₃ + β₄ + β₅ + β₆)
+```
+
+This is logged every 5 minutes for human interpretability and dashboard display. The bot doesn't *use* it (it uses the full coefficient vector); the bot logs it. If `estimated_lag_seconds` drifts from 45s down to 12s over a few days, that's quantitative evidence that Polymarket's market makers are getting faster and our edge is shrinking.
+
+### 3.5 Computing the edge — the single number that drives all decisions
+
+Every 10 seconds, after computing `q_settled`, compute the edge on each side:
+
+```python
+edge_up_raw   = q_settled - q_up_ask                 # signed; positive = buy Up
+edge_down_raw = (1 - q_settled) - q_down_ask         # signed; positive = buy Down
+
+# Cost adjustments (per dollar bet):
+#   - Polymarket taker fee: Theta * p * (1-p) where Theta ≈ 0.05
+#   - Slippage: estimated from depth at our intended bet size
+fee_up   = THETA * q_up_ask   * (1 - q_up_ask)
+fee_down = THETA * q_down_ask * (1 - q_down_ask)
+slip_up   = estimate_slippage(asset, side='up',   size=intended_size)
+slip_down = estimate_slippage(asset, side='down', size=intended_size)
+
+edge_up_net   = edge_up_raw   - fee_up   - slip_up
+edge_down_net = edge_down_raw - fee_down - slip_down
+
+# The "edge" — a single signed number representing best opportunity this tick
+if edge_up_net > edge_down_net:
+    edge_signed = edge_up_net    # positive = buy Up
+    favored_side = 'up'
+else:
+    edge_signed = -edge_down_net # negative = buy Down (sign flipped for consistency)
+    favored_side = 'down'
+
+# The magnitude is what the Kelly tier table consumes
+edge_magnitude = abs(edge_signed)
+```
+
+`edge_magnitude` is the number that drives every entry decision. If `edge_magnitude < 0.02` (lowest tier floor), abstain. Otherwise look up the tier and bet the corresponding wallet fraction on `favored_side` at the corresponding ask price.
+
+### 3.6 Worked example
+
+To make the above concrete, consider a single 10-second decision tick on the BTC market:
+
+```
+Window opened 2 minutes ago.
+K = 100,000             (Chainlink at window open)
+τ = 180 seconds remaining
+
+Coinbase right now:
+  microprice_t = 100,500    (BTC is $500 above strike)
+  60 seconds ago, microprice was 100,200    ($200 above)
+  120 seconds ago, microprice was 100,050   ($50 above)
+
+Polymarket right now:
+  q_up_ask = 0.72           (market says 72% chance Up)
+
+The fitted regression has learned (over the last 4 hours of data):
+  - β₀ (current spot)   = 0.5
+  - β₄ (60s-ago spot)   = 4.2     <-- dominant coefficient, lag is ~60s
+  - β₆ (120s-ago spot)  = 1.8
+  - other β's smaller
+
+Step 1: Confirm Polymarket's current quote is consistent with the lagged history
+        (sanity check; q_predicted should be close to q_actual).
+
+  logit(q_predicted) = α + β₀·log(100500/100000) + β₄·log(100200/100000)
+                       + β₆·log(100050/100000) + ... + tau/microstructure terms
+                     ≈ logit(0.71)            (close to observed 0.72; model is healthy)
+
+Step 2: Compute q_settled by substituting current microprice into all lag slots.
+
+  logit(q_settled) = α + (β₀ + β₄ + β₆ + ...) · log(100500/100000)
+                     + tau/microstructure terms
+                   ≈ logit(0.79)            (this is where Polymarket is heading)
+
+Step 3: Compute edge.
+
+  edge_up_raw = 0.79 - 0.72 = 0.07           (7 cents per share)
+  fee_up      = 0.05 * 0.72 * 0.28 = 0.0101  (~1 cent)
+  slip_up     = ~0.005                       (depth-dependent estimate)
+
+  edge_up_net = 0.07 - 0.0101 - 0.005 = 0.0549
+
+  edge_magnitude = 0.0549
+  favored_side   = 'up'
+
+Step 4: Look up Kelly tier.
+
+  edge_magnitude = 0.0549 falls in the (0.04, 0.03) tier
+    -> bet 3% of wallet on Up at q_up_ask = 0.72
+
+Step 5: Place bet (Phase 2 only; in Phase 1 we just log the would-be entry).
+
+  If wallet = $1,000:
+    bet_size = $30
+    contracts = $30 / $0.72 = ~41.7 Up shares
+
+Step 6: Wait. Over the next ~60 seconds, if the lag closes as predicted:
+
+  q_up_ask rises from 0.72 → ~0.78 (catching up to where spot says it should be)
+  q_up_bid rises correspondingly to ~0.77
+
+  We sell our 41.7 shares at q_up_bid = 0.77:
+    gross proceeds = 41.7 * 0.77 = $32.11
+    exit fee = 0.05 * 0.77 * 0.23 * 32.11 = $0.28
+    entry fee already paid = 0.05 * 0.72 * 0.28 * 30 = $0.30
+    net P&L = 32.11 - 30 - 0.28 - 0.30 = $1.53
+
+  Realized return: $1.53 / $30 = 5.1% on the trade.
+```
+
+The trade made money because Polymarket caught up to spot, regardless of whether BTC ends up above 100,000 at T+0. **That's the entire point of the strategy.** The over/under outcome at resolution doesn't enter into our P&L on this trade — we already exited.
+
+### 3.7 Entry rule
+
+Every 10 seconds:
+
+```
+1. Active 5m market? If no, idle.
+2. Compute τ.
+3. Read inputs: microprice, lagged microprices, K, τ, OFI, PM book, etc.
+4. Compute q_settled and q_predicted from the latest fitted regression.
+5. Compute edge_up_net, edge_down_net, edge_magnitude, favored_side.
+6. If we already have an open position in this window: skip entry, run exit logic.
+7. If edge_magnitude > tier_floor:
+     Enter on favored_side, size = wallet * kelly_fraction(edge_magnitude).
+   Else:
+     Abstain. Reason = 'edge_below_floor'.
+8. Persist decision row.
+```
+
+**One position per window per asset.** Never flip sides mid-window. Never stack positions on the same side in the same window.
+
+**Tier table (user-specified):**
 
 ```python
 KELLY_TIERS = [
@@ -115,20 +290,51 @@ KELLY_TIERS = [
 ]
 ```
 
-τ-conditional floor on which tiers are eligible:
+Note that the regression handles the τ-effect implicitly through its coefficients — we don't need a separate τ-conditional tier floor table. At small τ the model's q_settled changes rapidly with spot, so edges naturally appear bigger; at large τ they appear smaller. The tier floor is a flat 0.02 across all τ.
 
-| τ window         | Min eligible delta | Rationale                                        |
-|------------------|--------------------|--------------------------------------------------|
-| `τ > 240s`       | 0.15 (tier 4-5)    | Information sparse; only take large, clear edges |
-| `60s < τ ≤ 240s` | 0.04 (tier 2-5)    | Sweet spot for both strategies                   |
-| `10s ≤ τ ≤ 60s`  | 0.02 (tier 1-5)    | Last entry window; take what's there             |
-| `τ < 10s`        | 0.04 (tier 2-5)    | Latency-arb only; no time for thesis to play out |
+### 3.8 Exit rule
 
-This is a starting heuristic, tuned in the dry-run replay phase.
+```python
+LAG_CLOSE_THRESHOLD = 0.005   # exit when edge has compressed to half a cent
+STOP_THRESHOLD      = 0.03    # exit if edge erodes by 3 cents below entry
+FALLBACK_TAU        = 10      # default to resolution at this τ
 
-### 3.5 The processes own state, not decisions
+def evaluate_exit(position, current_state):
+    """
+    position:
+        side ('up'|'down'), entry_price, entry_tau, size_usd, edge_at_entry
+    current_state:
+        q_settled_now, q_up_ask_now, q_down_ask_now, q_up_bid_now, q_down_bid_now,
+        tau_now
+    """
+    if position.side == 'up':
+        edge_now = current_state.q_settled_now - current_state.q_up_ask_now
+        exit_bid = current_state.q_up_bid_now
+    else:
+        edge_now = (1 - current_state.q_settled_now) - current_state.q_down_ask_now
+        exit_bid = current_state.q_down_bid_now
 
-WebSocket handlers update state (spot book, Polymarket book, Chainlink window). A separate scheduler tick reads state and runs the 9-step decision loop. This separation is important because it makes the system trivially backtestable — the scheduler can be driven by replayed timestamps rather than wall-clock time during replay.
+    # 1. Lag closed -> profit-taking exit
+    if edge_now < LAG_CLOSE_THRESHOLD:
+        return ('exit', 'lag_closed', exit_bid)
+
+    # 2. Thesis broken -> stop-loss exit
+    if edge_now < position.edge_at_entry - STOP_THRESHOLD:
+        return ('exit', 'stopped_out', exit_bid)
+
+    # 3. Resolution fallback at small τ
+    if current_state.tau_now < FALLBACK_TAU:
+        return ('hold_to_resolution', None, None)
+
+    # 4. Otherwise hold
+    return ('hold', None, None)
+```
+
+The thresholds are sweep parameters in the dry-run replay (§10.3).
+
+### 3.9 Process model
+
+WebSocket handlers update state (spot book, Polymarket book, Chainlink window). The scheduler tick reads state, calls the regression, applies entry/exit logic. The regression refit runs as a separate background task every 5 minutes on the rolling history table.
 
 ---
 
@@ -147,32 +353,34 @@ WebSocket handlers update state (spot book, Polymarket book, Chainlink window). 
     spot_book.py             # Live mid, top-N bid/ask, microprice, OFI accumulator
     poly_book.py             # Live Yes/No best bid/ask, depth, our open orders
     window.py                # Current window: open_ts, close_ts, K, slug, tokens
-    history.py               # Rolling buffers for returns, OFI, features
+    history.py               # Rolling buffers for returns, OFI, features, q's
   /models
-    volatility.py            # EWMA + realized vol estimators
-    base_estimator.py        # Black-Scholes binary p_A and p_B
-    edge.py                  # Microstructure signal computation
-    fusion.py                # Logit-space combination -> final p
+    regression.py            # Lead-lag ridge regression: fit, predict, q_settled
+    features.py              # Feature engineering from raw spot/PM state
+    edge.py                  # Computes edge_up_net, edge_down_net, edge_magnitude
     fees.py                  # Fee curve fee(price) for net-edge calculation
+    slippage.py              # Slippage estimator from current PM book depth
   /strategy
-    decision.py              # The 9-step loop
+    decision.py              # The 8-step decision loop
     kelly.py                 # Tier table, sizing logic
-    exit.py                  # Cash-out exit logic for Strategy B
+    entry.py                 # Entry rule (§3.7)
+    exit.py                  # Cash-out exit rule (§3.8)
     risk.py                  # Daily loss cap, max open positions, circuit breakers
   /execution
-    orders.py                # Order placement, retries, slippage estimation (Phase 2)
+    orders.py                # Order placement, retries (Phase 2)
     fills.py                 # Position tracking, P&L attribution
   /infra
     scheduler.py             # Main 10s tick loop
+    refitter.py              # Background task: refit regression every 5 min
     config.py                # All tunables in one place
     logger.py                # Structured tick log -> Parquet for backtest replay
     secrets.py               # API keys, wallet config (env-loaded)
   /research
-    backtest.py              # Replay logged ticks, score model variants
-    cashout_simulator.py     # Computes Strategy B P&L from logged future books
-    fit_fusion.py            # Logistic regression for fusion weights
-    calibration.py           # Reliability diagrams, Platt/isotonic recalibration
-    policy_compare.py        # Side-by-side metric report for A vs B
+    backtest.py              # Replay logged ticks
+    cashout_simulator.py     # Computes P&L from logged future books
+    refit_offline.py         # Offline regression fitting + cross-validation
+    parameter_sweep.py       # Sweep LAG_CLOSE x STOP x FALLBACK_TAU + ridge_alpha
+    diagnostics.py           # R^2, lag-stability, edge-realization slope
   /cli
     polybot_metrics.py       # SSH-friendly metric queries via DuckDB
     polybot_ctl.py           # Pause/resume/status over Unix domain socket
@@ -188,15 +396,17 @@ WebSocket handlers update state (spot book, Polymarket book, Chainlink window). 
 ```
 Coinbase WS  ──tick──►  spot_book ──┐
                                     │
-Polymarket WS ──update──► poly_book ┼──► scheduler (10s tick) ──► decision.py ──► (Phase 2) orders.py
-                                    │              │
-RTDS Chainlink ──tick──► window ────┘              ▼
-                                              parquet writer
+Polymarket WS ──update──► poly_book ┼──► scheduler (10s) ──► features ──► regression ──► edge ──► kelly ──► (Phase 2) orders
+                                    │              │                            │
+RTDS Chainlink ──tick──► window ────┘              ▼                            ▼
+                                              parquet writer                refitter (every 5 min)
+                                                                                │
+                                                                                └──► models/regression.py
 ```
 
 ### 4.3 Process model
 
-Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: Coinbase WS, Polymarket CLOB WS, Polymarket RTDS WS, scheduler, parquet writer. Five tasks total, all under one event loop.
+Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: Coinbase WS, Polymarket CLOB WS, Polymarket RTDS WS, scheduler, parquet writer, regression refitter. Six tasks total, all under one event loop.
 
 ---
 
@@ -212,11 +422,10 @@ Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: C
 - **Library:** `coinbase-advanced-py` for SDK convenience, or raw `websockets` + `coinbase.jwt_generator` for tightest control. Use SDK for Phase 1.
 - **State derived in `spot_book.py`:**
   - `mid` = (best_bid + best_ask) / 2
-  - `microprice` = (best_bid × ask_size + best_ask × bid_size) / (bid_size + ask_size)
+  - **`microprice`** — the regression's primary input, updated on every L2 event
   - `top_5_bid_levels[]`, `top_5_ask_levels[]` (price + size)
   - `last_trade_price`, `last_trade_size`
-  - 1-second OHLC ring buffer over last 300 seconds
-  - 1-second log return ring buffer (from midpoint), feeds EWMA σ
+  - 1-second sampled microprice ring buffer over last 300 seconds (this is what the regression's lagged features read from)
   - per-event OFI accumulator (Cont-Kukanov-Stoikov, levels 1-5)
 
 ### 5.2 Polymarket CLOB WebSocket
@@ -272,129 +481,165 @@ Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: C
 fee_per_dollar(p) = Theta * p * (1 - p)   # Theta ≈ 0.05, peak ~3.15% at p=0.5
 ```
 
-For Strategy B, fees are paid on **both legs**. Total round-trip cost when entering at price `a` and exiting at price `e`:
+For this strategy, fees are paid on **both legs** (entry as taker; exit as taker if lag-closed or stopped out, fee-free if held to resolution). Total round-trip cost when entering at price `a` and exiting at price `e`:
 
 ```
 total_cost = fee(a) + fee(e) + spread_at_exit + slippage_in + slippage_out
 ```
 
-Net edge required to break even on Strategy B is therefore much higher than for Strategy A. The actual Θ for 5-min markets is borrowed from 15-min docs and must be confirmed in Phase 2 from real fills.
+The lag-driven edge (the regression's `q_settled − q_actual`) must exceed this total cost for the trade to be net positive. The actual Θ for 5-min markets is borrowed from 15-min docs and confirmed empirically only after first live trades.
+
+**Maker-rebate optimization (deferred to Phase 2):** Polymarket pays makers a rebate of 25-50% of taker fees from a daily pool. Posting the *exit* leg as a maker order (limit at our target exit price) captures the rebate and dodges the exit fee. In Phase 1 we model exits as takers (worst case); in Phase 2 we add a maker-exit mode and compare.
 
 ---
 
-## 6. Probability models
+## 6. The lead-lag regression in detail
 
-### 6.1 Black-Scholes binary (shared base)
+### 6.1 Why this is the right model for this strategy
 
-For the probability that GBM with per-second volatility σ ends above K at horizon τ given current price S:
+The strategy thesis is "Polymarket lags Coinbase." The most direct way to express that hypothesis as a model is *literally* a regression of Polymarket's quote on lagged Coinbase prices. There's no need to model an option, infer a volatility, or assume a probability distribution. We just need to know how Polymarket's quote depends on recent spot history, and the regression learns that from data.
+
+This formulation has properties no Black-Scholes formulation has:
+
+- **Self-falsifying.** If the regression's R² is poor, Polymarket isn't actually predictable from spot the way we hypothesized. The dry run will tell us this directly.
+- **Self-calibrating to costs.** We can include `q_actual_t-1` as a feature if we want and the model will learn whatever momentum is already priced in; we don't have to worry about double-counting signals.
+- **Self-adapting.** As Polymarket's market makers get faster, the lag profile (β coefficients) shifts; the model picks this up at every refit. No human re-tuning needed.
+- **No σ to be wrong about.** Volatility estimation is no longer a critical-path input. We log realized vol as a diagnostic, but a σ bug can't fake an edge signal anymore.
+- **The edge is a pure number, with units of probability.** `q_settled - q_actual` is already in probability points, the same units as the Kelly tier thresholds. No translation needed.
+
+### 6.2 Feature design
+
+Every feature is referenced to the current window's strike K so that windows are comparable across the training data. The lookback grid is intentionally dense in the 0-90s range and sparse beyond, since most plausible Polymarket lags fall in that range.
 
 ```
-d2 = (ln(S/K) - 0.5 * σ² * τ) / (σ * √τ)
-p = Φ(d2)                          # standard normal CDF
+Spot history (microprice / K, in log space):
+  x_now    = log(microprice_t      / K)
+  x_15     = log(microprice_{t-15s} / K)
+  x_30     = log(microprice_{t-30s} / K)
+  x_45     = log(microprice_{t-45s} / K)
+  x_60     = log(microprice_{t-60s} / K)
+  x_90     = log(microprice_{t-90s} / K)
+  x_120    = log(microprice_{t-120s}/ K)
+
+Time:
+  tau           = τ in seconds
+  inv_sqrt_tau  = 1 / √(τ + 1)         # makes near-close moves matter more
+
+Spot microstructure:
+  ofi_30s             # signed Order Flow Imbalance over last 30s, z-scored
+  ofi_l5_weighted     # multi-level OFI
+  momentum_30s        # log(microprice_t / microprice_{t-30s})
+  momentum_60s
+
+Polymarket microstructure:
+  pm_book_imbalance   # (depth_up - depth_down) / total
+  pm_trade_flow_30s   # net Yes-buying minus No-buying volume
+
+Cross-asset (when modeling BTC, this is ETH; vice versa):
+  cross_momentum_60s
 ```
 
-We use **r = 0** (drift over 5 minutes is dominated by noise).
+About 14-16 features total. Ridge regression with regularization `α` chosen by 5-fold time-series cross-validation each refit. (`α` is a Phase 1 sweep parameter alongside the exit thresholds.)
 
-**Edge cases:**
-- `τ ≤ 1.0`: clamp τ to 1.0 in the formula. If `S > K + ε`, return 1.0; if `S < K − ε`, return 0.0.
-- `|d2| > 6`: saturate to 0.0 / 1.0.
-- σ uninitialized (warmup): mark abstain with `sigma_uninitialized`.
+The features are computed at every 10-second decision tick AND at every 1-second sample for training. The training samples vastly outnumber decision ticks, which is fine — we want a richly-trained model.
 
-**Implementation:** `scipy.stats.norm.cdf` directly; do not roll your own erf.
-
-**Volatility:** EWMA on **midpoint** 1-second log returns (not last-trade — bid-ask bounce inflates raw σ by 5-20%). λ = 0.94 baseline (RiskMetrics; ~11s half-life). Range λ ∈ {0.90, 0.94, 0.97} swept in dry-run analysis.
-
-**Warmup:** abstain for first 60-120s after startup until ≥ 60 observations of returns. Optionally seed from REST candle history.
-
-### 6.2 Two p's, one formula
-
-The same formula computes both strategy probabilities; only the input price differs:
+### 6.3 The training loop
 
 ```python
-p_A = bs_binary(S=spot_book.mid,        K=window.K, sigma=σ, tau=τ)
-p_B = bs_binary(S=spot_book.microprice, K=window.K, sigma=σ, tau=τ)
+class RegressionRefitter:
+    """
+    Background task: every 5 minutes, refit the regression from the last 4 hours
+    of (q_actual, features) pairs. New coefficients are atomically swapped into
+    the live model used by the scheduler tick.
+    """
+    REFIT_INTERVAL_SECS = 300
+    TRAINING_WINDOW_SECS = 4 * 3600
+
+    async def run(self, history: HistoryStore, model: RegressionModel):
+        while True:
+            await asyncio.sleep(self.REFIT_INTERVAL_SECS)
+            try:
+                training_data = history.fetch_window(self.TRAINING_WINDOW_SECS)
+                if len(training_data) < MIN_TRAIN_SIZE:
+                    continue                                # cold-start, skip
+                X, y = build_design_matrix(training_data)
+                new_coefs, diagnostics = fit_ridge_cv(X, y)
+                model.atomic_swap(new_coefs)
+                log_model_version(new_coefs, diagnostics)
+            except Exception as e:
+                logger.exception("refit_failed", error=str(e))
+                # Keep using current coefficients; do not crash
 ```
 
-Microprice for Strategy B because it's the imbalance-weighted forward fair value — captures impending movement that hasn't reached the trade tape. At small τ, microprice and midpoint converge; at large τ, microprice is a stronger predictor of the next several seconds of midpoint movement.
+Refit diagnostics logged at every refit: `R²` (in-sample and CV), `n_train_samples`, fitted coefficients, the derived `estimated_lag_seconds`, prediction MSE on the most recent 30 minutes (which is held out from training), and L2 norm of coefficient delta vs previous fit (stability metric — large deltas suggest regime shift).
 
-For Phase 1 keep them separate so we can attribute edge to either source.
+### 6.4 Cold start
 
-### 6.3 Microstructure adjustments (logit-space)
-
-Each signal is z-scored against its own rolling 1-hour distribution, then summed in logit space:
+The regression needs ~1 hour of data minimum to fit anything meaningful, ~4 hours for stable coefficients. During this period, the bot abstains entirely. Phase 1 dry run divides into:
 
 ```
-logit(p_adjusted) = logit(p_strategy) + Σᵢ wᵢ * z_score(signalᵢ)
+Hour 0-1:    All WS feeds live, history accumulating, σ warming up.
+             Decisions table is being populated, but every row has
+             event = 'abstain' with abstention_reason = 'model_warmup'.
+
+Hour 1:      First regression fit attempted. If R² > 0.1, model goes live.
+             Otherwise wait another hour and retry.
+
+Hour 1-4:    Model is live but coefficients still settling. Bot operates
+             normally. Trades are simulated/logged, no real money even in
+             Phase 2 trial mode.
+
+Hour 4-24:   Model has 4 hours of training data. Considered fully warmed up.
+             Refits every 5 min on rolling 4-hour window.
 ```
 
-Signals:
+For future runs (after we've collected one good 24-hour history), we can bootstrap from a pickled prior model. Phase 1 starts cold.
 
-| Signal                        | Source                    | Initial weight |
-|-------------------------------|---------------------------|----------------|
-| Spot OFI (levels 1-5 weighted)| Coinbase L2 events        | 0.40           |
-| Spot momentum 5s              | Coinbase mid log return   | 0.10           |
-| Spot momentum 30s             | Coinbase mid log return   | 0.20           |
-| Polymarket book imbalance     | Polymarket WS book        | 0.15           |
-| Polymarket trade flow 30s     | Polymarket WS trades      | 0.20           |
-| Lead-lag residual             | Rolling regression        | 0.30           |
-| Cross-asset OFI (other coin)  | Coinbase                  | 0.10           |
+### 6.5 Computing q_settled
 
-Initial weights are placeholders. Fit by `research/fit_fusion.py` once dry-run data is collected.
+This is the core computation each decision tick uses.
 
-### 6.4 Order Flow Imbalance (Cont-Kukanov-Stoikov)
+```python
+def compute_q_settled(model, current_features):
+    """
+    What WILL Polymarket be quoting once it has digested current spot?
+    Substitute current microprice into every lag slot.
+    """
+    # Build a "settled" feature vector: every spot lookback uses x_now
+    settled_features = current_features.copy()
+    for lag_key in ['x_15', 'x_30', 'x_45', 'x_60', 'x_90', 'x_120']:
+        settled_features[lag_key] = current_features['x_now']
+    # Microstructure features stay as-is (they describe current conditions)
 
-Per book event, signed flow:
+    logit_q_settled = model.predict_logit(settled_features)
+    return sigmoid(logit_q_settled)
 
+
+def compute_q_predicted(model, current_features):
+    """
+    What SHOULD Polymarket be quoting right now given lagged spot history?
+    Sanity check: should be close to q_actual under healthy conditions.
+    """
+    return sigmoid(model.predict_logit(current_features))
 ```
-e_n = I(P_b_n ≥ P_b_{n-1}) * q_b_n
-    - I(P_b_n ≤ P_b_{n-1}) * q_b_{n-1}
-    - I(P_a_n ≤ P_a_{n-1}) * q_a_n
-    + I(P_a_n ≥ P_a_{n-1}) * q_a_{n-1}
-```
 
-Aggregate over 1-second bins. Multi-level extension: compute per level m=1..5, sum with weights `[1, 0.5, 0.25, 0.125, 0.0625]`. Z-score against rolling 60-120s window. Decay forward at half-life ~5-15s.
-
-### 6.5 Lead-lag residual
-
-Rolling regression of `Δlogit(q_polymarket_t)` on `Δlog(spot_t-k)` for k ∈ {0, 5, 10, 15, 30, 60}; residual at k* = argmax correlation is the signal. For Phase 1, log raw streams; compute the residual offline first to find typical k*, then move the computation online.
+`q_settled` is the headline output. `q_predicted` is a diagnostic — if it diverges substantially from `q_actual`, something is wrong (regime shift, stale model, feed problem) and we should be more cautious.
 
 ---
 
-## 7. Exit logic for Strategy B
+## 7. Sanity gates and circuit breakers around the regression
 
-Exit logic only matters for Strategy B (A is hold-to-resolution, trivial).
+The regression is the entire model, so we need to be careful when to trust it.
 
-```python
-# Called every 10s for each open Strategy B position
-def evaluate_exit_B(position, current_state):
-    # position: side ('up'|'down'), entry_price, entry_tau, size, p_B_at_entry
-    # current_state: p_B_now, q_bid_now (matching side), τ_now
+| Condition                                          | Action                                  |
+|----------------------------------------------------|-----------------------------------------|
+| Model not yet fit                                  | Abstain. `abstention_reason='model_warmup'` |
+| Model R² (rolling 30-min held-out) < 0.10          | Abstain. `abstention_reason='model_low_r2'` |
+| `\|q_predicted − q_actual\| > 0.15` (model very wrong) | Abstain. `abstention_reason='model_disagrees_market'` |
+| Coefficient delta vs previous fit > some threshold | Log + run normally (regime shift is real); refit window may need to shrink |
+| Last successful refit > 15 minutes ago             | Abstain. `abstention_reason='model_stale'`  |
 
-    # 1. Lag closed?
-    if position.side == 'up':
-        edge_now = current_state.p_B_now - current_state.q_up_ask_now
-        edge_at_entry = position.p_B_at_entry - position.entry_price
-    else:  # 'down'
-        edge_now = (1 - current_state.p_B_now) - current_state.q_down_ask_now
-        edge_at_entry = (1 - position.p_B_at_entry) - position.entry_price
-
-    if edge_now < LAG_CLOSE_THRESHOLD:        # e.g. 0.005
-        return ('exit', 'lag_closed', current_state.q_bid_now)
-
-    # 2. Thesis broken?
-    if edge_now < edge_at_entry - STOP_THRESHOLD:  # e.g. 0.03 erosion
-        return ('exit', 'stopped_out', current_state.q_bid_now)
-
-    # 3. Resolution fallback
-    if current_state.tau_now < 10:
-        return ('hold_to_resolution', None, None)
-
-    return ('hold', None, None)
-```
-
-The thresholds `LAG_CLOSE_THRESHOLD` and `STOP_THRESHOLD` are sweep parameters in the dry-run replay. Reasonable starting values: 0.005 and 0.03 respectively.
-
-**Important:** Strategy B never holds two positions on opposite sides of the same window. If we're long Up and the model flips to favor Down, we exit Up; we do *not* simultaneously buy Down (that would be paying spread + fees to lock in a loss).
+These gates collectively express: *we only trade when the model has been validated on recent data and currently agrees on Polymarket's level (even if we believe the level will move)*. A model that thinks Polymarket should be at 0.40 when it's actually at 0.72 isn't telling us about lag — it's telling us the model is broken or the regime has shifted.
 
 ---
 
@@ -403,40 +648,44 @@ The thresholds `LAG_CLOSE_THRESHOLD` and `STOP_THRESHOLD` are sweep parameters i
 ### 8.1 Goals
 
 1. Verify all four data feeds run cleanly for 24 hours under systemd on the Ubuntu VM.
-2. Log every input that any tuning sweep would need: spot, microprice, K, σ, p_A, p_B, q's, microstructure features, hypothetical decisions for both strategies.
+2. Log every input the regression and the cash-out simulator could possibly need: spot, microprice, lagged microprices, K, q's, microstructure features, model predictions, fitted coefficients, hypothetical entry decisions, hypothetical exit triggers.
 3. Resolve every window's outcome and write a clean `window_outcomes` table.
-4. Have enough information in the logs that any of the policy variants in §10 can be evaluated *offline* without re-running the bot live.
+4. Validate the strategy thesis quantitatively via the regression's fit quality and the edge-realization slope.
+5. Sweep exit-rule parameters and the ridge regularization to find the best operating point.
 
 ### 8.2 What is NOT done in Phase 1
 
 - No order placement. No authenticated Polymarket calls. No real money at risk.
-- No live tuning. Weights, thresholds, tier floors are fixed at startup from `config.py`.
-- No live policy comparison — that happens at replay time on the logged data.
+- No live tuning of the regression's structural parameters (lookback grid, feature set). The regression refits its coefficients automatically, but we don't change feature engineering during the run.
+- No live exit decisions — exits are simulated at replay time against the logged future order book.
 
-### 8.3 Pre-flight checks before starting the 24h run
+### 8.3 Pre-flight checks
 
 - All four WS connections established and streaming for 30+ minutes.
-- σ has finished warmup and produces values in [30%, 120%] annualized for BTC.
+- Microprice computation produces values that track midpoint in calm regimes (typical |microprice − mid| < 0.5 × spread) and diverge during bursts.
 - At least one full 5-minute window has resolved cleanly with `K` captured at boundary and `close_price` captured at close.
 - DuckDB query against the parquet directory returns expected row counts.
 - systemd unit auto-restarts on simulated crash.
-- Disk has ≥ 5GB free (24h run produces ~50MB; the buffer is for log overflows and journald).
+- Disk has ≥ 5GB free.
 
 ### 8.4 During the run
 
-Manual SSH check-ins via `polybot-metrics summary --asset btc --since=runstart` should be safe — they're read-only DuckDB queries against the parquet directory and don't touch the bot. Resist the urge to tune anything live; fixed inputs over 24 hours is the entire point.
+Manual SSH check-ins via `polybot-metrics summary --since=runstart` are safe — read-only DuckDB queries against parquet. After hour 4, also check `polybot-metrics model --latest` to inspect the live regression (coefficients, R², estimated_lag_seconds).
+
+Resist tuning anything live. Fixed inputs over 24 hours is the entire point.
 
 ### 8.5 Post-run validation
 
-Sanity checks before declaring the run successful and proceeding to backtest analysis:
+Sanity checks before declaring the run successful:
 
 1. **No data gaps.** Coinbase `sequence_num` strictly monotonic; heartbeats ≥ 1/s; Polymarket WS produced events per active window; Chainlink RTDS produced ≥ 1 tick per 60s.
 2. **All windows resolved.** Expected ≈ 288 windows × 2 assets = 576. Allow 1-2% loss to startup/shutdown edges.
-3. **σ in plausible range.** Histogram of σ_per_sec → annualized; tail values > 200% indicate microstructure-noise blow-ups.
-4. **p_A, p_B distributions reasonable.** Both should span [0.05, 0.95] over the run; if collapsed near 0.5, σ is too high; if bimodal at 0/1, τ=0 saturation is happening too aggressively.
-5. **q's correlate with p_A.** Bin decisions by p_A in 10 deciles; mean q in each decile should track diagonally (efficient market sanity).
-6. **Microprice rarely far from midpoint** in calm regimes (typical |microprice − mid| < 0.5 × spread); excursions are real signal.
-7. **Each window has ≈ 30 decision rows** (5 min / 10 s) with 1 K-capture event each.
+3. **Microprice rarely extreme** in calm regimes; excursions correlate with subsequent midpoint moves (validates microprice as forward predictor).
+4. **Each window has ≈ 30 decision rows** (5 min / 10 s) with 1 K-capture event each.
+5. **Model R² distribution.** Histogram CV-R² across all refits; median should be > 0.3 for healthy operation. If median < 0.1, Polymarket isn't actually predictable from spot the way the strategy assumes.
+6. **Lag-stability.** `estimated_lag_seconds` should be relatively stable hour-to-hour, ideally in the 15-90s range. Wild swings (5s one hour, 200s the next) suggest the model is fitting noise, not signal.
+7. **`q_predicted` tracks `q_actual` closely.** Plot q_predicted vs q_actual over the run; should hug the diagonal with low residual variance. This is the cleanest sanity check on the model.
+8. **Model-disagreement abstention rate < 5%.** If the model frequently disagrees with the market (`|q_predicted - q_actual| > 0.15`), the model is mis-specified.
 
 ---
 
@@ -454,16 +703,17 @@ logs/
   polymarket_book_snapshots/dt=2026-05-04/asset=btc/h=14.parquet
   polymarket_trades/dt=2026-05-04/asset=btc/h=14.parquet
   chainlink_ticks/dt=2026-05-04/asset=btc/h=14.parquet
-  window_outcomes/dt=2026-05-04/asset=btc.parquet  (no h= partition; small)
+  window_outcomes/dt=2026-05-04/asset=btc.parquet      (no h= partition)
+  model_versions/dt=2026-05-04/asset=btc.parquet       (no h= partition)
 ```
 
-One file per hour per asset. Keeps individual files at 5-50 MB, easily DuckDB-queryable, atomic to rewrite. Use `pyarrow.parquet.ParquetWriter` opened once per hour, batch-flushed every 60 seconds (do NOT write per-row).
+One file per hour per asset. Use `pyarrow.parquet.ParquetWriter` opened once per hour, batch-flushed every 60 seconds.
 
-Estimated total disk: ~50 MB/day compressed (~250 MB uncompressed), both assets combined.
+Estimated total disk: ~50 MB/day compressed, both assets combined.
 
 ### 9.2 The `decisions` table — primary tuning source
 
-One row per 10s scheduler tick, written even when abstaining. Both strategies' would-be decisions in the same row.
+One row per 10s scheduler tick.
 
 | Column                      | Type    | Notes |
 |-----------------------------|---------|-------|
@@ -473,306 +723,323 @@ One row per 10s scheduler tick, written even when abstaining. Both strategies' w
 | tau_s                       | float32 | seconds until close |
 | **Spot inputs**             |         |       |
 | S_mid                       | float64 | Coinbase midpoint |
-| S_last                      | float64 | last trade price |
 | microprice                  | float64 | imbalance-weighted fair value |
 | spot_spread                 | float32 | Coinbase ask − bid |
-| spot_bid_size_l1            | float32 | for OFI / microprice diagnostics |
+| spot_bid_size_l1            | float32 | |
 | spot_ask_size_l1            | float32 | |
 | **Strike**                  |         |       |
 | K                           | float64 | Chainlink window-open snapshot |
-| K_chainlink_ts_ms           | int64   | oracle observation time |
 | K_uncertain                 | bool    | true if K was estimated, not observed |
-| **Volatility**              |         |       |
-| sigma_per_sec               | float32 | EWMA σ |
-| sigma_initialized           | bool    | false during warmup |
-| **Probability — Strategy A**|         |       |
-| p_A                         | float32 | bs_binary on midpoint |
-| p_A_adjusted                | float32 | post-fusion, post-microstructure |
-| **Probability — Strategy B**|         |       |
-| p_B                         | float32 | bs_binary on microprice |
-| p_B_adjusted                | float32 | post-fusion, post-microstructure |
+| **Lagged spot features**    |         |       |
+| x_now_logKratio             | float32 | log(microprice_t / K) |
+| x_15_logKratio              | float32 | log(microprice_{t-15} / K) |
+| x_30_logKratio              | float32 | |
+| x_45_logKratio              | float32 | |
+| x_60_logKratio              | float32 | |
+| x_90_logKratio              | float32 | |
+| x_120_logKratio             | float32 | |
+| **Microstructure**          |         |       |
+| ofi_l1                      | float32 | |
+| ofi_l5_weighted             | float32 | |
+| pm_book_imbalance           | float32 | |
+| pm_trade_flow_30s           | float32 | |
+| momentum_30s                | float32 | |
+| momentum_60s                | float32 | |
+| cross_asset_momentum_60s    | float32 | |
+| **Diagnostic vol** (logged but not used) |    |       |
+| sigma_per_sec_realized      | float32 | EWMA realized vol; logged for diagnostics only |
 | **Polymarket book**         |         |       |
-| q_up_bid                    | float32 | best bid for Up |
-| q_up_ask                    | float32 | best ask for Up |
-| q_up_mid                    | float32 | mid of Up |
-| q_down_bid                  | float32 | best bid for Down |
-| q_down_ask                  | float32 | best ask for Down |
+| q_up_bid                    | float32 | |
+| q_up_ask                    | float32 | |
+| q_up_mid                    | float32 | |
+| q_down_bid                  | float32 | |
+| q_down_ask                  | float32 | |
 | q_down_mid                  | float32 | |
-| poly_spread_up              | float32 | q_up_ask − q_up_bid |
+| poly_spread_up              | float32 | |
 | poly_spread_down            | float32 | |
 | poly_depth_up_l1            | float32 | top-of-book size for Up bid+ask |
 | poly_depth_down_l1          | float32 | |
-| **Edges (per strategy, per side, net of fees+slippage)** | | |
-| edge_A_up_net               | float32 | p_A_adjusted − q_up_ask − fee − slip |
-| edge_A_down_net             | float32 | (1−p_A_adjusted) − q_down_ask − fee − slip |
-| edge_B_up_net               | float32 | p_B_adjusted − q_up_ask − fee − slip |
-| edge_B_down_net             | float32 | (1−p_B_adjusted) − q_down_ask − fee − slip |
-| edge_A_best_signed          | float32 | signed: edge_A_up_net if Up favored, −edge_A_down_net otherwise |
-| edge_A_best_abs             | float32 | max(edge_A_up_net, edge_A_down_net) |
-| edge_B_best_signed          | float32 | signed for Strategy B |
-| edge_B_best_abs             | float32 | max for Strategy B |
-| **Microstructure features** |         |       |
-| ofi_l1                      | float32 | level-1 OFI 1s window |
-| ofi_l5_weighted             | float32 | levels 1-5 with decay |
-| pm_book_imbalance           | float32 | (depth_up − depth_down)/total |
-| leadlag_resid               | float32 | spot-PM lag residual z-scored |
-| momentum_5s                 | float32 | log(S_mid_t / S_mid_{t-5}) |
-| momentum_15s                | float32 | |
-| momentum_30s                | float32 | |
-| cross_asset_momentum_30s    | float32 | other asset's momentum_30s |
-| **Strategy A action**       |         |       |
-| A_chosen_side               | dict    | "up"/"down"/"abstain" |
-| A_tier                      | int8    | 0=abstain, 1..5 |
-| A_would_bet_usd             | float32 | Kelly tier × wallet, 0 if abstain |
-| A_bet_price                 | float32 | q_ask of chosen side, null if abstain |
-| A_bet_payout_contracts      | float32 | A_would_bet_usd / A_bet_price |
-| A_abstention_reason         | dict    | nullable; see §3.3 |
-| **Strategy B action**       |         |       |
-| B_chosen_side               | dict    | "up"/"down"/"abstain" |
-| B_tier                      | int8    | |
-| B_would_bet_usd             | float32 | |
-| B_bet_price                 | float32 | |
-| B_bet_payout_contracts      | float32 | |
-| B_abstention_reason         | dict    | |
-| **State flags**             |         |       |
-| coinbase_stale_ms           | int32   | ms since last Coinbase event |
-| polymarket_stale_ms         | int32   | ms since last Polymarket event |
-| chainlink_stale_ms          | int32   | ms since last Chainlink tick |
+| **Model output**            |         |       |
+| model_version_id            | string  | links to model_versions table |
+| q_predicted                 | float32 | model's prediction of current q_actual (sanity) |
+| q_settled                   | float32 | model's prediction of where q is heading |
+| q_predicted_minus_q_actual  | float32 | sanity-check residual; should be small |
+| **Edge (the headline number)** |       |       |
+| edge_up_raw                 | float32 | q_settled − q_up_ask |
+| edge_down_raw               | float32 | (1 − q_settled) − q_down_ask |
+| fee_up_per_dollar           | float32 | THETA * q_up_ask * (1 - q_up_ask) |
+| fee_down_per_dollar         | float32 | |
+| slippage_up_per_dollar      | float32 | from depth model |
+| slippage_down_per_dollar    | float32 | |
+| edge_up_net                 | float32 | edge_up_raw − fee_up − slippage_up |
+| edge_down_net               | float32 | edge_down_raw − fee_down − slippage_down |
+| edge_signed                 | float32 | best signed edge (positive=Up favored, negative=Down) |
+| edge_magnitude              | float32 | abs(edge_signed) — Kelly tier input |
+| favored_side                | dict    | "up"/"down" |
+| **Action this tick**        |         |       |
+| event                       | dict    | "abstain" / "entry" / "hold" / "exit_lag_closed" / "exit_stopped" / "fallback_resolution" |
+| chosen_side                 | dict    | "up"/"down"/null |
+| tier                        | int8    | 0=abstain, 1..5 (only at entry) |
+| would_bet_usd               | float32 | Kelly tier × wallet, 0 if not entering |
+| bet_price                   | float32 | q_ask of chosen side at entry, null otherwise |
+| bet_payout_contracts        | float32 | would_bet_usd / bet_price at entry |
+| abstention_reason           | dict    | nullable; one of: edge_below_floor, model_warmup, model_low_r2, model_disagrees_market, model_stale, circuit_breaker_*, data_stale, sigma_uninitialized, wide_spread, already_engaged, k_uncertain |
+| **Position state**          |         |       |
+| has_open_position           | bool    | |
+| position_side               | dict    | nullable |
+| position_entry_tau          | float32 | nullable |
+| position_entry_price        | float32 | nullable |
+| position_edge_at_entry      | float32 | signed entry edge for stop-loss reference |
+| **Feed staleness**          |         |       |
+| coinbase_stale_ms           | int32   | |
+| polymarket_stale_ms         | int32   | |
+| chainlink_stale_ms          | int32   | |
 | circuit_active              | dict    | nullable; circuit breaker name if any |
 
-**Invariants the writer must enforce:**
+**Invariants:**
 
-1. **One row per 10s tick, even when abstaining.** If we don't write, engagement-rate metrics are uncomputable.
-2. **Edge columns are populated even when abstaining.** When inputs are unhealthy (data stale, σ uninitialized), write sentinel `-99.0` so it's distinguishable from a real near-zero edge. The 0.0 / null distinction matters for filtering at metric time.
-3. **Both strategies' actions are independently logged.** A row may have `A_chosen_side='up'` and `B_chosen_side='abstain'` simultaneously — that's expected and informative.
+1. **One row per 10s tick, always.** Even when abstaining.
+2. **`edge_magnitude` is always populated when the model is fit.** Sentinel `-99.0` if model is warming up or unfit.
+3. **The `event` column is the canonical record.** Downstream queries filter on it.
+4. **Position state is updated immediately after an entry/exit event.**
 
-### 9.3 The `window_outcomes` table
+### 9.3 The `model_versions` table
 
-Written when a window resolves (close-time Chainlink tick observed). One row per window per asset.
+One row per regression refit (every 5 minutes). Keyed by `model_version_id` for joins from `decisions`.
+
+| Column                      | Type    | Notes |
+|-----------------------------|---------|-------|
+| ts_ns                       | int64   | refit completion time |
+| asset                       | dict    | |
+| model_version_id            | string  | UUID |
+| n_train_samples             | int32   | rows used for training |
+| training_window_start_ns    | int64   | |
+| ridge_alpha                 | float32 | regularization param |
+| r2_in_sample                | float32 | |
+| r2_cv_mean                  | float32 | 5-fold time-series CV |
+| r2_held_out_30min           | float32 | held-out validation slice |
+| coef_alpha                  | float32 | intercept |
+| coef_x_now                  | float32 | β₀ |
+| coef_x_15                   | float32 | |
+| coef_x_30                   | float32 | |
+| coef_x_45                   | float32 | |
+| coef_x_60                   | float32 | |
+| coef_x_90                   | float32 | |
+| coef_x_120                  | float32 | |
+| coef_tau                    | float32 | |
+| coef_inv_sqrt_tau           | float32 | |
+| coef_ofi_l1                 | float32 | |
+| coef_ofi_l5_weighted        | float32 | |
+| coef_pm_book_imbalance      | float32 | |
+| coef_pm_trade_flow_30s      | float32 | |
+| coef_momentum_30s           | float32 | |
+| coef_momentum_60s           | float32 | |
+| coef_cross_asset_momentum_60s | float32 | |
+| estimated_lag_seconds       | float32 | β-weighted average lag, see §3.4 |
+| coef_delta_l2               | float32 | L2 norm of coef change vs previous fit |
+
+The `model_versions` table is essential for backtest replay: the cash-out simulator and the parameter sweep both need to know which coefficients were live at any given decision tick.
+
+### 9.4 The `window_outcomes` table
 
 | Column                          | Type    | Notes |
 |---------------------------------|---------|-------|
 | asset                           | dict    | |
-| window_ts                       | int32   | open |
-| close_ts                        | int32   | open + 300 |
-| K                               | float64 | strike |
+| window_ts                       | int32   | |
+| close_ts                        | int32   | |
+| K                               | float64 | |
 | close_price                     | float64 | Chainlink at close |
 | outcome                         | int8    | 1 if close ≥ K else 0 |
-| n_decisions                     | int16   | rows in `decisions` for this window |
-| **Strategy A first-bet info**   |         |       |
-| A_n_would_bet                   | int16   | non-abstain count |
-| A_first_tier                    | int8    | tier of first non-abstain (0 if none) |
-| A_first_tau_s                   | float32 | τ at first bet |
-| A_first_side                    | dict    | "up"/"down"/null |
-| A_first_size_usd                | float32 | |
-| A_first_price                   | float32 | bet_price at entry |
-| A_first_payout_contracts        | float32 | |
-| **Strategy B first-bet info**   |         |       |
-| B_n_would_bet                   | int16   | |
-| B_first_tier                    | int8    | |
-| B_first_tau_s                   | float32 | |
-| B_first_side                    | dict    | |
-| B_first_size_usd                | float32 | |
-| B_first_price                   | float32 | |
-| B_first_payout_contracts        | float32 | |
-| **Strategy B exit info (computed at replay)** |  |  |
-| B_exit_reason                   | dict    | "lag_closed"/"stopped_out"/"resolution"/null |
-| B_exit_tau_s                    | float32 | τ at exit |
-| B_exit_price                    | float32 | bid we sold into (or 0/1 if held to resolution) |
-| B_exit_holding_seconds          | float32 | exit_tau − entry_tau (negative since τ counts down) |
+| n_decisions                     | int16   | |
+| n_entries_attempted             | int16   | always 0 or 1 by policy |
+| **Entry info (if entered)**     |         |       |
+| entry_tier                      | int8    | |
+| entry_tau_s                     | float32 | |
+| entry_side                      | dict    | |
+| entry_size_usd                  | float32 | |
+| entry_price                     | float32 | |
+| entry_edge_signed               | float32 | |
+| entry_payout_contracts          | float32 | |
+| entry_q_settled                 | float32 | model output at entry, for diagnostic |
+| entry_model_version_id          | string  | |
+| **Exit info (computed at replay)** | |  |
+| exit_reason                     | dict    | "lag_closed"/"stopped_out"/"resolution"/null |
+| exit_tau_s                      | float32 | |
+| exit_price                      | float32 | bid we sold into (or 0/1 if held to resolution) |
+| exit_holding_seconds            | float32 | |
+| **P&L**                         |         |       |
+| realized_pnl_usd                | float32 | per the cash-out P&L formula in §10 |
+| realized_pnl_per_dollar         | float32 | |
 
-The exit fields are computed at backtest time (§10.2), not live.
+In Phase 1, exit and P&L fields are populated **only at backtest/replay time**.
 
-### 9.4 Other tables
+### 9.5 Other tables
 
-- **`coinbase_ticks`**: raw L2 events and trades. Used to reconstruct OFI offline at finer granularity than the live aggregation, and to validate microprice computation.
-- **`polymarket_book_snapshots`**: every WS book/price_change event with full top-5 levels per side. **This is the table the cash-out simulator uses to look up future exit prices.**
-- **`polymarket_trades`**: trade prints from PM, for trade flow signals.
+- **`coinbase_ticks`**: raw L2 events and trades. Used to reconstruct microprice and lagged features offline at finer granularity than the live aggregation.
+- **`polymarket_book_snapshots`**: every WS book/price_change event with full top-5 levels per side. **The cash-out simulator uses this for VWAP exit-fill modeling.**
+- **`polymarket_trades`**: trade prints from PM, for trade flow features.
 - **`chainlink_ticks`**: every Chainlink observation. Validates K capture and resolution prices.
 
 ---
 
-## 10. Phase 1 backtest — comparing the two strategies
+## 10. Phase 1 backtest — tuning the strategy
 
-This is the central analytic question of the dry run: **which strategy made more money over the 24 hours, and with what risk profile?**
+The central analytic question of the dry run: **given the logged data, what choice of regression hyperparameters and exit thresholds produces the best P&L per unit risk, and is that P&L positive after all costs?**
 
 ### 10.1 Replay invariants
 
-- Read decision rows in `ts_ns` order. Never join on a future row except via the explicit cash-out simulator (§10.2).
-- Use the `ts_ns` you assigned on receipt as the canonical clock; do NOT use venue-supplied event times for ordering (they're trade-engine times, not arrival times).
-- For Strategy A P&L, only `window_outcomes.outcome` and the `A_first_*` columns are needed.
-- For Strategy B P&L, you need `B_first_*` PLUS look-ahead access to `polymarket_book_snapshots` for exit price simulation.
+- Read decision rows in `ts_ns` order. Never join on a future row except via the explicit cash-out simulator.
+- When evaluating a hypothetical strategy variant, use the model coefficients that were **live at that decision tick** (via `model_version_id`). Do not retroactively apply a better-trained model to old decisions; that's look-ahead bias.
+- Use the `ts_ns` you assigned on receipt as the canonical clock. Do NOT use venue-supplied event times for ordering.
 
-### 10.2 Strategy B cash-out simulator (`research/cashout_simulator.py`)
+### 10.2 Cash-out simulator (`research/cashout_simulator.py`)
 
-This is the single hardest piece of replay logic. For each B entry, simulate exit by stepping forward through the order book log and applying the exit rules from §7.
+Same structure as before. For each entry, walk forward through `decisions` and `polymarket_book_snapshots` applying the exit rules.
 
 ```python
-def simulate_B_exit(entry_row, decisions_after_entry, book_snapshots,
-                    LAG_CLOSE=0.005, STOP=0.03):
-    """
-    entry_row: a `decisions` row where B_chosen_side != 'abstain'
-    decisions_after_entry: subsequent decisions in the same window for this asset
-    book_snapshots: polymarket book ticks within the window, after entry
-    Returns (exit_reason, exit_tau, exit_price, holding_seconds)
-    """
-    edge_at_entry = entry_row.edge_B_best_signed  # signed by chosen side
+def simulate_exit(entry_row, decisions_after_entry, book_snapshots, outcome,
+                  LAG_CLOSE=0.005, STOP=0.03, FALLBACK_TAU=10):
+    edge_at_entry = entry_row.entry_edge_signed
 
     for next_dec in decisions_after_entry:
-        # Recompute current edge on the position's side
-        if entry_row.B_chosen_side == 'up':
-            edge_now = next_dec.edge_B_up_net
-            exit_bid = next_dec.q_up_bid
+        # Strategy uses live edge_*_net columns from the logged decision —
+        # those columns already incorporate the live model's q_settled.
+        if entry_row.entry_side == 'up':
+            edge_now = next_dec.edge_up_net
+            exit_target_bid = next_dec.q_up_bid
         else:
-            edge_now = next_dec.edge_B_down_net
-            exit_bid = next_dec.q_down_bid
+            edge_now = next_dec.edge_down_net
+            exit_target_bid = next_dec.q_down_bid
 
-        # Lag closed
+        # VWAP fill against logged book depth
+        exit_price = vwap_fill_against_book(
+            book_snapshots, next_dec.ts_ns,
+            side=entry_row.entry_side,
+            size_contracts=entry_row.entry_payout_contracts,
+            target_bid=exit_target_bid,
+        )
+
         if edge_now < LAG_CLOSE:
-            return ('lag_closed', next_dec.tau_s, exit_bid,
-                    entry_row.tau_s - next_dec.tau_s)
+            return ('lag_closed', next_dec.tau_s, exit_price,
+                    entry_row.entry_tau_s - next_dec.tau_s)
 
-        # Stopped out
         if edge_now < edge_at_entry - STOP:
-            return ('stopped_out', next_dec.tau_s, exit_bid,
-                    entry_row.tau_s - next_dec.tau_s)
+            return ('stopped_out', next_dec.tau_s, exit_price,
+                    entry_row.entry_tau_s - next_dec.tau_s)
 
-        # Time-based fallback at small τ
-        if next_dec.tau_s < 10:
-            # Hold to resolution; exit price = outcome
-            outcome = window_outcomes.outcome
-            terminal = 1.0 if (entry_row.B_chosen_side == 'up') == (outcome == 1) else 0.0
-            return ('resolution', 0, terminal, entry_row.tau_s)
+        if next_dec.tau_s < FALLBACK_TAU:
+            terminal = 1.0 if (entry_row.entry_side == 'up') == (outcome == 1) else 0.0
+            return ('resolution', 0, terminal, entry_row.entry_tau_s)
 
-    # Window ended without explicit exit — treat as resolution
-    outcome = window_outcomes.outcome
-    terminal = 1.0 if (entry_row.B_chosen_side == 'up') == (outcome == 1) else 0.0
-    return ('resolution', 0, terminal, entry_row.tau_s)
+    terminal = 1.0 if (entry_row.entry_side == 'up') == (outcome == 1) else 0.0
+    return ('resolution', 0, terminal, entry_row.entry_tau_s)
 
 
-def realized_pnl_B(entry_row, exit_reason, exit_price):
-    """
-    P&L per dollar wagered, accounting for fees on both legs.
-    Entry: paid `entry_row.B_bet_price` per contract, `B_would_bet_usd` total
-    Exit: received `exit_price` per contract
-    Fees: pay taker fee on entry; if exit is a taker (lag_closed/stopped_out) pay again.
-          If exit is resolution, no exit fee (Polymarket auto-redeems).
-    """
-    contracts = entry_row.B_bet_payout_contracts
-    gross_proceeds = contracts * exit_price
-    cost = entry_row.B_would_bet_usd
-    entry_fee = THETA * entry_row.B_bet_price * (1 - entry_row.B_bet_price) * cost
+def realized_pnl(entry_row, exit_reason, exit_price, THETA=0.05):
+    contracts = entry_row.entry_payout_contracts
+    cost = entry_row.entry_size_usd
+    entry_fee = THETA * entry_row.entry_price * (1 - entry_row.entry_price) * cost
 
     if exit_reason in ('lag_closed', 'stopped_out'):
+        gross_proceeds = contracts * exit_price
         exit_fee = THETA * exit_price * (1 - exit_price) * gross_proceeds
-    else:  # resolution
-        exit_fee = 0.0
-
-    return gross_proceeds - cost - entry_fee - exit_fee
+        return gross_proceeds - cost - entry_fee - exit_fee
+    else:  # 'resolution'
+        if exit_price >= 1.0:
+            return contracts - cost - entry_fee
+        else:
+            return -cost - entry_fee
 ```
 
-The simulator is deterministic given the logged book history and the threshold parameters. Sweep `LAG_CLOSE ∈ {0.003, 0.005, 0.01, 0.02}` and `STOP ∈ {0.02, 0.03, 0.05, 0.10}` and plot the P&L surface — somewhere on that surface is Strategy B's best-case operating point.
+### 10.3 Parameter sweep
 
-**Slippage realism:** at exit, the bid you can hit is constrained by depth. If your position is larger than the top-of-book bid size, you walk down: average exit price = VWAP across the next levels until size is satisfied. Apply this in the simulator using the depth columns logged in `polymarket_book_snapshots`.
+Sweep three exit thresholds plus the regression's ridge regularization:
 
-### 10.3 Strategy A P&L (trivial)
-
-```python
-def realized_pnl_A(window_row):
-    if window_row.A_first_tier == 0:
-        return 0.0
-    won = (window_row.A_first_side == 'up' and window_row.outcome == 1) or \
-          (window_row.A_first_side == 'down' and window_row.outcome == 0)
-    contracts = window_row.A_first_payout_contracts
-    cost = window_row.A_first_size_usd
-    entry_fee = THETA * window_row.A_first_price * (1 - window_row.A_first_price) * cost
-    if won:
-        return contracts - cost - entry_fee   # contracts redeem at $1
-    else:
-        return -cost - entry_fee
+```
+LAG_CLOSE_THRESHOLD ∈ {0.002, 0.003, 0.005, 0.008, 0.012, 0.020}
+STOP_THRESHOLD      ∈ {0.020, 0.030, 0.050, 0.080, 0.120}
+FALLBACK_TAU        ∈ {5, 10, 20, 30}
+RIDGE_ALPHA         ∈ {0.01, 0.1, 1.0, 10.0}     # determines via offline-refit replay
 ```
 
-### 10.4 Policy comparison report (`research/policy_compare.py`)
+The first three are exit-rule sweeps and use the live-fitted models in the logged data. The fourth requires re-fitting the regression offline at each ridge value and re-running the cashout simulator with the alternative coefficients. That's expensive but worth doing once.
 
-Run all three of your headline metrics for each strategy variant, side-by-side. Output is a Rich table on the terminal and a parquet table for further analysis.
+For each combination, replay the entire 24h dataset and report total P&L, ROI, win rate, and Sharpe.
 
-Variants to compare:
+### 10.4 Model diagnostics
 
-| Variant ID                | Strategy | Exit policy                                  |
-|---------------------------|----------|----------------------------------------------|
-| `A_hold`                  | A        | hold to resolution                           |
-| `B_dynamic_005_03`        | B        | LAG_CLOSE=0.005, STOP=0.03                   |
-| `B_dynamic_010_05`        | B        | LAG_CLOSE=0.010, STOP=0.05                   |
-| `B_fixed_30s`             | B        | exit at exactly entry_tau − 30 (force taker) |
-| `B_fixed_60s`             | B        | exit at exactly entry_tau − 60               |
-| `B_fixed_120s`            | B        | exit at entry_tau − 120                      |
-| `A_or_B_first_to_fire`    | mixed    | take whichever strategy fires first per window |
-| `A_and_B_independent`     | mixed    | both run, separate bankrolls (40%/60% split) |
+Before any strategy P&L is meaningful, validate the model itself:
 
-For each variant, compute and report:
+```sql
+-- Distribution of CV-R^2 across refits
+SELECT
+  asset,
+  approx_quantile(r2_cv_mean, 0.1) AS p10_r2,
+  approx_quantile(r2_cv_mean, 0.5) AS median_r2,
+  approx_quantile(r2_cv_mean, 0.9) AS p90_r2
+FROM model_versions
+GROUP BY asset;
+```
 
-- **Realized P&L** (USD, total over 24h)
-- **ROI** (P&L / total wagered)
-- **Bankroll return** (P&L / starting bankroll)
-- **Win rate**
-- **Average win, average loss, ratio**
-- **Sharpe-like per-bet ratio** = mean / sd × √n
-- **Max drawdown** of cumulative P&L
-- **Engagement rate per cycle** (% of decision rows that fired)
-- **Engagement rate per window** (% of windows with ≥ 1 fired bet)
-- **Average observed edge per cycle** (mean of `edge_X_best_abs` for that strategy)
-- **Average observed edge at entry** (mean of `edge_X_best_signed` on rows where action was taken)
-- **Edge realization slope:** for fired bets, regress realized return against `edge_at_entry`. Slope ≈ 1.0 = honest model; slope < 0.3 = edge is mostly noise; slope ≤ 0 = the model has zero predictive value.
-- **Per-tier breakdown:** all of the above bucketed by tier 1..5.
-- **Per-τ-bucket breakdown:** by entry-time bucket (T-300..T-241, T-240..T-61, T-60..T-11, T-10..T-0).
-- **Strategy B specific:** distribution of `B_exit_reason`, average holding seconds, lag-close hit rate (% of B trades that exited via "lag_closed" vs. stopped out vs. fell through to resolution).
+Healthy: median R² > 0.3, p10 R² > 0.15. If R² is consistently below 0.1, the strategy thesis isn't supported and no sweep will rescue it.
 
-### 10.5 The three headline metrics, formal SQL
+```sql
+-- Stability of estimated_lag_seconds over the run
+SELECT
+  asset,
+  date_trunc('hour', to_timestamp(ts_ns/1e9)) AS hr,
+  AVG(estimated_lag_seconds) AS mean_lag,
+  STDDEV(estimated_lag_seconds) AS sd_lag
+FROM model_versions
+GROUP BY asset, hr
+ORDER BY asset, hr;
+```
 
-These are computed once per variant in `policy_compare.py` and printed to terminal. All queries run against the Parquet directory via DuckDB. Examples below are for Strategy A; substitute `A_*` → `B_*` and join the cash-out simulator output for Strategy B.
+Healthy: mean lag in 15-90s range, sd_lag < 20s. Wild swings = the model is fitting noise.
+
+```sql
+-- q_predicted vs q_actual sanity
+SELECT
+  asset,
+  AVG(ABS(q_predicted - q_up_ask)) AS mean_abs_residual,
+  AVG((q_predicted - q_up_ask) * (q_predicted - q_up_ask)) AS mse
+FROM decisions
+WHERE event != 'abstain' OR abstention_reason IS NULL
+GROUP BY asset;
+```
+
+Healthy: mean_abs_residual < 0.03. The model should be tracking Polymarket's level closely; the edge signal comes from `q_settled` (the forecast), not from `q_predicted` (the fit).
+
+### 10.5 The three headline metrics
 
 #### Metric 1 — Realized P&L
 
 ```sql
--- Strategy A daily P&L
 SELECT
   asset,
   date_trunc('day', to_timestamp(window_ts)) AS day,
-  COUNT(*) FILTER (WHERE A_first_tier > 0) AS n_bets,
-  SUM(realized_pnl_A) AS pnl_usd,
-  SUM(A_first_size_usd) AS gross_wagered,
-  SUM(realized_pnl_A) / NULLIF(SUM(A_first_size_usd), 0) AS roi,
-  SUM(realized_pnl_A) / 1000.0 AS bankroll_return_pct  -- starting bankroll = $1000
+  COUNT(*) FILTER (WHERE entry_tier > 0) AS n_entries,
+  SUM(realized_pnl_usd) AS pnl_usd,
+  SUM(entry_size_usd) AS gross_wagered,
+  SUM(realized_pnl_usd) / NULLIF(SUM(entry_size_usd), 0) AS roi,
+  SUM(realized_pnl_usd) / 1000.0 AS bankroll_return_pct,  -- $1000 starting wallet
+  COUNT(*) FILTER (WHERE exit_reason = 'lag_closed') AS n_lag_closed,
+  COUNT(*) FILTER (WHERE exit_reason = 'stopped_out') AS n_stopped,
+  COUNT(*) FILTER (WHERE exit_reason = 'resolution') AS n_resolved,
+  AVG(exit_holding_seconds) FILTER (WHERE entry_tier > 0) AS mean_hold_s,
+  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'lag_closed') AS roi_lag_closed,
+  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'stopped_out') AS roi_stopped,
+  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'resolution') AS roi_resolved
 FROM window_outcomes_with_pnl
-GROUP BY 1, 2
-ORDER BY 1, 2;
-```
-
-For Strategy B, the equivalent query joins on the cash-out simulator's output table (one row per B entry with `B_realized_pnl`, `B_exit_reason`, `B_exit_tau_s`).
-
-```sql
--- Strategy B P&L (cash-out simulator output already joined)
-SELECT
-  asset,
-  date_trunc('day', to_timestamp(window_ts)) AS day,
-  COUNT(*) FILTER (WHERE B_first_tier > 0) AS n_bets,
-  SUM(realized_pnl_B) AS pnl_usd,
-  SUM(B_first_size_usd) AS gross_wagered,
-  -- breakdown by exit reason
-  COUNT(*) FILTER (WHERE B_exit_reason = 'lag_closed') AS n_lag_closed,
-  COUNT(*) FILTER (WHERE B_exit_reason = 'stopped_out') AS n_stopped,
-  COUNT(*) FILTER (WHERE B_exit_reason = 'resolution') AS n_resolved,
-  AVG(B_exit_holding_seconds) FILTER (WHERE B_first_tier > 0) AS mean_hold_s
-FROM window_outcomes_with_pnl
+WHERE params_id = :chosen_params
 GROUP BY 1, 2;
 ```
 
+A healthy strategy has 50%+ of exits as `lag_closed` (the thesis is actually working). Lots of `stopped_out` or `resolution` exits suggest the lag isn't real or our exit thresholds are mis-tuned.
+
 #### Metric 2 — Engagement rate
 
-The *per-cycle* rate is the headline. Compute both per-cycle and per-window so we can separate "model fires often" from "policy fires often" (one bet per window collapses many fires into one).
-
 ```sql
--- Strategy A per-cycle engagement, by τ bucket
 SELECT
   asset,
   CASE
@@ -782,99 +1049,97 @@ SELECT
     ELSE 'T-10..T-0'
   END AS tau_bucket,
   COUNT(*) AS n_decisions,
-  COUNT(*) FILTER (WHERE A_chosen_side != 'abstain') AS n_engaged_A,
-  COUNT(*) FILTER (WHERE B_chosen_side != 'abstain') AS n_engaged_B,
-  AVG(CASE WHEN A_chosen_side != 'abstain' THEN 1.0 ELSE 0.0 END) AS engagement_rate_A,
-  AVG(CASE WHEN B_chosen_side != 'abstain' THEN 1.0 ELSE 0.0 END) AS engagement_rate_B,
-  AVG(edge_A_best_abs) FILTER (WHERE edge_A_best_abs > -50) AS mean_edge_A,
-  AVG(edge_B_best_abs) FILTER (WHERE edge_B_best_abs > -50) AS mean_edge_B
+  COUNT(*) FILTER (WHERE event = 'entry') AS n_entries,
+  COUNT(*) FILTER (WHERE event = 'abstain') AS n_abstains,
+  AVG(CASE WHEN event = 'entry' THEN 1.0 ELSE 0.0 END) AS entry_rate,
+  AVG(edge_magnitude) FILTER (WHERE edge_magnitude > -50) AS mean_edge_observed,
+  COUNT(*) FILTER (WHERE abstention_reason = 'edge_below_floor') * 1.0
+    / NULLIF(COUNT(*) FILTER (WHERE event='abstain'), 0) AS pct_below_floor,
+  COUNT(*) FILTER (WHERE abstention_reason = 'model_warmup') * 1.0 / COUNT(*) AS pct_warmup,
+  COUNT(*) FILTER (WHERE abstention_reason = 'model_low_r2') * 1.0 / COUNT(*) AS pct_low_r2
 FROM decisions
 WHERE asset = 'btc'
 GROUP BY 1, 2
 ORDER BY 1, 2;
 ```
 
-Healthy ranges: 0.5%–8% per-cycle engagement, depending on tier floors. Below 0.5% means circuit breakers or warmup are dominating; above 10% means the floor is too low or edges are systematically overstated. Strategy B's per-cycle engagement is expected to be 2-5× higher than Strategy A's because microprice signals at large τ that midpoint doesn't.
+Healthy: 1-10% per-cycle entry rate (excluding warmup). The warmup hours should show 100% abstentions with reason `model_warmup`.
 
 #### Metric 3 — Average observed edge across all polls
-
-The unconditional distribution of model-vs-market disagreement, regardless of whether we acted.
 
 ```sql
 SELECT
   asset,
   COUNT(*) AS n_decisions,
-  -- Strategy A
-  AVG(edge_A_best_abs) AS mean_abs_edge_A,
-  AVG(edge_A_best_signed) AS mean_signed_edge_A,    -- ≈0 if unbiased
-  STDDEV(edge_A_best_signed) AS sd_signed_edge_A,
-  approx_quantile(edge_A_best_abs, 0.5) AS p50_abs_edge_A,
-  approx_quantile(edge_A_best_abs, 0.9) AS p90_abs_edge_A,
-  approx_quantile(edge_A_best_abs, 0.99) AS p99_abs_edge_A,
-  -- Strategy B
-  AVG(edge_B_best_abs) AS mean_abs_edge_B,
-  AVG(edge_B_best_signed) AS mean_signed_edge_B,
-  STDDEV(edge_B_best_signed) AS sd_signed_edge_B,
-  approx_quantile(edge_B_best_abs, 0.5) AS p50_abs_edge_B,
-  approx_quantile(edge_B_best_abs, 0.99) AS p99_abs_edge_B
+  AVG(edge_magnitude) AS mean_abs_edge,
+  AVG(edge_signed) AS mean_signed_edge,                  -- ≈0 if unbiased
+  STDDEV(edge_signed) AS sd_signed_edge,
+  approx_quantile(edge_magnitude, 0.5) AS p50,
+  approx_quantile(edge_magnitude, 0.9) AS p90,
+  approx_quantile(edge_magnitude, 0.99) AS p99,
+  AVG(edge_up_net) AS mean_edge_up,
+  AVG(edge_down_net) AS mean_edge_down
 FROM decisions
 WHERE asset = 'btc'
   AND coinbase_stale_ms < 5000
   AND polymarket_stale_ms < 60000
-  AND sigma_initialized
+  AND edge_magnitude > -50
 GROUP BY asset;
 ```
 
 Healthy values:
-- `mean_abs_edge` between 0.005 and 0.025 (50bp to 2.5%); larger means likely miscalibration
-- `|mean_signed_edge|` < 0.005 (no systematic directional bias)
-- `mean_abs_edge_B ≥ mean_abs_edge_A` is expected — microprice is a more aggressive predictor
+- `mean_abs_edge` between 0.005 and 0.025.
+- `|mean_signed_edge|` < 0.005 (no systematic directional bias).
+- `p99 / mean_abs_edge` ratio of 5-15 (heavy right tail is the strategy's natural shape).
 
 ### 10.6 The decisive diagnostic — edge realization slope
 
-This is the single most important plot. For each variant, regress realized P&L per dollar wagered against the edge observed at entry.
-
 ```sql
--- Strategy A
 WITH bets AS (
   SELECT
-    edge_A_best_signed AS edge_at_entry,
-    realized_pnl_A / A_first_size_usd AS realized_per_dollar
+    entry_edge_signed AS edge_at_entry,
+    realized_pnl_per_dollar AS realized
   FROM window_outcomes_with_pnl
-  WHERE A_first_tier > 0
+  WHERE entry_tier > 0
+    AND params_id = :chosen_params
 )
 SELECT
-  width_bucket(edge_at_entry, -0.10, 0.30, 16) AS bucket,
+  width_bucket(edge_at_entry, 0.0, 0.30, 12) AS bucket,
   COUNT(*) AS n,
   AVG(edge_at_entry) AS mean_edge,
-  AVG(realized_per_dollar) AS mean_realized,
-  STDDEV(realized_per_dollar) AS sd_realized
+  AVG(realized) AS mean_realized,
+  STDDEV(realized) AS sd_realized
 FROM bets
 GROUP BY 1
 ORDER BY 1;
 ```
 
-Plot mean_edge (x) vs mean_realized (y). The relationship should be **linear with slope ≈ 1**: a 5% reported edge should translate to a 5% realized return per dollar wagered. Slope < 0.3: most reported edge is illusory. Slope ≤ 0: model is anti-predictive — do not trade live under any circumstances.
-
-The same diagnostic for Strategy B uses `edge_B_best_signed` and the cash-out P&L. Comparing slopes across variants is the cleanest signal of which strategy is actually picking up real signal vs. noise.
+Plot `mean_edge` (x) vs `mean_realized` (y). Linear positive slope is the strategy's signature. Slope of 1.0 means we capture all reported edge as profit (impossible after costs); slope of 0.5 means costs eat half of the raw signal but the strategy is profitable. Slope ≤ 0 means the model has zero predictive value — do not trade.
 
 ### 10.7 Decision criteria for advancing to Phase 2
 
-Advance to Phase 2 (small live-money trial) if and only if:
+Advance to Phase 2 (small live-money trial) if and only if all of the following hold:
 
-1. **At least one variant** has positive total P&L over 24h with hit rate > 50% in tiers ≥ 3.
-2. The winning variant's edge realization slope (§10.6) is statistically distinguishable from zero with p < 0.10 (note: 24h sample is small; this is suggestive, not conclusive).
-3. `|mean_signed_edge|` < 0.008 for the winning strategy (no systematic directional bias).
-4. No more than 5% of windows had `K_uncertain=true` (Chainlink capture is reliable).
-5. WS reconnect events < 10 over the run.
+1. **Total P&L positive** with the best parameter combination from §10.3.
+2. **Median CV-R²** for the regression > 0.25 across all refits.
+3. **`estimated_lag_seconds`** is stable (sd across hourly means < 25s) and sits in the 15-120s range.
+4. **`q_predicted` mean absolute residual** < 0.03 — the model tracks Polymarket's level reliably.
+5. **Edge realization slope** statistically distinguishable from zero with p < 0.10.
+6. **`|mean_signed_edge| < 0.008`** — no systematic directional bias.
+7. **At least 50% of exits are `lag_closed`** — the thesis actually works.
+8. **Hit rate > 50% in tiers 3-5**.
+9. **No more than 5% of windows had `K_uncertain=true`**.
+10. **WS reconnect events < 10** over the run.
 
 Do not advance if:
-- Best variant lost money.
-- Edge realization slope ≤ 0 for all variants.
-- σ estimates clustered at unreasonable values (median annualized > 200%) — units bug.
+- Best parameters lose money on 24h.
+- Median R² < 0.10 (the strategy thesis is wrong; no parameter sweep can rescue it).
+- Edge realization slope ≤ 0.
+- Lag-close exit rate < 30%.
+- σ-realized estimates clustered at unreasonable values (median annualized > 200%) — feed quality problem.
 - Polymarket WS silent-freeze recurred more than 3× despite watchdog.
 
-If none of the variants are clearly profitable but Strategy B's slope is distinguishable from zero and Strategy A's isn't, that is itself useful information: it means the lag-arbitrage thesis is real but not yet large enough to clear costs. The next iteration should focus on reducing per-trip cost (smaller bets, only-tier-5 entries, maker orders for exit).
+If results are mixed — slope is positive but small, P&L is near zero after costs — that's diagnostic information. Iterate on the same logged data: try richer features, different lookback grids, smarter slippage estimation. Do not advance to live trading until criteria 1-10 are satisfied.
 
 ---
 
@@ -886,7 +1151,7 @@ If none of the variants are clearly profitable but Strategy B's slope is disting
 
 ```ini
 [Unit]
-Description=Polymarket Crypto Bot (dry-run)
+Description=Polymarket Crypto Lag-Arb Bot (dry-run)
 After=network-online.target
 Wants=network-online.target
 
@@ -913,7 +1178,7 @@ WantedBy=multi-user.target
 
 ### 11.2 Logging
 
-structlog → stdout → journald. JSON renderer when not a tty. Rotate journald via `/etc/systemd/journald.conf`:
+structlog → stdout → journald. JSON renderer when not a tty. journald rotation:
 
 ```
 SystemMaxUse=2G
@@ -921,61 +1186,69 @@ SystemMaxFileSize=200M
 MaxRetentionSec=14day
 ```
 
-Parquet rotation via filename (one file per hour per asset).
+Parquet rotation by filename (one file per hour per asset).
 
 ### 11.3 SSH-friendly tooling
 
 - **`journalctl -u polybot -f --output=cat`** — live tail
 - **`journalctl -u polybot -f --output=json | jq 'select(.level=="error")'`** — errors only
-- **`duckdb -c "SELECT * FROM 'logs/decisions/dt=2026-05-04/asset=btc/h=*.parquet' LIMIT 10"`** — quick inspect
-- **`pq head /path/to/file.parquet`** — Rust pqrs CLI for quick file inspection
-- **`polybot-metrics summary --asset btc --since=2026-05-04`** — wraps DuckDB queries from §10
-- **`polybot-metrics policy-compare`** — runs the variant table from §10.4
+- **`duckdb -c "SELECT * FROM 'logs/decisions/dt=*/asset=btc/h=*.parquet' LIMIT 10"`** — quick inspect
+- **`pq head /path/to/file.parquet`** — Rust pqrs CLI
+- **`polybot-metrics summary --asset btc --since=2026-05-04`** — wraps §10.5 queries
+- **`polybot-metrics model --latest`** — current model coefficients, R², estimated_lag_seconds
+- **`polybot-metrics model --since=runstart`** — model stability over time
+- **`polybot-metrics sweep --top=10`** — best parameter combinations from `parameter_sweep.py`
+- **`polybot-metrics edge-slope --params=:chosen`** — §10.6 diagnostic
 - **`polybot-ctl status | pause | resume`** — Unix domain socket control
 
 ### 11.4 Kill switches
 
-- `touch /run/polybot/STOP` — bot exits gracefully on next decision cycle
+- `touch /run/polybot/STOP` — graceful exit on next decision cycle
 - `systemctl stop polybot` — SIGTERM, 30s grace
 - Never `kill -9` — corrupts in-flight Parquet writes
 
 ### 11.5 Secrets
 
-`/etc/polybot/secrets.env`, mode 0600, owned by polybot user. `KEY=VALUE` per line, no quoting. structlog processors must redact any key containing `KEY|SECRET|PASSPHRASE|PRIVATE` on output. Never commit, never log.
+`/etc/polybot/secrets.env`, mode 0600, owned by polybot user. structlog processors must redact any key matching `KEY|SECRET|PASSPHRASE|PRIVATE`.
 
 ---
 
 ## 12. Risk and circuit breakers
 
-In Phase 1 these are abstention triggers; in Phase 2 they additionally prevent order placement.
+| Trigger                                       | Action                                  |
+|-----------------------------------------------|-----------------------------------------|
+| Coinbase WS no message in 5s                  | abstain new entries; reconnect; (Phase 2) force-exit any open position |
+| Polymarket WS no event in 60s                 | abstain; force reconnect; if reconnect fails twice, force-exit via REST |
+| Chainlink RTDS no tick in 90s                 | abstain                                 |
+| Coinbase sequence_num gap                     | drop book, fresh snapshot, abstain 30s  |
+| Polymarket spread > 0.10                      | abstain (round-trip too costly)         |
+| Tick-size change                              | log + revalidate active orders          |
+| **Model warmup not complete**                 | abstain                                 |
+| **Model CV-R² < 0.10 on most recent fit**     | abstain                                 |
+| **\|q_predicted − q_actual\| > 0.15**         | abstain (model disagrees with market)   |
+| **Last refit > 15 min ago**                   | abstain (model stale)                   |
+| Daily realized loss > 5% of starting wallet   | HARD STOP, page operator (Phase 2)      |
+| ≥ 1 open position in this window already      | refuse new entry                        |
+| ≥ 2 open positions across assets              | refuse new entry                        |
+| Wall clock vs Coinbase server time > 2s       | abstain                                 |
+| `/run/polybot/STOP` exists                    | graceful shutdown                       |
+| K_uncertain on current window                 | abstain entire window                   |
 
-| Trigger                                    | Action                                  |
-|--------------------------------------------|-----------------------------------------|
-| Coinbase WS no message in 5s               | abstain; reconnect after 10s            |
-| Polymarket WS no event in 60s              | abstain; force reconnect                |
-| Chainlink RTDS no tick in 90s              | abstain; reconnect                      |
-| Coinbase sequence_num gap                  | drop book, fresh snapshot, abstain 30s  |
-| σ > 5× rolling median (regime shift)       | abstain 60s                             |
-| Polymarket spread > 0.10                   | abstain                                 |
-| Tick-size change                           | log + revalidate active orders          |
-| Daily realized loss > 5% of starting wallet| HARD STOP, page operator (Phase 2)      |
-| ≥ 1 open position in window already        | refuse new (per strategy)               |
-| ≥ 2 open positions across assets           | refuse new                              |
-| Wall clock vs Coinbase server time > 2s    | abstain (boundary trust broken)         |
-| `/run/polybot/STOP` exists                 | graceful shutdown                       |
-| K_uncertain on current window              | abstain entire window                   |
+A lag-arb position whose data feed has gone stale is the worst case — we don't know if the lag has closed or widened. In Phase 2, always force-exit on persistent feed staleness rather than wait.
 
 ---
 
 ## 13. Phase 2 preview (not in scope yet)
 
-After dry-run analysis selects a winning variant:
+After dry-run analysis identifies best parameters:
 
 1. Authenticate Polymarket (L2 HMAC + proxy wallet sig type 1).
 2. Fund wallet with $50-100 USDC; one-time approvals via `approvals.py`.
-3. Run *only* the winning variant, *only* at the most conservative tier (delta ≥ 0.30, 10% wallet) for 1 week.
-4. Compare realized fills against backtest expectations (slippage, fee model accuracy, exit fill realism for Strategy B).
-5. Scale bankroll only if realized P&L is within ±25% of backtest expectations.
+3. Run with the best parameter combination, *only* at the most conservative tier (delta ≥ 0.30, 10% wallet) for 1 week.
+4. Bootstrap the regression from the dry-run final coefficients rather than cold-starting.
+5. Compare realized fills against backtest expectations.
+6. Implement maker-exit mode (post limit order at target exit price for fee rebate) and A/B test against taker-exit.
+7. Scale bankroll only if realized P&L is within ±25% of backtest expectations.
 
 Phase 2 is its own document and its own pull request.
 
@@ -985,22 +1258,26 @@ Phase 2 is its own document and its own pull request.
 
 - **CLOB v2 / pUSD migration** is recent (early 2026). py-clob-client-v2 has the new EIP-712 v2 signature scheme. Phase 1 read-only is unaffected; Phase 2 must use v2.
 - **Geographic restriction:** Polymarket's global CLOB restricts US persons. Phase 1 read-only is fine; Phase 2 from US must use Polymarket US (separate API at `api.polymarket.us`). Confirm jurisdictional compliance before live trading.
-- **5-minute markets are newer than 15-minute markets.** Fee coefficient Θ=0.05 is borrowed by analogy from 15m docs and confirmed empirically only after first live trades.
+- **5-minute markets are newer than 15-minute markets.** Fee coefficient Θ=0.05 is borrowed by analogy from 15m docs and confirmed only after first live trades.
 - **Polymarket WS silent-freeze (#292)** is real and unresolved; watchdog is mandatory.
-- **The "Polymarket lags Coinbase by 30-90s" figure** is anecdotal. Your dry-run cross-correlation analysis is the dispositive measurement — and Strategy B's profitability depends on it being real.
-- **EWMA λ=0.94 baseline** is from RiskMetrics (1994). Crypto-1-second-optimal λ may differ; sweep in dry run.
-- **Strategy B's edge depends on round-trip costs being smaller than raw lag.** Fee curve, spread distribution, and exit-side liquidity are all measurable in Phase 1 — if the math doesn't work, the dry run will show it without losing any real money.
-- **Microprice as a forward predictor** has well-known half-life of ~1-10 seconds in equity markets. Crypto half-life on Coinbase is unconfirmed in the literature for our purposes; the dry run measures it directly via `cross_corr(microprice_t, mid_{t+k})`.
+- **The "Polymarket lags Coinbase by 30-90s" assumption** is anecdotal. The dry-run regression validates or invalidates this directly. If the fitted lag is consistently small (< 5s), the strategy is unprofitable and we don't advance.
+- **Microprice as a forward predictor** has well-known half-life of ~1-10 seconds in equity markets. Crypto half-life on Coinbase is unconfirmed in literature for our purposes; the fitted regression's coefficient on `x_now` vs lagged x's effectively measures it.
+- **Adverse selection at lag-close** — when the lag closes, every other lag-arb bot is also trying to exit. Exit fills can be materially worse than mid-bid. The dry run's VWAP-against-logged-book simulation captures part of this but not the *competitive* dynamic; real Phase 2 fills may be worse.
+- **The 24h sample is small for parameter selection.** ~290 entries × 120+ parameter combinations is overfitting territory. Mitigations: (a) prefer parameters in stable plateaus rather than sharp peaks of the P&L surface, (b) treat Phase 2's first week as the real out-of-sample test, (c) extend the dry run to 7 days if 24h results are ambiguous.
+- **Regression refit cost.** Ridge regression on ~14k samples × ~15 features fits in well under a second; refit every 5 minutes is trivially cheap. If the feature set grows substantially (e.g., adding tree-based models or many polynomial features), revisit the refit cadence.
+- **Look-ahead bias in the offline ridge_alpha sweep.** Re-fitting the regression with different α at replay time and applying it retroactively is technically anachronistic — it uses information unavailable at the live decision tick. Mitigation: when sweeping α, use only data strictly prior to each replayed tick (rolling-origin cross-validation), not the full-run dataset. This is more expensive but honest.
 
 ---
 
 ## 15. Prior art to learn from
 
-- **Archetapp gist `7680adabc48f812a561ca79d73cbac69`** — confirms slug format, RTDS Chainlink as strike source.
-- **KaustubhPatange / `polymarket-trade-engine`** — TS reference for lifecycle state machine, market discovery, fill tracking.
-- **joicodev / `polymarket-bot`** — JS implementation of exactly our Black-Scholes + EWMA + logit-fusion stack; port the math.
+- **Archetapp gist `7680adabc48f812a561ca79d73cbac69`** — confirms slug format, RTDS Chainlink as strike source. Their bot is hold-to-resolution late-window entry, not lag arbitrage; we're doing something different.
+- **KaustubhPatange / `polymarket-trade-engine`** — TS reference for lifecycle state machine, market discovery, fill tracking. Architecturally useful even though strategy differs.
 - **NautilusTrader Polymarket integration** — production-grade Rust+Python framework with clean instrument loading and signature handling.
 - **Polymarket/agent-skills (`websocket.md`)** — authoritative WS protocol reference.
 - **Polymarket/real-time-data-client** — TS reference SDK for RTDS.
+- **Cont-Kukanov-Stoikov 2014** — foundational paper on Order Flow Imbalance. Required reading for the OFI feature in §6.2.
+- **Stoikov 2018 "The Micro-Price"** — foundational paper on microprice as a forward predictor of midpoint. Required reading for understanding why microprice is the right input to the regression.
+- **Hayashi-Yoshida 2005** — non-synchronous covariance estimator for tick data from two venues. Useful for offline lag analysis as a sanity check on what the regression's β coefficients are telling us.
 
-Read these before reinventing anything. The math, the lifecycle, and the WS protocols are all solved problems; what we're adding is the *side-by-side evaluation of two distinct exit policies on the same logged data*, which none of them do.
+Read these before reinventing anything. The OFI math, microprice theory, and WS protocols are all solved problems; what we're building on top is a *lead-lag regression with adaptive refitting and cash-out exit logic* that none of the published Polymarket bots implement.
