@@ -126,6 +126,7 @@ def main():
         clob_host=config.CLOB_HOST,
         chain_id=config.CHAIN_ID,
         dry_run=dry_run,
+        funder=config.FUNDER or None,
     )
 
     estimators: dict[str, MarkovEstimator] = {

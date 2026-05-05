@@ -19,6 +19,9 @@ API_SECRET     = os.getenv("API_SECRET", "")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE", "")
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
+# Your Polymarket account address (0x9244...). Required when using a relayer
+# signing key — the funder is the address that actually holds the USDC.
+FUNDER         = os.getenv("FUNDER", "")
 
 # ---------------------------------------------------------------------------
 # Dual-Mode model parameters (Section 8.1 of the paper)

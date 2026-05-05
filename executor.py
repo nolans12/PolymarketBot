@@ -25,6 +25,7 @@ class Executor:
         clob_host: str,
         chain_id: int = POLYGON,
         dry_run: bool = False,
+        funder: str = None,
     ):
         self.dry_run = dry_run
         self.client = ClobClient(
@@ -32,7 +33,7 @@ class Executor:
             key=private_key,
             chain_id=chain_id,
             signature_type=2,
-            funder=None,
+            funder=funder or None,
         )
 
         if api_key:
