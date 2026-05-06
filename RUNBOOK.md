@@ -639,6 +639,72 @@ What does transfer: the three threshold values (`LAG_CLOSE_THRESHOLD`,
 `STOP_THRESHOLD`, `FALLBACK_TAU_S`) from your sweep. Edit those three
 lines in `polybot/infra/config.py` on the VM before starting.
 
+### Live-API smoke tests (run BEFORE starting the bot)
+
+Before flipping `DRY_RUN=false` and running the full bot on real money, prove
+that order placement actually works with three small standalone scripts.
+
+**Step A — Dry-run check (no money moves)**
+
+```bash
+# Plans the trade, prints intent, doesn't place an order. Validates that
+# market resolution + WS book reading + order-args construction all work.
+python scripts/test_trade_buy.py --dry-run
+```
+
+You should see the resolved slug, the live Up/Down asks, and the order plan.
+No order_id is created on the exchange.
+
+**Step B — Single $5 BUY (real money)**
+
+```bash
+python scripts/test_trade_buy.py
+```
+
+Verify:
+- `ORDER PLACED | side=BUY | shares=… | order_id=…` appears in the log
+- An entry shows up in your Polymarket activity page
+- `.last_test_order.json` is written to disk
+
+**Step C — Cash out the position**
+
+```bash
+python scripts/test_trade_sell.py
+```
+
+Verify:
+- `ORDER PLACED | side=SELL | …` appears
+- The position closes on Polymarket activity page
+- `.last_test_order.json` now has a `sell` block with the exit price + gross P&L
+
+**Step D — Full cycle in one shot**
+
+```bash
+# Default: $5 BUY → hold 30s → SELL. Tweak --usd / --hold / --side as needed.
+python scripts/test_full_cycle.py
+
+# Or fully simulate without spending:
+python scripts/test_full_cycle.py --dry-run
+```
+
+This is the closest single-script approximation of one bot trade. Expect a
+small loss (~5–7% of size) on a 30s round-trip due to the entry+exit fees;
+the bot's lag-arb edge is what makes the math work in production.
+
+**If any test fails**, capture the full error output and the contents of
+`.last_test_order.json`. The most common failure modes:
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Could not resolve … market` | Window just closed/rolled; gamma not yet caught up | Wait 5–10s and retry |
+| `403 Forbidden` on order POST | API credentials invalid or signed for wrong wallet | Re-run `derive_creds.py` and re-paste into `.env` |
+| `Insufficient balance` | CLOB collateral is 0 even though on-chain USDC is funded | Approve USDC allowance via the Polymarket UI |
+| `ERROR: bad ask price: 0.0` | WS connected but book event was empty (one-sided market) | Retry — usually self-corrects within a window |
+| `No book snapshot within 5s` | Polymarket WS slow on first connect | Pass `--book-wait 15` to give it more time |
+
+Only after **all four steps succeed** should you flip `DRY_RUN=false` and
+launch the full bot.
+
 ---
 
 ## 11. Troubleshooting
