@@ -22,9 +22,11 @@ from polybot.infra.config import (
     ASSETS, DECISION_INTERVAL, WINDOW_SECONDS,
     BINANCE_STALE_MS_MAX, COINBASE_STALE_MS_MAX, POLY_STALE_MS_MAX, RTDS_STALE_MS_MAX,
     WIDE_SPREAD_THRESHOLD, KILL_SWITCH_PATH, DRY_RUN,
+    MODEL_MIN_CV_R2, MODEL_MAX_DISAGREEMENT, MODEL_MAX_STALE_SECONDS,
 )
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.models.features import build_features
+from polybot.models.edge import compute_edge
 from polybot.state.spot_book import SpotBook
 from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
@@ -263,19 +265,51 @@ class Scheduler:
             logger.debug("tick asset=%s tau=%.0f abstain=model_warmup", asset, tau_s)
             return
 
+        # --- Model sanity gates (CLAUDE.md §7) ---
+        stale_s = (tick_ns - model.last_refit_ns) / 1e9 if model.last_refit_ns else 9999
+        if model.r2_cv_mean < MODEL_MIN_CV_R2:
+            row["abstention_reason"] = "model_low_r2"
+            self.writer.write_decision(asset, row)
+            return
+        if stale_s > MODEL_MAX_STALE_SECONDS:
+            row["abstention_reason"] = "model_stale"
+            self.writer.write_decision(asset, row)
+            return
+
         row["model_version_id"] = model.version_id
         q_pred    = model.q_predicted(fv)
         q_settled = model.q_settled(fv)
+
         if q_pred is not None:
             row["q_predicted"] = float(q_pred)
         if q_settled is not None:
             row["q_settled"] = float(q_settled)
-        if q_pred is not None and row.get("q_up_ask") is not None:
-            row["q_predicted_minus_q_actual"] = float(q_pred - row["q_up_ask"])
 
-        # Stage 2C/2D will add edge calculation and entry/exit logic here.
+        q_up_ask = row.get("q_up_ask")
+        if q_pred is not None and q_up_ask is not None:
+            residual = float(q_pred - q_up_ask)
+            row["q_predicted_minus_q_actual"] = residual
+            if abs(residual) > MODEL_MAX_DISAGREEMENT:
+                row["abstention_reason"] = "model_disagrees_market"
+                self.writer.write_decision(asset, row)
+                return
+
+        # --- Edge calculation (Stage 2C) ---
+        if q_settled is not None and poly.ready:
+            er = compute_edge(
+                q_settled=q_settled,
+                poly=poly,
+                wallet_usd=1000.0,   # Stage 2D will inject real wallet
+            )
+            if er is not None:
+                row.update(er.as_dict())
+                row["edge_signed"]    = er.edge_signed
+                row["edge_magnitude"] = er.edge_magnitude
+                row["favored_side"]   = er.favored_side
+
+        # Stage 2D will add entry/exit logic here.
         row["event"] = "abstain"
-        row["abstention_reason"] = "model_warmup"
+        row["abstention_reason"] = "edge_below_floor"
         self.writer.write_decision(asset, row)
 
     # ------------------------------------------------------------------
