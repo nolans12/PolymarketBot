@@ -1,10 +1,15 @@
 """
-visualize_market.py — Collect 3 minutes of live data, then plot statically.
+visualize_market.py — Collect live data then plot all lag-indicator combos.
 
-Runs both feeds simultaneously for COLLECT_S seconds, then renders a
-two-axis static chart showing Binance BTC microprice vs Polymarket Up
-implied probability over time. Any visible lag between the lines is the
-arbitrage edge the regression exploits.
+Collects COLLECT_S seconds from Binance + Coinbase + Polymarket, then
+produces a multi-panel static chart with every combination useful for
+seeing the lag:
+
+  Panel 1 (main): Binance microprice + mid + Coinbase last-trade
+                  vs Polymarket Up bid/ask/mid
+  Panel 2:        Spread between Polymarket Up ask and Down ask (should sum ~1)
+  Panel 3:        % change from start — Binance microprice + Coinbase
+                  vs Poly Up mid (shift Binance right to align with Poly)
 
 Usage:
     python scripts/visualize_market.py
@@ -13,11 +18,14 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import websockets
 
 from polybot.clients.binance_ws import BinanceWS
 from polybot.clients.polymarket_ws import PolymarketWS
@@ -26,28 +34,97 @@ from polybot.state.spot_book import SpotBook
 from polybot.state.poly_book import PolyBook
 from polybot.infra.config import ASSETS
 
+COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--collect", type=int, default=180,
-                   help="Seconds to collect data before plotting (default 180)")
+                   help="Seconds to collect (default 180)")
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Coinbase ticker feed (public, no auth)
+# ---------------------------------------------------------------------------
+
+async def _coinbase_ticker(data: dict, stop_flag: asyncio.Event) -> None:
+    """
+    Subscribe to Coinbase Advanced Trade WS ticker channel for BTC-USD.
+    Appends (timestamp, price) to data['cb_times'] / data['cb_price'].
+    """
+    subscribe_msg = {
+        "type": "subscribe",
+        "product_ids": ["BTC-USD"],
+        "channel": "ticker",
+    }
+    last_cb_t = 0.0
+    reconnect_delay = 2.0
+
+    while not stop_flag.is_set():
+        try:
+            async with websockets.connect(
+                COINBASE_WS,
+                ping_interval=20,
+                ping_timeout=10,
+                extra_headers={"User-Agent": "polybot-visualizer/1.0"},
+            ) as ws:
+                await ws.send(json.dumps(subscribe_msg))
+                async for raw in ws:
+                    if stop_flag.is_set():
+                        return
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    channel = msg.get("channel", "")
+                    if channel != "ticker":
+                        continue
+                    for ev in msg.get("events", []):
+                        for tick in ev.get("tickers", []):
+                            price_str = tick.get("price")
+                            if not price_str:
+                                continue
+                            try:
+                                price = float(price_str)
+                            except ValueError:
+                                continue
+                            t = time.time()
+                            if t - last_cb_t < 0.1:
+                                continue
+                            last_cb_t = t
+                            data["cb_times"].append(t)
+                            data["cb_price"].append(price)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if stop_flag.is_set():
+                return
+            print(f"\r  [Coinbase WS reconnect: {exc}]   ", end="", flush=True)
+            await asyncio.sleep(reconnect_delay)
 
 
 # ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
 
-async def collect(collect_s: int) -> tuple[list, list, list, list, str]:
-    """
-    Returns (b_times, b_prices, p_times, p_prices, slug).
-    Uses BinanceWS and PolymarketWS exactly as the demo scripts do.
-    """
-    b_times:  list[float] = []
-    b_prices: list[float] = []
-    p_times:  list[float] = []
-    p_prices: list[float] = []
-    slug = "unknown"
+async def collect(collect_s: int):
+    """Collect all series; returns a dict of named lists."""
+    data = {
+        "b_times":  [],   # Binance timestamps
+        "b_micro":  [],   # Binance microprice
+        "b_mid":    [],   # Binance plain mid
+        "cb_times": [],   # Coinbase timestamps
+        "cb_price": [],   # Coinbase last-trade price
+        "p_times":  [],   # Polymarket timestamps
+        "p_up_bid": [],
+        "p_up_ask": [],
+        "p_up_mid": [],
+        "p_dn_bid": [],
+        "p_dn_ask": [],
+        "p_dn_mid": [],
+        "slug":     "unknown",
+    }
 
     spot_books = {a: SpotBook(a) for a in ASSETS}
     poly_books = {a: PolyBook(a) for a in ASSETS}
@@ -59,33 +136,42 @@ async def collect(collect_s: int) -> tuple[list, list, list, list, str]:
         if asset != "btc" or not book.ready:
             return
         t = time.time()
-        if t - last_b_t < 0.2:   # cap at ~5 Hz
+        if t - last_b_t < 0.2:
             return
         last_b_t = t
-        b_times.append(t)
-        b_prices.append(book.microprice)
+        data["b_times"].append(t)
+        data["b_micro"].append(book.microprice)
+        data["b_mid"].append(book.mid)
 
     def on_poly(asset: str, book: PolyBook) -> None:
         if asset != "btc" or not book.ready:
             return
         up = book.up
-        if up and 0 < up.best_bid and up.best_ask < 1:
-            p_times.append(time.time())
-            p_prices.append(up.mid)
+        dn = book.down
+        if not (up and dn):
+            return
+        if not (0 < up.best_bid and up.best_ask < 1):
+            return
+        data["p_times"].append(time.time())
+        data["p_up_bid"].append(up.best_bid)
+        data["p_up_ask"].append(up.best_ask)
+        data["p_up_mid"].append(up.mid)
+        data["p_dn_bid"].append(dn.best_bid)
+        data["p_dn_ask"].append(dn.best_ask)
+        data["p_dn_mid"].append(dn.mid)
 
     binance_ws = BinanceWS(books=spot_books, on_update=on_binance)
     poly_ws    = PolymarketWS(books=poly_books, on_update=on_poly)
 
-    # Resolve current BTC market for Polymarket
     window_ts = current_window_ts()
     market = fetch_market("btc", window_ts)
     if market:
-        slug = market["slug"]
+        data["slug"] = market["slug"]
         poly_books["btc"].set_tokens(market["up_token_id"], market["down_token_id"])
         poly_ws.subscribe("btc", market["up_token_id"], market["down_token_id"])
-        print(f"  Market: {slug}", flush=True)
+        print(f"  Market: {market['slug']}", flush=True)
     else:
-        print("  WARNING: BTC market not found — Polymarket feed will be empty", flush=True)
+        print("  WARNING: BTC market not found", flush=True)
 
     print(f"  Collecting for {collect_s}s…", flush=True)
 
@@ -100,115 +186,203 @@ async def collect(collect_s: int) -> tuple[list, list, list, list, str]:
 
     async def _progress():
         while not stop_flag.is_set():
-            elapsed = time.time() - start
-            b_last = f"{b_prices[-1]:,.2f}" if b_prices else "—"
-            p_last = f"{p_prices[-1]:.4f}" if p_prices else "—"
+            el = time.time() - start
+            b_last  = f"{data['b_micro'][-1]:,.2f}"  if data["b_micro"]  else "—"
+            cb_last = f"{data['cb_price'][-1]:,.2f}" if data["cb_price"] else "—"
+            p_last  = f"{data['p_up_mid'][-1]:.4f}"  if data["p_up_mid"] else "—"
             print(
-                f"\r  t={elapsed:4.0f}s  "
-                f"Binance: {b_last} ({len(b_prices)} pts)  "
-                f"Polymarket Up: {p_last} ({len(p_prices)} pts)  "
-                f"[{collect_s - elapsed:.0f}s left]   ",
+                f"\r  t={el:4.0f}s  Binance: {b_last} ({len(data['b_micro'])} pts)  "
+                f"Coinbase: {cb_last} ({len(data['cb_price'])} pts)  "
+                f"Poly Up: {p_last} ({len(data['p_up_mid'])} pts)  "
+                f"[{collect_s - el:.0f}s left]   ",
                 end="", flush=True,
             )
             await asyncio.sleep(1.0)
 
-    # Run feeds; cancel all tasks once the timer fires.
     loop = asyncio.get_event_loop()
     tasks = [
         loop.create_task(binance_ws.run()),
         loop.create_task(poly_ws.run()),
+        loop.create_task(_coinbase_ticker(data, stop_flag)),
         loop.create_task(_progress()),
     ]
-
-    await _timer()   # blocks for collect_s seconds, then sets stop_flag + calls .stop()
-
+    await _timer()
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
     print()
-    return b_times, b_prices, p_times, p_prices, slug
+    return data
 
 
 # ---------------------------------------------------------------------------
-# Static plot
+# Multi-panel static plot
 # ---------------------------------------------------------------------------
 
-def plot(b_times, b_prices, p_times, p_prices, slug, collect_s):
+def plot(data: dict, collect_s: int) -> None:
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import matplotlib.gridspec as gridspec
     from datetime import datetime
 
+    slug    = data["slug"]
+    b_times = data["b_times"]
+    p_times = data["p_times"]
+    cb_times = data["cb_times"]
+
     if not b_times:
-        print("No Binance data collected — cannot plot.", file=sys.stderr)
+        print("No Binance data — cannot plot.", file=sys.stderr)
         return
-    if not p_times:
-        print("No Polymarket data collected — plotting Binance only.", file=sys.stderr)
 
-    # Convert unix timestamps to datetime
-    b_dt = [datetime.fromtimestamp(t) for t in b_times]
-    p_dt = [datetime.fromtimestamp(t) for t in p_times]
+    b_dt  = [datetime.fromtimestamp(t) for t in b_times]
+    p_dt  = [datetime.fromtimestamp(t) for t in p_times]
+    cb_dt = [datetime.fromtimestamp(t) for t in cb_times]
 
-    fig, ax_b = plt.subplots(figsize=(15, 6))
-    ax_p = ax_b.twinx()
-
-    fig.patch.set_facecolor("#111111")
-    ax_b.set_facecolor("#111111")
-    for ax in (ax_b, ax_p):
-        ax.tick_params(colors="#bbbbbb", labelsize=9)
-        for spine in ax.spines.values():
-            spine.set_color("#333333")
-
-    # Plot Binance microprice
-    ax_b.plot(b_dt, b_prices, color="#4da6ff", linewidth=1.4,
-              label=f"Binance microprice  ({len(b_prices)} pts)", zorder=3)
-
-    # Plot Polymarket Up mid as a step-style line (prices only change on events)
-    if p_times:
-        ax_p.step(p_dt, p_prices, color="#ff8c42", linewidth=1.6,
-                  where="post", label=f"Polymarket Up mid  ({len(p_prices)} pts)",
-                  zorder=4)
-        ax_p.set_ylim(
-            max(0.0, min(p_prices) - 0.05),
-            min(1.0, max(p_prices) + 0.05),
-        )
-
-    # Labels
-    ax_b.set_ylabel("Binance BTC microprice  (USD)", color="#4da6ff", fontsize=10)
-    ax_p.set_ylabel("Polymarket Up implied prob  (0–1)", color="#ff8c42", fontsize=10)
-    ax_b.set_xlabel("Time (UTC)", color="#aaaaaa", fontsize=9)
-
-    ax_b.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-    plt.setp(ax_b.xaxis.get_majorticklabels(), rotation=25, ha="right")
-    ax_b.grid(axis="y", color="#222222", linewidth=0.5, linestyle="--")
-
-    # Legend combining both axes
-    lines_b, labels_b = ax_b.get_legend_handles_labels()
-    lines_p, labels_p = ax_p.get_legend_handles_labels()
-    ax_b.legend(lines_b + lines_p, labels_b + labels_p,
-                loc="upper left", facecolor="#1c1c1c",
-                edgecolor="#444444", labelcolor="#cccccc", fontsize=9)
-
+    has_poly     = bool(p_times)
+    has_coinbase = bool(cb_times)
     duration = b_times[-1] - b_times[0] if len(b_times) >= 2 else 0
-    ax_b.set_title(
-        f"{slug}  —  {collect_s}s collection  "
-        f"({duration:.0f}s span)\n"
-        "Look for orange line trailing blue at inflection points → that delay is the lag",
-        color="#dddddd", fontsize=10, pad=10,
+
+    # ---- Figure layout: 3 rows ----
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor("#111111")
+    gs = gridspec.GridSpec(3, 1, figure=fig, hspace=0.45,
+                           height_ratios=[3, 1.2, 1.2])
+
+    def _style(ax):
+        ax.set_facecolor("#111111")
+        ax.tick_params(colors="#bbbbbb", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#333333")
+        ax.grid(axis="y", color="#222222", linewidth=0.4, linestyle="--")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=20, ha="right", fontsize=7)
+
+    # ================================================================
+    # Panel 1: Spot prices vs Polymarket Up probability
+    # ================================================================
+    ax1 = fig.add_subplot(gs[0])
+    ax1r = ax1.twinx()
+    _style(ax1)
+    ax1r.set_facecolor("#111111")
+    ax1r.tick_params(colors="#ff8c42", labelsize=8)
+
+    # Binance mid (dashed, light blue)
+    ax1.plot(b_dt, data["b_mid"], color="#6699cc", linewidth=0.9,
+             alpha=0.5, linestyle="--", label="Binance mid")
+    # Binance microprice (solid, bright blue)
+    ax1.plot(b_dt, data["b_micro"], color="#4da6ff", linewidth=1.6,
+             label="Binance microprice")
+    # Coinbase last-trade (green)
+    if has_coinbase:
+        ax1.plot(cb_dt, data["cb_price"], color="#44cc88", linewidth=1.2,
+                 alpha=0.85, linestyle="-", label="Coinbase last trade")
+
+    if has_poly:
+        # Up bid (lower bound)
+        ax1r.step(p_dt, data["p_up_bid"], color="#cc5500", linewidth=0.9,
+                  alpha=0.6, where="post", linestyle=":", label="Poly Up bid")
+        # Up ask
+        ax1r.step(p_dt, data["p_up_ask"], color="#ff6600", linewidth=0.9,
+                  alpha=0.6, where="post", linestyle="-.", label="Poly Up ask")
+        # Up mid (clearest signal)
+        ax1r.step(p_dt, data["p_up_mid"], color="#ff8c42", linewidth=2.0,
+                  where="post", label="Poly Up mid")
+        # Down mid (moves inversely)
+        ax1r.step(p_dt, data["p_dn_mid"], color="#cc44ff", linewidth=1.2,
+                  alpha=0.7, where="post", linestyle="--", label="Poly Down mid")
+
+        lo = max(0.0, min(min(data["p_up_bid"]), min(data["p_dn_mid"])) - 0.04)
+        hi = min(1.0, max(max(data["p_up_ask"]), max(data["p_dn_mid"])) + 0.04)
+        ax1r.set_ylim(lo, hi)
+
+    ax1.set_ylabel("BTC price (USD)", color="#4da6ff", fontsize=9)
+    ax1r.set_ylabel("Polymarket implied prob", color="#ff8c42", fontsize=9)
+
+    lines1,  labels1  = ax1.get_legend_handles_labels()
+    lines1r, labels1r = ax1r.get_legend_handles_labels()
+    ax1.legend(lines1 + lines1r, labels1 + labels1r,
+               loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
+               labelcolor="#ccc", fontsize=8, ncol=2)
+    ax1.set_title(
+        f"{slug}  —  {collect_s}s collection  ({duration:.0f}s actual)\n"
+        "Blue = Binance (microprice solid, mid dashed).  "
+        "Green = Coinbase last trade.  Orange = Poly Up.  Purple = Poly Down.",
+        color="#dddddd", fontsize=9, pad=6,
     )
 
-    fig.tight_layout(pad=1.5)
+    # ================================================================
+    # Panel 2: Poly Up ask + Down ask (should sum to ~1.0 + 2×fee)
+    # ================================================================
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)
+    _style(ax2)
 
-    # Annotation: mark the first inflection where lag is visible
-    # (just a text hint, not auto-detected)
-    fig.text(0.5, 0.002,
-             "Tip: zoom in on a sharp Binance move and see how many seconds before "
-             "Polymarket (orange) catches up",
-             ha="center", color="#666666", fontsize=8)
+    if has_poly:
+        ax2.step(p_dt, data["p_up_ask"], color="#ff8c42", linewidth=1.4,
+                 where="post", label="Up ask")
+        ax2.step(p_dt, data["p_dn_ask"], color="#cc44ff", linewidth=1.4,
+                 where="post", label="Down ask")
+        p_sum = [u + d for u, d in zip(data["p_up_ask"], data["p_dn_ask"])]
+        ax2.step(p_dt, p_sum, color="#888888", linewidth=0.9, alpha=0.6,
+                 where="post", linestyle="--", label="Up ask + Down ask")
+        ax2.axhline(1.0, color="#555555", linewidth=0.7, linestyle=":")
+        ax2.set_ylim(min(min(data["p_up_ask"]), min(data["p_dn_ask"])) - 0.02,
+                     max(p_sum) + 0.02)
+    ax2.set_ylabel("Ask prices", color="#bbbbbb", fontsize=9)
+    ax2.legend(loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
+               labelcolor="#ccc", fontsize=8)
+    ax2.set_title("Polymarket Up ask vs Down ask  (sum ≈ 1 + fees)",
+                  color="#aaaaaa", fontsize=8, pad=4)
 
+    # ================================================================
+    # Panel 3: % change from start — all spot feeds vs Poly Up mid
+    #          Shift any spot curve RIGHT by estimated lag to align with Poly
+    # ================================================================
+    ax3 = fig.add_subplot(gs[2], sharex=ax1)
+    ax3r = ax3.twinx()
+    _style(ax3)
+    ax3r.set_facecolor("#111111")
+    ax3r.tick_params(colors="#ff8c42", labelsize=8)
+
+    if len(data["b_micro"]) >= 2:
+        base_mp = data["b_micro"][0]
+        b_pct = [(v / base_mp - 1) * 100 for v in data["b_micro"]]
+        ax3.plot(b_dt, b_pct, color="#4da6ff", linewidth=1.4,
+                 label="Binance microprice Δ%")
+        ax3.axhline(0, color="#444444", linewidth=0.5)
+
+    if has_coinbase and len(data["cb_price"]) >= 2:
+        base_cb = data["cb_price"][0]
+        cb_pct = [(v / base_cb - 1) * 100 for v in data["cb_price"]]
+        ax3.plot(cb_dt, cb_pct, color="#44cc88", linewidth=1.0,
+                 alpha=0.85, label="Coinbase Δ%")
+
+    ax3.set_ylabel("Spot Δ% from start", color="#4da6ff", fontsize=8)
+
+    if has_poly and len(data["p_up_mid"]) >= 2:
+        base_pm = data["p_up_mid"][0]
+        p_pct = [(v - base_pm) * 100 for v in data["p_up_mid"]]
+        ax3r.step(p_dt, p_pct, color="#ff8c42", linewidth=1.6,
+                  where="post", label="Poly Up mid Δ pp")
+        ax3r.axhline(0, color="#664400", linewidth=0.5)
+        ax3r.set_ylabel("Poly Up Δ prob-points", color="#ff8c42", fontsize=8)
+
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    lines3r, labels3r = ax3r.get_legend_handles_labels()
+    ax3.legend(lines3 + lines3r, labels3 + labels3r,
+               loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
+               labelcolor="#ccc", fontsize=8)
+    ax3.set_title(
+        "% change from start — shift a spot curve RIGHT by estimated lag to align with Poly",
+        color="#aaaaaa", fontsize=8, pad=4,
+    )
+    ax3.set_xlabel("Time (local)", color="#aaaaaa", fontsize=8)
+
+    # ================================================================
+    # Save + show
+    # ================================================================
     outfile = Path("lag_plot.png")
     plt.savefig(outfile, dpi=150, bbox_inches="tight", facecolor="#111111")
-    print(f"\nSaved to: {outfile.resolve()}")
+    print(f"Saved: {outfile.resolve()}")
     plt.show()
 
 
@@ -218,24 +392,20 @@ def plot(b_times, b_prices, p_times, p_prices, slug, collect_s):
 
 def main():
     args = parse_args()
-
-    print(f"=== BTC Lag Visualizer ===")
-    print(f"Collecting {args.collect}s of live data from Binance + Polymarket…")
+    print("=== BTC Lag Visualizer ===")
+    print(f"Collecting {args.collect}s of live data…")
 
     try:
-        b_times, b_prices, p_times, p_prices, slug = asyncio.run(
-            collect(args.collect)
-        )
+        data = asyncio.run(collect(args.collect))
     except KeyboardInterrupt:
-        print("\nStopped early — plotting what we have…")
-        # asyncio.run won't return partial data on KeyboardInterrupt
-        # so we can't recover; just exit
+        print("\nStopped early.")
         sys.exit(0)
 
-    print(f"\nCollected: Binance {len(b_prices)} pts, Polymarket {len(p_prices)} pts")
+    print(f"Collected: Binance {len(data['b_micro'])} pts, "
+          f"Coinbase {len(data['cb_price'])} pts, "
+          f"Polymarket {len(data['p_up_mid'])} pts")
     print("Rendering plot…")
-
-    plot(b_times, b_prices, p_times, p_prices, slug, args.collect)
+    plot(data, args.collect)
 
 
 if __name__ == "__main__":
