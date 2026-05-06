@@ -57,6 +57,13 @@ MIN_TRAIN_SAMPLES      = 360          # first fit after ~6 min at 1 sample/s
 RIDGE_ALPHAS           = [0.001, 0.01, 0.1, 1.0, 10.0]
 HELDOUT_FRACTION       = 0.20         # hold out last 20% for out-of-sample R²
 
+# Training-sample filter: only train on yes_mid in [MIN, MAX].
+# Extreme tails (p>0.95 or p<0.05) have logit values that disproportionately
+# pull the regression. Filtering them keeps the model focused on the
+# uncertain-middle regime where the lag-arb edge actually lives.
+TRAIN_YES_MID_MIN      = 0.05
+TRAIN_YES_MID_MAX      = 0.95
+
 # Model sanity gates — abstain when these are violated
 MODEL_MIN_CV_R2        = 0.05         # permissive during early data collection
 MODEL_MAX_DISAGREEMENT = 0.20         # |q_predicted - q_actual| before we distrust model

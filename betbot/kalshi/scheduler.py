@@ -28,6 +28,7 @@ from betbot.kalshi.config import (
     LAG_CLOSE_THRESHOLD, MIN_TRAIN_SAMPLES,
     REFIT_INTERVAL_S, SAMPLE_INTERVAL_S,
     STOP_THRESHOLD, THETA_FEE, TRAINING_WINDOW_S,
+    TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
 from betbot.kalshi.model import KalshiRegressionModel, ModelDiagnostics
@@ -314,6 +315,9 @@ class Scheduler:
             yes_mid  = r["yes_mid"]
             if K <= 0 or mp_now <= 0 or yes_mid <= 0 or yes_mid >= 1:
                 continue
+            # Same training filter as the live sampler: skip extreme tails
+            if not (TRAIN_YES_MID_MIN <= yes_mid <= TRAIN_YES_MID_MAX):
+                continue
 
             ts = r["ts_ns"]
             mp15  = lagged("btc_micro", ts -  15 * 1_000_000_000, i)
@@ -364,7 +368,11 @@ class Scheduler:
             try:
                 cb, kb = self._cb, self._kb
                 fv = build_features(cb, kb)
-                if fv is not None and fv.complete:
+                # Only train on the uncertain-middle regime; extreme tails
+                # (p>0.95 or p<0.05) are dominated by end-of-window resolution
+                # noise rather than the lag-arb signal we want to learn.
+                if (fv is not None and fv.complete
+                        and TRAIN_YES_MID_MIN <= kb.yes_mid <= TRAIN_YES_MID_MAX):
                     y = _logit(kb.yes_mid)
                     self._buf.append(fv.as_array(), y)
 

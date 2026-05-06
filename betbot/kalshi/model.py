@@ -27,6 +27,19 @@ from betbot.kalshi.features import (
 from betbot.kalshi.config import RIDGE_ALPHAS, HELDOUT_FRACTION
 
 
+def _clip_r2(r2: float) -> float:
+    """
+    Clip an R^2 to a sane range. R^2 can legitimately be negative (worse than
+    mean baseline), but when held-out target variance is near zero (e.g. early
+    in a run when yes_mid is flat), the formula 1 - SSE/SST explodes to values
+    like -1e30. Clipping to [-10, 1] preserves the "model is bad" signal
+    without producing unreadable garbage in logs.
+    """
+    if not np.isfinite(r2):
+        return -10.0
+    return max(-10.0, min(1.0, float(r2)))
+
+
 @dataclass
 class ModelDiagnostics:
     version_id:           str
@@ -107,9 +120,9 @@ class KalshiRegressionModel:
                        fit_intercept=True)
         mdl.fit(X_tr_s, y_train)
 
-        r2_in  = float(mdl.score(X_tr_s, y_train))
-        r2_cv  = float(getattr(mdl, "best_score_", r2_in))
-        r2_hld = float(mdl.score(X_va_s, y_val)) if X_va_s is not None and len(y_val) > 0 else 0.0
+        r2_in  = _clip_r2(mdl.score(X_tr_s, y_train))
+        r2_cv  = _clip_r2(getattr(mdl, "best_score_", r2_in))
+        r2_hld = _clip_r2(mdl.score(X_va_s, y_val)) if X_va_s is not None and len(y_val) > 0 else 0.0
 
         new_coefs = mdl.coef_.copy()
 
