@@ -1,432 +1,528 @@
 """
-visualize_market.py — Collect live data then plot all lag-indicator combos.
+visualize_market.py — Collect 60s of Binance/Coinbase BTC + Kalshi 15-min odds, then plot.
 
-Collects COLLECT_S seconds from Binance + Coinbase + Polymarket, then
-produces a multi-panel static chart with every combination useful for
-seeing the lag:
+Goal: visually confirm whether Kalshi's yes probability LAGS spot.
 
-  Panel 1 (main): Binance microprice + mid + Coinbase last-trade
-                  vs Polymarket Up bid/ask/mid
-  Panel 2:        Spread between Polymarket Up ask and Down ask (should sum ~1)
-  Panel 3:        % change from start — Binance microprice + Coinbase
-                  vs Poly Up mid (shift Binance right to align with Poly)
+  Panel 1 (main): Spot microprice (left axis) vs Kalshi YES bid/ask (right axis)
+  Panel 2:        Absolute Δ from start on dual axes — lag is visible here.
 
 Usage:
     python scripts/visualize_market.py
-    python scripts/visualize_market.py --collect 180
+    python scripts/visualize_market.py --collect 120
+    python scripts/visualize_market.py --spot binance      # use Binance (VPN required)
+    python scripts/visualize_market.py --spot coinbase     # use Coinbase (US, no VPN)
+    python scripts/visualize_market.py --ticker KXBTC15M-26MAY061415-00
 """
 
 import argparse
 import asyncio
+import base64
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from dotenv import load_dotenv
+load_dotenv()
+
+import requests
 import websockets
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
-from polybot.clients.binance_ws import BinanceWS
-from polybot.clients.polymarket_ws import PolymarketWS
-from polybot.clients.polymarket_rest import fetch_market, current_window_ts
-from polybot.state.spot_book import SpotBook
-from polybot.state.poly_book import PolyBook
-from polybot.infra.config import ASSETS
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
+COINBASE_WS  = "wss://advanced-trade-ws.coinbase.com"
+BINANCE_WS   = "wss://stream.binance.com:9443"
+KALSHI_REST  = "https://api.elections.kalshi.com"
+KALSHI_WS    = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+API_PREFIX   = "/trade-api/v2"
+WS_PATH      = "/trade-api/ws/v2"
+SPRINT_SERIES = {"btc": "KXBTC15M", "eth": "KXETH15M"}
+
+# ---------------------------------------------------------------------------
+# Kalshi auth
+# ---------------------------------------------------------------------------
+
+def load_private_key():
+    pem_inline = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
+    pem_file   = os.getenv("KALSHI_PRIVATE_KEY_FILE", "")
+    if pem_inline:
+        pem_bytes = pem_inline.encode().replace(b"\\n", b"\n")
+    elif pem_file:
+        p = Path(pem_file).expanduser()
+        if not p.exists():
+            sys.exit(f"ERROR: KALSHI_PRIVATE_KEY_FILE missing: {p}")
+        pem_bytes = p.read_bytes()
+    else:
+        sys.exit("ERROR: set KALSHI_PRIVATE_KEY_FILE or KALSHI_PRIVATE_KEY_PEM in .env")
+    return serialization.load_pem_private_key(pem_bytes, password=None)
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--collect", type=int, default=180,
-                   help="Seconds to collect (default 180)")
-    return p.parse_args()
+def _sign(pk, method: str, path: str) -> tuple[str, str]:
+    ts = str(int(time.time() * 1000))
+    msg = (ts + method.upper() + path).encode()
+    sig = pk.sign(
+        msg,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
+    return ts, base64.b64encode(sig).decode()
+
+
+def _auth_headers(pk, key_id: str, method: str, path: str) -> dict:
+    ts, sig = _sign(pk, method, path)
+    return {"KALSHI-ACCESS-KEY": key_id,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig}
 
 
 # ---------------------------------------------------------------------------
-# Coinbase ticker feed (public, no auth)
+# Market discovery
 # ---------------------------------------------------------------------------
 
-async def _coinbase_ticker(data: dict, stop_flag: asyncio.Event) -> None:
-    """
-    Subscribe to Coinbase Advanced Trade WS ticker channel for BTC-USD.
-    Captures last-trade price and computes microprice from best bid/ask when available.
-    Appends to data['cb_times'] / data['cb_price'] / data['cb_micro'].
-    """
-    subscribe_msg = {
-        "type": "subscribe",
-        "product_ids": ["BTC-USD"],
-        "channel": "ticker",
-    }
-    last_cb_t = 0.0
-    reconnect_delay = 2.0
-    attempt = 0
+def _close_within_minutes(m: dict, n: int) -> bool:
+    from datetime import datetime, timezone
+    ct = m.get("close_time", "")
+    try:
+        dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    return 0 < (dt - datetime.now(timezone.utc)).total_seconds() <= n * 60
 
-    while not stop_flag.is_set():
+
+def discover_kalshi_market(key_id: str, pk, asset: str) -> dict:
+    series    = SPRINT_SERIES[asset]
+    sign_path = f"{API_PREFIX}/markets"
+    headers   = {"Accept": "application/json",
+                 **_auth_headers(pk, key_id, "GET", sign_path)}
+    r = requests.get(KALSHI_REST + sign_path, headers=headers,
+                     params={"status": "open", "series_ticker": series, "limit": 200},
+                     timeout=10)
+    r.raise_for_status()
+    markets = r.json().get("markets", []) or []
+    sprints = [m for m in markets if _close_within_minutes(m, 16)]
+    if not sprints:
+        markets.sort(key=lambda m: m.get("close_time", "9999"))
+        if not markets:
+            sys.exit(f"No open {asset.upper()} markets found in {series}.")
+        print(f"  WARN: no sprint closing within 16 min — using nearest market")
+        sprints = [markets[0]]
+    return sprints[0]
+
+
+# ---------------------------------------------------------------------------
+# Coinbase collector
+# ---------------------------------------------------------------------------
+
+async def collect_coinbase(product: str, data: dict, stop: asyncio.Event):
+    sub = {"type": "subscribe", "product_ids": [product], "channel": "ticker"}
+    last_t = 0.0
+    while not stop.is_set():
         try:
-            attempt += 1
             async with websockets.connect(
-                COINBASE_WS,
-                ping_interval=20,
-                ping_timeout=10,
-                open_timeout=10,
+                COINBASE_WS, ping_interval=20, ping_timeout=10, open_timeout=10,
             ) as ws:
-                attempt = 0
-                await ws.send(json.dumps(subscribe_msg))
+                await ws.send(json.dumps(sub))
                 async for raw in ws:
-                    if stop_flag.is_set():
+                    if stop.is_set():
                         return
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
-
-                    channel = msg.get("channel", "")
-                    # subscriptions ack and heartbeats — skip
-                    if channel not in ("ticker", ""):
+                    if msg.get("channel") not in ("ticker", ""):
                         continue
-
                     for ev in msg.get("events", []):
                         for tick in ev.get("tickers", []):
-                            if tick.get("product_id") != "BTC-USD":
+                            if tick.get("product_id") != product:
                                 continue
-
-                            price_str = tick.get("price")
-                            bid_str   = tick.get("best_bid")
-                            ask_str   = tick.get("best_ask")
-                            bid_qty   = tick.get("best_bid_quantity")
-                            ask_qty   = tick.get("best_ask_quantity")
-
-                            if not price_str:
+                            price_s = tick.get("price")
+                            bid_s   = tick.get("best_bid")
+                            ask_s   = tick.get("best_ask")
+                            bq_s    = tick.get("best_bid_quantity")
+                            aq_s    = tick.get("best_ask_quantity")
+                            if not price_s:
                                 continue
-                            try:
-                                price = float(price_str)
-                            except ValueError:
-                                continue
-
                             t = time.time()
-                            if t - last_cb_t < 0.1:
+                            if t - last_t < 0.05:
                                 continue
-                            last_cb_t = t
-                            data["cb_times"].append(t)
-                            data["cb_price"].append(price)
-
-                            # Compute microprice if bid/ask/sizes are present
+                            last_t = t
                             try:
-                                if bid_str and ask_str and bid_qty and ask_qty:
-                                    bid  = float(bid_str)
-                                    ask  = float(ask_str)
-                                    bsz  = float(bid_qty)
-                                    asz  = float(ask_qty)
-                                    if bsz + asz > 0:
-                                        mp = (bid * asz + ask * bsz) / (bsz + asz)
-                                        data["cb_micro"].append(mp)
-                                    else:
-                                        data["cb_micro"].append(price)
+                                price = float(price_s)
+                                if bid_s and ask_s and bq_s and aq_s:
+                                    bid = float(bid_s); ask = float(ask_s)
+                                    bsz = float(bq_s);  asz = float(aq_s)
+                                    mp = (bid * asz + ask * bsz) / (bsz + asz) if (bsz + asz) > 0 else price
                                 else:
-                                    data["cb_micro"].append(price)
+                                    mp = price
                             except (ValueError, TypeError):
-                                data["cb_micro"].append(price)
+                                continue
+                            data["cb_t"].append(t)
+                            data["cb_price"].append(price)
+                            data["cb_micro"].append(mp)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            if stop.is_set():
+                return
+            await asyncio.sleep(2)
+
+
+# ---------------------------------------------------------------------------
+# Binance collector (L2 book — microprice from best bid/ask + sizes)
+# ---------------------------------------------------------------------------
+
+async def collect_binance(symbol: str, data: dict, stop: asyncio.Event):
+    """Binance combined stream: bookTicker gives best bid/ask/sizes in real time."""
+    url  = f"{BINANCE_WS}/ws/{symbol.lower()}@bookTicker"
+    last_t = 0.0
+    while not stop.is_set():
+        try:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=10, open_timeout=10,
+            ) as ws:
+                async for raw in ws:
+                    if stop.is_set():
+                        return
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    # bookTicker: {b: best_bid, B: bid_qty, a: best_ask, A: ask_qty}
+                    bid_s = msg.get("b"); ask_s = msg.get("a")
+                    bsz_s = msg.get("B"); asz_s = msg.get("A")
+                    if not (bid_s and ask_s and bsz_s and asz_s):
+                        continue
+                    t = time.time()
+                    if t - last_t < 0.05:
+                        continue
+                    last_t = t
+                    try:
+                        bid = float(bid_s); ask = float(ask_s)
+                        bsz = float(bsz_s); asz = float(asz_s)
+                        mid = (bid + ask) / 2.0
+                        mp  = (bid * asz + ask * bsz) / (bsz + asz) if (bsz + asz) > 0 else mid
+                    except (ValueError, TypeError):
+                        continue
+                    data["cb_t"].append(t)
+                    data["cb_price"].append(mid)
+                    data["cb_micro"].append(mp)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            if stop.is_set():
+                return
+            await asyncio.sleep(2)
+
+
+# ---------------------------------------------------------------------------
+# Kalshi collector
+# ---------------------------------------------------------------------------
+
+async def collect_kalshi(ticker: str, data: dict, stop: asyncio.Event,
+                         key_id: str, pk):
+    """
+    Mirror the demo_kalshi_ws.py stream() architecture exactly:
+    - inline ping (no subtask)
+    - asyncio.wait_for(ws.recv(), 1s) so we never block and can check stop
+    - heartbeat emit inline so plot has continuous data even during quiet markets
+    - fresh auth headers on every connection attempt
+    """
+    yes_book: dict[float, float] = {}
+    no_book:  dict[float, float] = {}
+    ping_id   = 100
+    last_ping = 0.0
+    last_emit = 0.0
+    last_update = 0.0   # last real orderbook_snapshot or orderbook_delta received
+    STALE_TIMEOUT = 10.0  # force reconnect if no real update in this many seconds
+
+    while not stop.is_set():
+        headers = _auth_headers(pk, key_id, "GET", WS_PATH)
+        yes_book.clear()
+        no_book.clear()
+
+        try:
+            async with websockets.connect(
+                KALSHI_WS,
+                additional_headers=list(headers.items()),
+                ping_interval=None,
+                open_timeout=15,
+            ) as ws:
+                # Subscribe to orderbook_delta (book) + ticker (last trade) —
+                # same channels the demo uses; more traffic keeps connection alive.
+                for sub_id, ch in [(1, "orderbook_delta"), (2, "ticker")]:
+                    await ws.send(json.dumps({
+                        "id": sub_id, "cmd": "subscribe",
+                        "params": {"channels": [ch], "market_tickers": [ticker]},
+                    }))
+
+                last_ping   = time.time()
+                last_emit   = time.time()
+                last_update = time.time()  # reset on each fresh connection
+
+                while not stop.is_set():
+                    now = time.time()
+
+                    # Watchdog: if no real update has arrived in STALE_TIMEOUT seconds,
+                    # break out of the inner loop to force a full reconnect.
+                    if now - last_update >= STALE_TIMEOUT:
+                        print(f"\n  [Kalshi WS] no update for {STALE_TIMEOUT:.0f}s — reconnecting…",
+                              flush=True)
+                        break
+
+                    # Send ping every 8s — server drops connection after ~15s silence
+                    if now - last_ping >= 8.0:
+                        await ws.send(json.dumps({"id": ping_id, "cmd": "ping"}))
+                        ping_id  += 1
+                        last_ping = now
+
+                    # Heartbeat: emit last-known book every 2s so plot has
+                    # continuous data even when the market isn't moving
+                    if now - last_emit >= 2.0 and yes_book and no_book:
+                        yb = max(yes_book);  ya = 1.0 - max(no_book)
+                        if ya > yb:
+                            data["k_t"].append(now)
+                            data["k_bid"].append(yb)
+                            data["k_ask"].append(ya)
+                            data["k_mid"].append((yb + ya) / 2.0)
+                        last_emit = now
+
+                    # 1-second timeout so we loop back to check stop + ping + hb
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    t = msg.get("type")
+                    p = msg.get("msg") or {}
+                    if t in ("subscribed", "pong"):
+                        continue
+                    if (p.get("market_ticker") or p.get("ticker")) != ticker:
+                        continue
+
+                    changed = False
+                    if t == "orderbook_snapshot":
+                        yes_book = {float(a): float(b) for a, b in p.get("yes_dollars_fp", [])}
+                        no_book  = {float(a): float(b) for a, b in p.get("no_dollars_fp",  [])}
+                        changed     = True
+                        last_update = now
+                    elif t == "orderbook_delta":
+                        side = p.get("side")
+                        pr   = p.get("price_dollars")
+                        dl   = p.get("delta_fp")
+                        if side in ("yes", "no") and pr and dl:
+                            book  = yes_book if side == "yes" else no_book
+                            price = float(pr); delta = float(dl)
+                            book[price] = book.get(price, 0.0) + delta
+                            if book[price] <= 0:
+                                book.pop(price, None)
+                            changed     = True
+                            last_update = now
+
+                    if changed and yes_book and no_book:
+                        yb = max(yes_book);  ya = 1.0 - max(no_book)
+                        if ya > yb:
+                            now2 = time.time()
+                            data["k_t"].append(now2)
+                            data["k_bid"].append(yb)
+                            data["k_ask"].append(ya)
+                            data["k_mid"].append((yb + ya) / 2.0)
+                            last_emit = now2
 
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            if stop_flag.is_set():
+        except Exception as e:
+            if stop.is_set():
                 return
-            delay = min(reconnect_delay * attempt, 15.0)
-            print(f"\r  [Coinbase WS err={exc!r} retry in {delay:.0f}s]   ",
-                  end="", flush=True)
-            await asyncio.sleep(delay)
+            print(f"\n  [Kalshi WS] {type(e).__name__}: {e} — reconnecting…", flush=True)
+            await asyncio.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
-# Data collection
+# Collection runner
 # ---------------------------------------------------------------------------
 
-async def collect(collect_s: int):
-    """Collect all series; returns a dict of named lists."""
+async def collect(collect_s: int, asset: str, ticker: str,
+                  key_id: str, pk, spot: str = "binance") -> dict:
     data = {
-        "b_times":  [],   # Binance timestamps
-        "b_micro":  [],   # Binance microprice
-        "b_mid":    [],   # Binance plain mid
-        "cb_times": [],   # Coinbase timestamps
-        "cb_price": [],   # Coinbase last-trade price
-        "cb_micro": [],   # Coinbase microprice (bid*ask_sz + ask*bid_sz / total)
-        "p_times":  [],   # Polymarket timestamps
-        "p_up_bid": [],
-        "p_up_ask": [],
-        "p_up_mid": [],
-        "p_dn_bid": [],
-        "p_dn_ask": [],
-        "p_dn_mid": [],
-        "slug":     "unknown",
+        "cb_t": [], "cb_price": [], "cb_micro": [],
+        "k_t":  [], "k_bid": [],   "k_ask": [],   "k_mid": [],
     }
-
-    spot_books = {a: SpotBook(a) for a in ASSETS}
-    poly_books = {a: PolyBook(a) for a in ASSETS}
-
-    last_b_t = 0.0
-
-    def on_binance(asset: str, book: SpotBook) -> None:
-        nonlocal last_b_t
-        if asset != "btc" or not book.ready:
-            return
-        t = time.time()
-        if t - last_b_t < 0.2:
-            return
-        last_b_t = t
-        data["b_times"].append(t)
-        data["b_micro"].append(book.microprice)
-        data["b_mid"].append(book.mid)
-
-    def on_poly(asset: str, book: PolyBook) -> None:
-        if asset != "btc" or not book.ready:
-            return
-        up = book.up
-        dn = book.down
-        if not (up and dn):
-            return
-        if not (0 < up.best_bid and up.best_ask < 1):
-            return
-        data["p_times"].append(time.time())
-        data["p_up_bid"].append(up.best_bid)
-        data["p_up_ask"].append(up.best_ask)
-        data["p_up_mid"].append(up.mid)
-        data["p_dn_bid"].append(dn.best_bid)
-        data["p_dn_ask"].append(dn.best_ask)
-        data["p_dn_mid"].append(dn.mid)
-
-    binance_ws = BinanceWS(books=spot_books, on_update=on_binance)
-    poly_ws    = PolymarketWS(books=poly_books, on_update=on_poly)
-
-    window_ts = current_window_ts()
-    market = fetch_market("btc", window_ts)
-    if market:
-        data["slug"] = market["slug"]
-        poly_books["btc"].set_tokens(market["up_token_id"], market["down_token_id"])
-        poly_ws.subscribe("btc", market["up_token_id"], market["down_token_id"])
-        print(f"  Market: {market['slug']}", flush=True)
-    else:
-        print("  WARNING: BTC market not found", flush=True)
-
-    print(f"  Collecting for {collect_s}s…", flush=True)
-
-    start = time.time()
-    stop_flag = asyncio.Event()
+    cb_product = "BTC-USD" if asset == "btc" else "ETH-USD"
+    bn_symbol  = "BTCUSDT" if asset == "btc" else "ETHUSDT"
+    stop       = asyncio.Event()
+    start      = time.time()
 
     async def _timer():
-        await asyncio.sleep(collect_s)
-        stop_flag.set()
-        binance_ws.stop()
-        poly_ws.stop()
-
-    async def _progress():
-        while not stop_flag.is_set():
-            el = time.time() - start
-            b_last  = f"{data['b_micro'][-1]:,.2f}"  if data["b_micro"]  else "—"
-            cb_last = f"{data['cb_price'][-1]:,.2f}" if data["cb_price"] else "no CB"
-            p_last  = f"{data['p_up_mid'][-1]:.4f}"  if data["p_up_mid"] else "—"
-            print(
-                f"\r  t={el:4.0f}s  Binance: {b_last} ({len(data['b_micro'])}pts)  "
-                f"Coinbase: {cb_last} ({len(data['cb_price'])}pts)  "
-                f"Poly: {p_last} ({len(data['p_up_mid'])}pts)  "
-                f"[{collect_s - el:.0f}s left]   ",
-                end="", flush=True,
-            )
+        while not stop.is_set():
+            elapsed   = time.time() - start
+            remaining = collect_s - elapsed
+            cb_pts    = len(data["cb_micro"])
+            k_pts     = len(data["k_mid"])
+            src       = spot.capitalize()
+            print(f"\r  [{elapsed:5.1f}s / {collect_s}s]  "
+                  f"{src}: {cb_pts} pts  Kalshi: {k_pts} pts  "
+                  f"[{remaining:.0f}s left]   ",
+                  end="", flush=True)
+            if elapsed >= collect_s:
+                stop.set()
+                return
             await asyncio.sleep(1.0)
 
-    loop = asyncio.get_event_loop()
+    spot_task = (
+        asyncio.create_task(collect_binance(bn_symbol, data, stop))
+        if spot == "binance"
+        else asyncio.create_task(collect_coinbase(cb_product, data, stop))
+    )
     tasks = [
-        loop.create_task(binance_ws.run()),
-        loop.create_task(poly_ws.run()),
-        loop.create_task(_coinbase_ticker(data, stop_flag)),
-        loop.create_task(_progress()),
+        spot_task,
+        asyncio.create_task(collect_kalshi(ticker, data, stop, key_id, pk)),
+        asyncio.create_task(_timer()),
     ]
-    await _timer()
-    for t in tasks:
-        t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-
     print()
     return data
 
 
 # ---------------------------------------------------------------------------
-# Multi-panel static plot
+# Static lag-detection plot
 # ---------------------------------------------------------------------------
 
-def plot(data: dict, collect_s: int) -> None:
+def plot(data: dict, asset: str, ticker: str, strike: float, collect_s: int):
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     import matplotlib.gridspec as gridspec
     from datetime import datetime
 
-    slug    = data["slug"]
-    b_times = data["b_times"]
-    p_times = data["p_times"]
-    cb_times = data["cb_times"]
+    cb_t     = data["cb_t"]
+    k_t      = data["k_t"]
+    cb_micro = data["cb_micro"]
+    cb_price = data["cb_price"]
+    k_bid    = data["k_bid"]
+    k_ask    = data["k_ask"]
+    k_mid    = data["k_mid"]
 
-    if not b_times:
-        print("No Binance data — cannot plot.", file=sys.stderr)
+    if not cb_t:
+        print("No Coinbase data — cannot plot.", file=sys.stderr)
+        return
+    if not k_t:
+        print("No Kalshi data — cannot plot.", file=sys.stderr)
         return
 
-    b_dt  = [datetime.fromtimestamp(t) for t in b_times]
-    p_dt  = [datetime.fromtimestamp(t) for t in p_times]
-    cb_dt = [datetime.fromtimestamp(t) for t in cb_times]
+    cb_dt = [datetime.fromtimestamp(t) for t in cb_t]
+    k_dt  = [datetime.fromtimestamp(t) for t in k_t]
 
-    has_poly     = bool(p_times)
-    has_coinbase = bool(cb_times)
-    duration = b_times[-1] - b_times[0] if len(b_times) >= 2 else 0
-
-    # ---- Figure layout: 3 rows ----
-    fig = plt.figure(figsize=(16, 12))
+    fig = plt.figure(figsize=(15, 10))
     fig.patch.set_facecolor("#111111")
-    gs = gridspec.GridSpec(3, 1, figure=fig, hspace=0.45,
-                           height_ratios=[3, 1.2, 1.2])
+    gs = gridspec.GridSpec(2, 1, figure=fig, hspace=0.5, height_ratios=[1.2, 1])
 
-    def _style(ax):
+    def _style(ax, ylabel="", ycolor="#cccccc"):
         ax.set_facecolor("#111111")
-        ax.tick_params(colors="#bbbbbb", labelsize=8)
+        ax.tick_params(colors="#aaaaaa", labelsize=8)
         for sp in ax.spines.values():
             sp.set_color("#333333")
-        ax.grid(axis="y", color="#222222", linewidth=0.4, linestyle="--")
+        ax.grid(color="#1e1e1e", linewidth=0.5)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=20, ha="right", fontsize=7)
+        if ylabel:
+            ax.set_ylabel(ylabel, color=ycolor, fontsize=9)
+
+    asset_upper = asset.upper()
+    strike_str  = f"${strike:,.2f}"
 
     # ================================================================
-    # Panel 1: Spot prices vs Polymarket Up probability
+    # Panel 1: raw prices on dual axes
     # ================================================================
-    ax1 = fig.add_subplot(gs[0])
+    ax1  = fig.add_subplot(gs[0])
     ax1r = ax1.twinx()
-    _style(ax1)
+    _style(ax1, f"{asset_upper} price (USD)", "#00e676")
     ax1r.set_facecolor("#111111")
     ax1r.tick_params(colors="#ff8c42", labelsize=8)
 
-    # Binance mid (dashed, light blue)
-    ax1.plot(b_dt, data["b_mid"], color="#6699cc", linewidth=0.9,
-             alpha=0.5, linestyle="--", label="Binance mid")
-    # Binance microprice (solid, bright blue)
-    ax1.plot(b_dt, data["b_micro"], color="#4da6ff", linewidth=1.6,
-             label="Binance microprice")
-    # Coinbase last-trade (green)
-    if has_coinbase:
-        ax1.plot(cb_dt, data["cb_price"], color="#44cc88", linewidth=1.0,
-                 alpha=0.55, linestyle="--", label="Coinbase last trade")
-        if data["cb_micro"]:
-            ax1.plot(cb_dt[:len(data["cb_micro"])], data["cb_micro"],
-                     color="#00ff99", linewidth=1.5, label="Coinbase microprice")
+    ax1.plot(cb_dt, cb_price, color="#44cc88", linewidth=0.8,
+             alpha=0.5, linestyle="--", label="Coinbase last trade")
+    ax1.plot(cb_dt, cb_micro, color="#00e676", linewidth=1.6,
+             label="Coinbase microprice")
 
-    if has_poly:
-        # Up bid (lower bound)
-        ax1r.step(p_dt, data["p_up_bid"], color="#cc5500", linewidth=0.9,
-                  alpha=0.6, where="post", linestyle=":", label="Poly Up bid")
-        # Up ask
-        ax1r.step(p_dt, data["p_up_ask"], color="#ff6600", linewidth=0.9,
-                  alpha=0.6, where="post", linestyle="-.", label="Poly Up ask")
-        # Up mid (clearest signal)
-        ax1r.step(p_dt, data["p_up_mid"], color="#ff8c42", linewidth=2.0,
-                  where="post", label="Poly Up mid")
-        # Down mid (moves inversely)
-        ax1r.step(p_dt, data["p_dn_mid"], color="#cc44ff", linewidth=1.2,
-                  alpha=0.7, where="post", linestyle="--", label="Poly Down mid")
+    ax1r.step(k_dt, [b * 100 for b in k_bid], color="#cc5500", linewidth=0.8,
+              where="post", alpha=0.6, linestyle=":", label="Kalshi YES bid (¢)")
+    ax1r.step(k_dt, [a * 100 for a in k_ask], color="#ff6600", linewidth=0.8,
+              where="post", alpha=0.6, linestyle="-.", label="Kalshi YES ask (¢)")
+    ax1r.step(k_dt, [m * 100 for m in k_mid], color="#ff8c42", linewidth=2.0,
+              where="post", label="Kalshi YES mid (¢)")
 
-        lo = max(0.0, min(min(data["p_up_bid"]), min(data["p_dn_mid"])) - 0.04)
-        hi = min(1.0, max(max(data["p_up_ask"]), max(data["p_dn_mid"])) + 0.04)
-        ax1r.set_ylim(lo, hi)
+    ax1r.set_ylabel("Kalshi YES probability (¢)", color="#ff8c42", fontsize=9)
+    lo = max(0, min(k_bid) * 100 - 5) if k_bid else 0
+    hi = min(100, max(k_ask) * 100 + 5) if k_ask else 100
+    ax1r.set_ylim(lo, hi)
 
-    ax1.set_ylabel("BTC price (USD)", color="#4da6ff", fontsize=9)
-    ax1r.set_ylabel("Polymarket implied prob", color="#ff8c42", fontsize=9)
-
-    lines1,  labels1  = ax1.get_legend_handles_labels()
-    lines1r, labels1r = ax1r.get_legend_handles_labels()
-    ax1.legend(lines1 + lines1r, labels1 + labels1r,
-               loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
-               labelcolor="#ccc", fontsize=8, ncol=2)
+    h1, l1   = ax1.get_legend_handles_labels()
+    h1r, l1r = ax1r.get_legend_handles_labels()
+    ax1.legend(h1 + h1r, l1 + l1r, loc="upper left",
+               facecolor="#1c1c1c", edgecolor="#444", labelcolor="#ccc",
+               fontsize=8, ncol=2)
     ax1.set_title(
-        f"{slug}  —  {collect_s}s collection  ({duration:.0f}s actual)\n"
-        "Blue = Binance (microprice solid, mid dashed).  "
-        "Green = Coinbase last trade.  Orange = Poly Up.  Purple = Poly Down.",
+        f"{ticker}  |  Strike: {strike_str}  |  {collect_s}s collection\n"
+        f"Green = Coinbase microprice (USD).  Orange = Kalshi YES probability.",
         color="#dddddd", fontsize=9, pad=6,
     )
 
     # ================================================================
-    # Panel 2: Poly Up ask + Down ask (should sum to ~1.0 + 2×fee)
+    # Panel 2: absolute change from start — dual axes so scales match
+    #   Left  (green): Coinbase microprice Δ USD
+    #   Right (orange): Kalshi YES mid Δ probability-points (×100 = cents)
+    #
+    # If Kalshi lags Coinbase, the orange line will mirror the green
+    # line but shifted right by N seconds.
     # ================================================================
-    ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    _style(ax2)
+    ax2  = fig.add_subplot(gs[1], sharex=ax1)
+    ax2r = ax2.twinx()
+    _style(ax2, f"Coinbase Δ USD from start", "#00e676")
+    ax2r.set_facecolor("#111111")
+    ax2r.tick_params(colors="#ff8c42", labelsize=8)
+    ax2.axhline(0, color="#444444", linewidth=0.6, linestyle="--")
+    ax2r.axhline(0, color="#442200", linewidth=0.6, linestyle="--")
 
-    if has_poly:
-        ax2.step(p_dt, data["p_up_ask"], color="#ff8c42", linewidth=1.4,
-                 where="post", label="Up ask")
-        ax2.step(p_dt, data["p_dn_ask"], color="#cc44ff", linewidth=1.4,
-                 where="post", label="Down ask")
-        p_sum = [u + d for u, d in zip(data["p_up_ask"], data["p_dn_ask"])]
-        ax2.step(p_dt, p_sum, color="#888888", linewidth=0.9, alpha=0.6,
-                 where="post", linestyle="--", label="Up ask + Down ask")
-        ax2.axhline(1.0, color="#555555", linewidth=0.7, linestyle=":")
-        ax2.set_ylim(min(min(data["p_up_ask"]), min(data["p_dn_ask"])) - 0.02,
-                     max(p_sum) + 0.02)
-    ax2.set_ylabel("Ask prices", color="#bbbbbb", fontsize=9)
-    ax2.legend(loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
-               labelcolor="#ccc", fontsize=8)
-    ax2.set_title("Polymarket Up ask vs Down ask  (sum ≈ 1 + fees)",
-                  color="#aaaaaa", fontsize=8, pad=4)
+    if len(cb_micro) >= 2:
+        base_cb  = cb_micro[0]
+        cb_delta = [v - base_cb for v in cb_micro]
+        ax2.plot(cb_dt, cb_delta, color="#00e676", linewidth=1.8,
+                 label=f"Coinbase microprice  Δ USD  (base={base_cb:,.2f})")
 
-    # ================================================================
-    # Panel 3: % change from start — all spot feeds vs Poly Up mid
-    #          Shift any spot curve RIGHT by estimated lag to align with Poly
-    # ================================================================
-    ax3 = fig.add_subplot(gs[2], sharex=ax1)
-    ax3r = ax3.twinx()
-    _style(ax3)
-    ax3r.set_facecolor("#111111")
-    ax3r.tick_params(colors="#ff8c42", labelsize=8)
+    if len(k_mid) >= 2:
+        base_km  = k_mid[0]
+        k_delta  = [(v - base_km) * 100 for v in k_mid]   # in cents (prob-points)
+        ax2r.step(k_dt, k_delta, color="#ff8c42", linewidth=1.8,
+                  where="post",
+                  label=f"Kalshi YES mid  Δ cents  (base={base_km*100:.1f}¢)")
 
-    if len(data["b_micro"]) >= 2:
-        base_mp = data["b_micro"][0]
-        b_pct = [(v / base_mp - 1) * 100 for v in data["b_micro"]]
-        ax3.plot(b_dt, b_pct, color="#4da6ff", linewidth=1.4,
-                 label="Binance microprice Δ%")
-        ax3.axhline(0, color="#444444", linewidth=0.5)
+    ax2r.set_ylabel("Kalshi YES mid Δ cents", color="#ff8c42", fontsize=9)
+    ax2.set_xlabel("Time (local)", color="#aaaaaa", fontsize=8)
 
-    if has_coinbase and len(data["cb_price"]) >= 2:
-        base_cb = data["cb_price"][0]
-        cb_pct = [(v / base_cb - 1) * 100 for v in data["cb_price"]]
-        ax3.plot(cb_dt, cb_pct, color="#44cc88", linewidth=0.8,
-                 alpha=0.5, linestyle="--", label="Coinbase last trade Δ%")
-    if has_coinbase and len(data["cb_micro"]) >= 2:
-        base_cm = data["cb_micro"][0]
-        cm_pct = [(v / base_cm - 1) * 100 for v in data["cb_micro"]]
-        cb_micro_dt = cb_dt[:len(data["cb_micro"])]
-        ax3.plot(cb_micro_dt, cm_pct, color="#00ff99", linewidth=1.2,
-                 label="Coinbase microprice Δ%")
-
-    ax3.set_ylabel("Spot Δ% from start", color="#4da6ff", fontsize=8)
-
-    if has_poly and len(data["p_up_mid"]) >= 2:
-        base_pm = data["p_up_mid"][0]
-        p_pct = [(v - base_pm) * 100 for v in data["p_up_mid"]]
-        ax3r.step(p_dt, p_pct, color="#ff8c42", linewidth=1.6,
-                  where="post", label="Poly Up mid Δ pp")
-        ax3r.axhline(0, color="#664400", linewidth=0.5)
-        ax3r.set_ylabel("Poly Up Δ prob-points", color="#ff8c42", fontsize=8)
-
-    lines3, labels3 = ax3.get_legend_handles_labels()
-    lines3r, labels3r = ax3r.get_legend_handles_labels()
-    ax3.legend(lines3 + lines3r, labels3 + labels3r,
-               loc="upper left", facecolor="#1c1c1c", edgecolor="#444",
-               labelcolor="#ccc", fontsize=8)
-    ax3.set_title(
-        "% change from start — shift a spot curve RIGHT by estimated lag to align with Poly",
+    h2,  l2  = ax2.get_legend_handles_labels()
+    h2r, l2r = ax2r.get_legend_handles_labels()
+    ax2.legend(h2 + h2r, l2 + l2r, loc="upper left",
+               facecolor="#1c1c1c", edgecolor="#444", labelcolor="#ccc", fontsize=8)
+    ax2.set_title(
+        "LAG DETECTION — if Kalshi lags Coinbase, orange trails green by N seconds.\n"
+        "Left axis = Coinbase Δ USD.  Right axis = Kalshi YES mid Δ cents.",
         color="#aaaaaa", fontsize=8, pad=4,
     )
-    ax3.set_xlabel("Time (local)", color="#aaaaaa", fontsize=8)
 
-    # ================================================================
-    # Save + show
-    # ================================================================
-    outfile = Path("lag_plot.png")
+    outfile = Path(f"lag_plot_{asset}.png")
     plt.savefig(outfile, dpi=150, bbox_inches="tight", facecolor="#111111")
     print(f"Saved: {outfile.resolve()}")
     plt.show()
@@ -436,23 +532,50 @@ def plot(data: dict, collect_s: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
-    print("=== BTC Lag Visualizer ===")
-    print(f"Collecting {args.collect}s of live data…")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--collect", type=int, default=60,
+                   help="Seconds to collect (default 60).")
+    p.add_argument("--asset", choices=["btc", "eth"], default="btc")
+    p.add_argument("--ticker", default=None,
+                   help="Kalshi ticker; skip auto-discovery.")
+    p.add_argument("--spot", choices=["binance", "coinbase"], default="binance",
+                   help="Spot feed: binance (VPN, higher freq) or coinbase (US, no VPN). Default: binance.")
+    return p.parse_args()
 
+
+def main():
+    args   = parse_args()
+    key_id = os.getenv("KALSHI_API_KEY_ID", "").strip()
+    if not key_id:
+        sys.exit("ERROR: KALSHI_API_KEY_ID not set in .env")
+    pk = load_private_key()
+
+    print(f"=== {args.asset.upper()} lag visualizer — {args.collect}s collect then plot  [spot={args.spot}] ===")
+
+    if args.ticker:
+        ticker = args.ticker
+        strike = 0.0
+    else:
+        print("  Discovering Kalshi 15-min market…")
+        m      = discover_kalshi_market(key_id, pk, args.asset)
+        ticker = m["ticker"]
+        strike = float(m.get("floor_strike") or m.get("strike_value") or 0)
+        print(f"  Ticker: {ticker}  Strike: ${strike:,.2f}  Closes: {m.get('close_time')}")
+
+    print(f"  Collecting {args.collect}s from Coinbase + Kalshi…")
     try:
-        data = asyncio.run(collect(args.collect))
+        data = asyncio.run(collect(args.collect, args.asset, ticker, key_id, pk, spot=args.spot))
     except KeyboardInterrupt:
-        print("\nStopped early.")
+        print("\nStopped.")
         sys.exit(0)
 
-    print(f"Collected: Binance {len(data['b_micro'])} pts, "
-          f"Coinbase last-trade {len(data['cb_price'])} pts "
-          f"(microprice {len(data['cb_micro'])} pts), "
-          f"Polymarket {len(data['p_up_mid'])} pts")
-    print("Rendering plot…")
-    plot(data, args.collect)
+    print(f"  Coinbase: {len(data['cb_micro'])} pts   Kalshi: {len(data['k_mid'])} pts")
+    if not data["cb_micro"] or not data["k_mid"]:
+        sys.exit("Not enough data collected — check feeds and try again.")
+
+    print("  Rendering plot…")
+    plot(data, args.asset, ticker, strike, args.collect)
 
 
 if __name__ == "__main__":
