@@ -264,6 +264,20 @@ class PolymarketRTDS:
             if captured and self.on_k_captured:
                 self.on_k_captured(asset, window)
 
+        # First tick per asset: log so we know RTDS is alive
+        if not getattr(self, "_logged_first_tick", {}).get(asset):
+            if not hasattr(self, "_logged_first_tick"):
+                self._logged_first_tick = {}
+            self._logged_first_tick[asset] = True
+            last_oracle_ms, last_price = ticks[-1]
+            logger.info(
+                "rtds first tick asset=%s price=%.2f oracle_ts_ms=%d "
+                "window_open_ts=%d window_open_ms=%d K_set=%s",
+                asset, last_price, last_oracle_ms,
+                window.open_ts, window.open_ts * 1000,
+                window.K is not None,
+            )
+
     # ------------------------------------------------------------------
     # Market resolution
     # ------------------------------------------------------------------

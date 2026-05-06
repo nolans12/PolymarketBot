@@ -88,17 +88,31 @@ class PolymarketWS:
                 self._consec_failures = 0
             except asyncio.CancelledError:
                 break
+            except BaseExceptionGroup as eg:
+                # TaskGroup wraps inner exceptions; unwrap so the real cause is visible
+                self._consec_failures += 1
+                delay = min(RECONNECT_DELAY_S * self._consec_failures, 30.0)
+                inner = eg.exceptions[0] if eg.exceptions else eg
+                logger.warning(
+                    "polymarket_ws reconnect consec=%d delay=%.1fs err_type=%s err=%s",
+                    self._consec_failures, delay, type(inner).__name__, inner,
+                )
+                if self._consec_failures >= MAX_RECONNECT_BEFORE_REST:
+                    logger.warning(
+                        "polymarket_ws %d consecutive failures — will keep retrying",
+                        self._consec_failures,
+                    )
+                await asyncio.sleep(delay)
             except Exception as exc:
                 self._consec_failures += 1
                 delay = min(RECONNECT_DELAY_S * self._consec_failures, 30.0)
                 logger.warning(
-                    "polymarket_ws reconnect consec=%d delay=%.1fs err=%s",
-                    self._consec_failures, delay, exc,
+                    "polymarket_ws reconnect consec=%d delay=%.1fs err_type=%s err=%s",
+                    self._consec_failures, delay, type(exc).__name__, exc,
                 )
                 if self._consec_failures >= MAX_RECONNECT_BEFORE_REST:
-                    logger.error(
-                        "polymarket_ws %d consecutive failures — running in degraded mode "
-                        "(REST-only fallback; live book updates paused)",
+                    logger.warning(
+                        "polymarket_ws %d consecutive failures — will keep retrying",
                         self._consec_failures,
                     )
                 await asyncio.sleep(delay)
@@ -160,7 +174,11 @@ class PolymarketWS:
 
             # Server keep-alive: literal "PING" string (not JSON)
             if isinstance(raw, str) and raw.strip() == "PING":
-                await ws.send("PONG")
+                try:
+                    await ws.send("PONG")
+                except Exception as exc:
+                    logger.warning("polymarket_ws PONG send failed: %s", exc)
+                    raise  # connection is dead, force reconnect
                 continue
 
             try:
@@ -168,7 +186,14 @@ class PolymarketWS:
             except json.JSONDecodeError:
                 continue
 
-            await self._dispatch(msg)
+            try:
+                await self._dispatch(msg)
+            except Exception as exc:
+                # Don't let one malformed event kill the connection
+                logger.warning(
+                    "polymarket_ws dispatch error: %s msg=%s",
+                    exc, str(raw)[:200],
+                )
 
     async def _ping_loop(self, ws) -> None:
         """Send literal PING every 10s to keep the connection alive."""
@@ -204,6 +229,11 @@ class PolymarketWS:
 
     async def _send_subscriptions(self, ws) -> None:
         """Send one subscribe message per asset (all tokens in one message per asset)."""
+        # Track which (asset, tokens) pairs we've already announced this session,
+        # so resubscribes don't re-log the same pair.
+        if not hasattr(self, "_announced_subs"):
+            self._announced_subs: set[tuple[str, tuple[str, ...]]] = set()
+
         for asset, token_ids in self._subscriptions.items():
             msg = {
                 "type": "market",
@@ -212,10 +242,13 @@ class PolymarketWS:
             }
             try:
                 await ws.send(json.dumps(msg))
-                logger.info(
-                    "polymarket_ws subscribed asset=%s tokens=%s",
-                    asset, [t[:8] + "…" for t in token_ids],
-                )
+                key = (asset, tuple(token_ids))
+                if key not in self._announced_subs:
+                    self._announced_subs.add(key)
+                    logger.info(
+                        "polymarket_ws subscribed asset=%s tokens=%s",
+                        asset, [t[:8] + "…" for t in token_ids],
+                    )
             except Exception as exc:
                 logger.warning("polymarket_ws subscribe send failed: %s", exc)
 
@@ -239,7 +272,12 @@ class PolymarketWS:
         elif event_type == "last_trade_price":
             self._handle_last_trade(msg)
         elif event_type == "tick_size_change":
-            logger.info("polymarket_ws tick_size_change: %s", msg)
+            asset_id = msg.get("asset_id", "")
+            asset = self._token_to_asset.get(asset_id, "?")
+            logger.info(
+                "polymarket_ws tick_size_change asset=%s old=%s new=%s",
+                asset, msg.get("old_tick_size"), msg.get("new_tick_size"),
+            )
         # else: ignore (e.g. confirmation messages)
 
     def _handle_book(self, msg: dict) -> None:
@@ -253,6 +291,20 @@ class PolymarketWS:
         book = self.books[asset]
         book.handle_book(asset_id, bids, asks)
         self._last_market_event_s = time.time()
+
+        # Log first book per (asset, token) so we can see whether one side is empty
+        seen = self._first_book_logged if hasattr(self, "_first_book_logged") else None
+        if seen is None:
+            self._first_book_logged = set()
+            seen = self._first_book_logged
+        key = (asset, asset_id[:12])
+        if key not in seen:
+            seen.add(key)
+            side = "up" if (book.up and book.up.token_id == asset_id) else "down"
+            logger.info(
+                "polymarket_ws first book asset=%s side=%s token=%s… bids=%d asks=%d",
+                asset, side, asset_id[:12], len(bids), len(asks),
+            )
 
         if self.on_update:
             self.on_update(asset, book)

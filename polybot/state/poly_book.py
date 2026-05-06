@@ -154,11 +154,11 @@ class PolyBook:
         token_book = self.up if side == "up" else self.down
         token_book.apply_snapshot(bids, asks)
         self.last_update_ns = time.time_ns()
-        # Ready once both sides have received at least one snapshot
-        if self.up and self.down:
+        # Ready once the Up side has data (training needs q_up_ask).
+        # Down side can lag in low-liquidity windows; don't block on it.
+        if self.up:
             up_has_data = bool(self.up._bids or self.up._asks)
-            dn_has_data = bool(self.down._bids or self.down._asks)
-            if up_has_data and dn_has_data:
+            if up_has_data:
                 self.ready = True
         return True
 
@@ -176,6 +176,9 @@ class PolyBook:
                 ch["side"], float(ch["price"]), float(ch["size"])
             )
         self.last_update_ns = time.time_ns()
+        # Flip ready once Up side accumulates data via incremental updates
+        if self.up and (self.up._bids or self.up._asks):
+            self.ready = True
         return True
 
     def handle_last_trade_price(self, asset_id: str, price: float, size: float) -> None:

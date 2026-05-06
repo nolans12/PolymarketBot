@@ -113,18 +113,24 @@ class RegressionModel:
             raise ValueError(f"too few training samples: {n}")
 
         # --- Hold out most-recent HELDOUT_WINDOW_SECONDS for validation ---
-        heldout_cutoff_ns = now_ns - HELDOUT_WINDOW_SECONDS * 1_000_000_000
+        # If the configured heldout window would consume everything (early
+        # warmup), shrink it so we always keep ~80% for training.
+        ts_span_s = (ts_ns_array.max() - ts_ns_array.min()) / 1e9 if len(ts_ns_array) > 0 else 0
+        heldout_s = min(HELDOUT_WINDOW_SECONDS, max(60, ts_span_s * 0.20))
+        heldout_cutoff_ns = now_ns - int(heldout_s) * 1_000_000_000
         train_mask = ts_ns_array < heldout_cutoff_ns
         val_mask   = ts_ns_array >= heldout_cutoff_ns
 
-        n_train = train_mask.sum()
+        n_train = int(train_mask.sum())
         if n_train < 50:
             # Not enough held-in data — use everything for training
             X_train, y_train = X, y
             X_val,   y_val   = None, None
+            n_train_used = len(y)
         else:
             X_train, y_train = X[train_mask], y[train_mask]
             X_val,   y_val   = X[val_mask],   y[val_mask]
+            n_train_used = n_train
 
         # --- Scale features ---
         scaler = StandardScaler()
@@ -175,7 +181,7 @@ class RegressionModel:
             model_version_id=version_id,
             asset=self.asset,
             ts_ns=now_ns,
-            n_train_samples=n_train,
+            n_train_samples=n_train_used,
             training_window_start_ns=training_start_ns,
             ridge_alpha=float(model.alpha_),
             r2_in_sample=r2_in,

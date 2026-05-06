@@ -196,7 +196,10 @@ class SpotBook:
     def microprice_at(self, lag_s: int) -> Optional[float]:
         """
         Return microprice from `lag_s` seconds ago using the ring buffer.
-        Returns None if that slot isn't populated yet.
+
+        If the ring doesn't yet have a sample that old (warmup period), falls
+        back to the oldest available sample so the regression can still warm
+        up. Once the buffer fills, this returns the correct lagged value.
         """
         if not self._ring:
             return None
@@ -205,7 +208,8 @@ class SpotBook:
         for ts, mp in reversed(self._ring):
             if ts <= target_s:
                 return mp
-        return None
+        # Warmup fallback: return oldest available sample
+        return self._ring[0][1]
 
     def drain_ofi(self) -> tuple[float, float]:
         """Return accumulated OFI since last drain and reset accumulators."""

@@ -54,6 +54,23 @@ GAMMA_API       = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
 COINBASE_WS_HOST = os.getenv("COINBASE_WS_HOST", "wss://advanced-trade-ws.coinbase.com")
 
 # ---------------------------------------------------------------------------
+# Spot feed selection
+#
+# When ENABLE_BINANCE=true the bot subscribes to Binance L2 and uses it as
+# the primary spot feed. When ENABLE_COINBASE=true the bot subscribes to
+# Coinbase Advanced Trade ticker as a fallback / additional feature source.
+# At least one must be true.
+# ---------------------------------------------------------------------------
+
+ENABLE_BINANCE  = os.getenv("ENABLE_BINANCE",  "true").lower() == "true"
+ENABLE_COINBASE = os.getenv("ENABLE_COINBASE", "false").lower() == "true"
+
+# K-capture source. "spot" uses the live Binance microprice at window open
+# (more reliable, slightly different from Polymarket's resolution oracle).
+# "chainlink" uses Polymarket RTDS - aka the "price to beat" (canonical but high-latency / gap-prone).
+K_SOURCE = os.getenv("K_SOURCE", "spot").lower()
+
+# ---------------------------------------------------------------------------
 # Assets
 #
 # Phase 1 covers BTC and ETH only (CLAUDE.md §1). Alts (SOL, XRP) revisited
@@ -82,7 +99,8 @@ CHAINLINK_SYMBOLS = {
 # ---------------------------------------------------------------------------
 
 WINDOW_SECONDS    = 300                    # Polymarket 5-min market window
-DECISION_INTERVAL = 10                     # scheduler tick cadence
+DECISION_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))   # scheduler tick cadence
+SAMPLE_INTERVAL   = float(os.getenv("SAMPLE_INTERVAL", "1.0"))  # training sampler cadence
 
 # ---------------------------------------------------------------------------
 # Microprice / OFI / history
@@ -101,9 +119,12 @@ LOOKBACK_HORIZONS_S = [0, 15, 30, 45, 60, 90, 120]
 
 REFIT_INTERVAL_SECONDS    = 300            # 5 min
 TRAINING_WINDOW_SECONDS   = 4 * 3600       # 4 h rolling window
-MIN_TRAIN_SIZE            = 1800           # ~30 min worth of 1s samples
+# At 1s sampler + 10s decision ticks combined, expect ~66 rows/min.
+# 30 min warmup = ~2,000 rows minimum before first fit.
+# 4h window = ~15,840 rows at steady state.
+MIN_TRAIN_SIZE            = 1800           # ~30 min of combined 1s+5s rows for first fit
 HELDOUT_WINDOW_SECONDS    = 1800           # most-recent 30 min held out for validation
-RIDGE_ALPHAS              = [0.01, 0.1, 1.0, 10.0]
+RIDGE_ALPHAS              = [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
 
 # ---------------------------------------------------------------------------
 # Sanity gates around the model (CLAUDE.md §7)
@@ -165,7 +186,7 @@ KILL_SWITCH_PATH      = "/run/polybot/STOP"
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
 LOG_DIR          = Path(os.getenv("LOG_DIR", "logs"))
 PARQUET_DIR      = Path(os.getenv("PARQUET_DIR", "logs"))
-PARQUET_FLUSH_S  = 60                      # flush in-memory rows to disk every 60s
+PARQUET_FLUSH_S  = 10                      # flush in-memory rows to disk every 10s
 
 
 def validate() -> list[str]:

@@ -81,11 +81,15 @@ class CoinbaseBook:
         return (time.time_ns() - self.last_update_ns) // 1_000_000
 
     def microprice_at(self, lag_s: int) -> Optional[float]:
-        """Return microprice from `lag_s` seconds ago via the ring buffer."""
+        """
+        Return microprice from `lag_s` seconds ago via the ring buffer.
+        Falls back to the oldest available sample during warmup so features
+        become 'complete' before the buffer is fully populated.
+        """
         if not self._ring:
             return None
         target_s = int(time.time()) - lag_s
         for ts, mp in reversed(self._ring):
             if ts <= target_s:
                 return mp
-        return None
+        return self._ring[0][1]

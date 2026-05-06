@@ -101,8 +101,9 @@ class BinanceWS:
                 logger.warning("binance_ws reconnect attempt=%d delay=%.1fs err=%s",
                                attempt, delay, exc)
                 if attempt >= MAX_RECONNECT_ATTEMPTS:
-                    logger.error("binance_ws max reconnects reached — giving up")
-                    break
+                    logger.warning("binance_ws %d reconnect failures — continuing with Coinbase fallback",
+                                   attempt)
+                    attempt = MAX_RECONNECT_ATTEMPTS  # cap backoff, don't give up
                 await asyncio.sleep(delay)
 
     def stop(self) -> None:

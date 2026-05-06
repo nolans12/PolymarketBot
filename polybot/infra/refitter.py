@@ -96,8 +96,9 @@ def _build_training_matrix(rows: list[dict]) -> tuple[np.ndarray, np.ndarray, np
 
             val = row.get(col)
             if val is None:
-                # Only the core Binance x_now..x_60 are required; others impute 0
-                required = fname in ("x_now", "x_15", "x_30", "x_45", "x_60", "tau")
+                # Required = matches the runtime completeness check in features.py.
+                # x_45/x_90/x_120 are proxied/imputed during cold-start.
+                required = fname in ("x_now", "x_15", "x_30", "x_60", "tau")
                 if required:
                     skip = True; break
                 feat_row.append(0.0)
@@ -145,24 +146,66 @@ class RegressionRefitter:
         logger.info("refitter started (interval=%ds, window=%ds)",
                     REFIT_INTERVAL_SECONDS, TRAINING_WINDOW_SECONDS)
 
-        # Stagger first refit so we don't thrash at cold start
-        await asyncio.sleep(REFIT_INTERVAL_SECONDS)
+        # Run the row-count heartbeat and the refit loop concurrently
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._row_count_loop(), name="refitter_heartbeat")
+            tg.create_task(self._refit_loop(),     name="refitter_refit")
+
+    async def _refit_loop(self) -> None:
+        # First refit attempt fires quickly so we can verify the loop is alive;
+        # subsequent refits respect the configured interval. After a successful
+        # fit we wait the full interval; after a skip we retry sooner so cold
+        # starts don't have to wait 5 minutes per attempt.
+        await asyncio.sleep(60)
 
         while self._running:
+            any_fitted = False
             for asset in ASSETS:
                 try:
-                    await self._refit_asset(asset)
+                    fitted = await self._refit_asset(asset)
+                    any_fitted = any_fitted or fitted
                 except asyncio.CancelledError:
                     return
                 except Exception:
                     logger.exception("refitter error asset=%s", asset)
 
-            await asyncio.sleep(REFIT_INTERVAL_SECONDS)
+            delay = REFIT_INTERVAL_SECONDS if any_fitted else 60
+            await asyncio.sleep(delay)
+
+    async def _row_count_loop(self) -> None:
+        """Log training row counts every 60 seconds. Label changes after first fit."""
+        while self._running:
+            await asyncio.sleep(60)
+            if not self._running:
+                break
+            now_ns    = time.time_ns()
+            cutoff_ns = now_ns - TRAINING_WINDOW_SECONDS * 1_000_000_000
+            parts = []
+            any_fit = False
+            for asset in ASSETS:
+                mem_rows = self.writer.get_decision_rows(asset, since_ns=cutoff_ns)
+                n_mem    = len(mem_rows)
+                n_pq = await asyncio.get_event_loop().run_in_executor(
+                    None, _count_parquet_rows, asset, cutoff_ns, PARQUET_DIR
+                )
+                total = n_mem + n_pq
+                model = self.models[asset]
+                if model.is_fit:
+                    any_fit = True
+                    diag = model._last_diagnostics
+                    r2 = diag.r2_cv_mean if diag else 0.0
+                    parts.append(f"{asset.upper()}: {total} rows, r2_cv={r2:.3f}")
+                else:
+                    pct = min(100, int(total * 100 / MIN_TRAIN_SIZE))
+                    parts.append(f"{asset.upper()}: {total}/{MIN_TRAIN_SIZE} rows ({pct}%)")
+            label = "training rolling-window status" if any_fit else "training warmup"
+            logger.info("%s — %s", label, " | ".join(parts))
 
     def stop(self) -> None:
         self._running = False
 
-    async def _refit_asset(self, asset: str) -> None:
+    async def _refit_asset(self, asset: str) -> bool:
+        """Returns True iff a model was successfully fit on this attempt."""
         now_ns = time.time_ns()
         cutoff_ns = now_ns - TRAINING_WINDOW_SECONDS * 1_000_000_000
 
@@ -179,7 +222,7 @@ class RegressionRefitter:
         if n < MIN_TRAIN_SIZE:
             logger.info("refitter asset=%s skip: only %d rows (need %d)",
                         asset, n, MIN_TRAIN_SIZE)
-            return
+            return False
 
         logger.info("refitter asset=%s fitting on %d rows", asset, n)
 
@@ -190,7 +233,7 @@ class RegressionRefitter:
         if len(y) < MIN_TRAIN_SIZE:
             logger.info("refitter asset=%s skip: only %d valid rows after filter",
                         asset, len(y))
-            return
+            return False
 
         model = self.models[asset]
         diag = await asyncio.get_event_loop().run_in_executor(
@@ -206,6 +249,35 @@ class RegressionRefitter:
         )
 
         self.writer.write_model_version(asset, diag)
+        return True
+
+
+def _count_parquet_rows(asset: str, cutoff_ns: int, parquet_dir: Path) -> int:
+    """Fast row count — reads only ts_ns column, not full schema."""
+    try:
+        import pyarrow.parquet as pq
+        asset_dir = Path(parquet_dir) / "decisions"
+        if not asset_dir.exists():
+            return 0
+        count = 0
+        for pfile in asset_dir.rglob("*.parquet"):
+            # Only count files under the correct asset partition
+            if f"asset={asset}" not in str(pfile):
+                continue
+            try:
+                # Use ParquetFile (single-file reader) to avoid dataset/partition
+                # schema inference, which conflicts with hive partition columns.
+                pf = pq.ParquetFile(str(pfile))
+                tbl = pf.read(columns=["ts_ns"])
+                for ts in tbl.column("ts_ns"):
+                    v = ts.as_py()
+                    if v and v >= cutoff_ns:
+                        count += 1
+            except Exception as exc:
+                logger.debug("count_parquet_rows error file=%s err=%s", pfile, exc)
+        return count
+    except Exception:
+        return 0
 
 
 def _load_parquet_rows(asset: str, cutoff_ns: int, parquet_dir: Path) -> list[dict]:
@@ -221,9 +293,18 @@ def _load_parquet_rows(asset: str, cutoff_ns: int, parquet_dir: Path) -> list[di
         return []
 
     rows = []
-    for pfile in sorted(base.rglob(f"*asset={asset}*/*.parquet")):
+    needed = ["ts_ns"] + _needed_parquet_cols()
+    for pfile in sorted(base.rglob("*.parquet")):
+        if f"asset={asset}" not in str(pfile):
+            continue
         try:
-            tbl = pq.read_table(pfile, columns=["ts_ns"] + _needed_parquet_cols())
+            # Use ParquetFile (single-file reader) to avoid hive partition
+            # schema inference. read_table() treats the parent dir as a dataset
+            # and fails on schema mismatches between the file body and the
+            # hive partition column types.
+            pf = pq.ParquetFile(str(pfile))
+            avail = [c for c in needed if c in pf.schema_arrow.names]
+            tbl = pf.read(columns=avail)
             for batch in tbl.to_batches():
                 d = batch.to_pydict()
                 n = len(d.get("ts_ns", []))
@@ -231,8 +312,8 @@ def _load_parquet_rows(asset: str, cutoff_ns: int, parquet_dir: Path) -> list[di
                     ts = d["ts_ns"][i]
                     if ts and ts >= cutoff_ns:
                         rows.append({col: d[col][i] for col in d})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("load_parquet_rows error file=%s err=%s", pfile, exc)
 
     return rows
 

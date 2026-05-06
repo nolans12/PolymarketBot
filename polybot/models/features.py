@@ -241,11 +241,41 @@ def build_features(
         if c_now and c_60 and c_60 > 0:
             fv.cross_asset_momentum_60s = float(math.log(c_now / c_60))
 
+    # ---- Coinbase fallback for Binance lag slots ----
+    # When Binance is geo-blocked / unavailable, fill the x_* slots from
+    # Coinbase's ring buffer so the regression can still run.
+    if cb_book and cb_book.ready and K and K > 0:
+        for lag_s, binance_attr, cb_attr in [
+            (0,  "x_now", "cb_x_now"),
+            (15, "x_15",  "cb_x_15"),
+            (30, "x_30",  "cb_x_30"),
+            (45, "x_45",  "cb_x_30"),  # no cb_x_45; use cb_x_30 as nearest proxy
+            (60, "x_60",  "cb_x_60"),
+            (90, "x_90",  "cb_x_60"),  # proxy: reuse cb_x_60
+            (120,"x_120", "cb_x_60"),  # proxy: reuse cb_x_60
+        ]:
+            if getattr(fv, binance_attr) is None:
+                val = getattr(fv, cb_attr) if cb_attr else None
+                if val is not None:
+                    setattr(fv, binance_attr, val)
+
+        # Also fill momentum from Coinbase when Binance is absent
+        if fv.momentum_30s is None and cb_book.ready:
+            mp_now = cb_book.microprice_at(0)
+            mp_30  = cb_book.microprice_at(30)
+            if mp_now and mp_30 and mp_30 > 0:
+                fv.momentum_30s = float(math.log(mp_now / mp_30))
+        if fv.momentum_60s is None and cb_book.ready:
+            mp_now = cb_book.microprice_at(0)
+            mp_60  = cb_book.microprice_at(60)
+            if mp_now and mp_60 and mp_60 > 0:
+                fv.momentum_60s = float(math.log(mp_now / mp_60))
+
     # ---- Completeness check ----
-    # Minimum required: x_now through x_60 (5 Binance lags) + tau
-    binance_core = (fv.x_now is not None and fv.x_15 is not None and
-                    fv.x_30  is not None and fv.x_45 is not None and
-                    fv.x_60  is not None)
-    fv.complete = binance_core and fv.tau is not None
+    # Minimum required: x_now, x_15, x_30, x_60 (from Binance OR Coinbase fallback) + tau.
+    # x_45/x_90/x_120 are proxied from Coinbase and excluded from the hard requirement.
+    spot_core = (fv.x_now is not None and fv.x_15 is not None and
+                 fv.x_30  is not None and fv.x_60  is not None)
+    fv.complete = spot_core and fv.tau is not None
 
     return fv
