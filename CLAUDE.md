@@ -2,16 +2,16 @@
 
 > ## 🛑 MANDATORY WORKFLOW — read before doing ANYTHING in this repo
 >
-> This document specifies four pending work items (see **§15**) that change the structure of the codebase. They are non-trivial, touch many files, and will produce a broken intermediate state if executed without discipline.
+> This document specifies five pending work items (see **§15**) that change the structure of the codebase. They are non-trivial, touch many files, and will produce a broken intermediate state if executed without discipline.
 >
 > **Before starting any work described in this document, you MUST:**
 >
-> 1. **Invoke `/superpowers`.** Every refactor, deletion, and feature add in §14, §5.6, §6.6, and §15 is to be executed under the `/superpowers` skill. The skill enforces a plan-first / verify-after workflow that is required for changes of this scope.
-> 2. **Invoke `/gsd`.** This document is long (~1200+ lines) and references many files across `betbot/kalshi/`, `scripts/`, `pyproject.toml`, `.env.example`, and the dead legacy directories. `/gsd` keeps the relevant context loaded efficiently and prevents you from re-fetching the same files.
+> 1. **Invoke `/superpowers`.** Every refactor, deletion, and feature add in §14, §5.6, §6.6, §11.1, and §15 is to be executed under the `/superpowers` skill. The skill enforces a plan-first / verify-after workflow that is required for changes of this scope.
+> 2. **Invoke `/gsd`.** This document is long (~1400+ lines) and references many files across `betbot/kalshi/`, `scripts/`, `pyproject.toml`, `.env.example`, and the dead legacy directories. `/gsd` keeps the relevant context loaded efficiently and prevents you from re-fetching the same files.
 >
-> **After all four work items in §15 are complete and merged, you MUST also:**
+> **After all five work items in §15 are complete and merged, you MUST also:**
 >
-> 3. **Invoke `/ultra-review`.** This is the closing-step verification pass. It is non-optional. The work is not "done" — and §5.6 / §6.6 / §15 must NOT have their `PENDING` markers removed — until `/ultra-review` has run and passed. See **§15.8** for what the review covers and what counts as passing.
+> 3. **Invoke `/ultra-review`.** This is the closing-step verification pass. It is non-optional. The work is not "done" — and §5.6 / §6.6 / §11.1 / §15 must NOT have their `PENDING` markers removed — until `/ultra-review` has run and passed. See **§15.9** for what the review covers and what counts as passing.
 >
 > **Do not skip any of these three invocations.** If you (the AI assistant or human maintainer) start editing files without first invoking `/superpowers` and `/gsd`, stop and restart the session under the correct workflow. If you mark any work item complete without running `/ultra-review`, undo that and run the review first. There is no acceptable reason to bypass any of this — the work items are exactly the kind of multi-file, multi-step changes these skills exist for.
 >
@@ -453,6 +453,8 @@ Peak ~1.75% per leg at p = 0.5. Round-trip cost (entry as taker + exit as taker)
 
 `THETA_FEE = 0.07` is a working estimate borrowed from Kalshi's published 2025 schedule and **must be calibrated against actual fills** before any conclusions about live profitability. See `scripts/test_trade.py` for the round-trip sanity check that produces a real fee number.
 
+**Maker fees are zero on Kalshi.** The above formula applies to taker fills only. Switching the entry leg from taker to maker (limit order at the existing best bid, wait for someone to take it) eliminates the entry fee and captures rather than pays the bid-ask spread — roughly halving total round-trip cost. This is non-trivial relative to the strategy's net edge and is specified as a separate work item: see **§11.1** for the full design and **§15 WI-5** for the execution checklist.
+
 ### 5.5 Slippage
 
 Modeled crudely in `_slippage()`:
@@ -841,6 +843,84 @@ When the gates above pass, the live-trading path replaces the dry-run gating in 
 
 Phase 2 is its own pull request. Do not edit `_tick()` to actually call the orders endpoint until `Phase 1 → Phase 2` decision criteria are met.
 
+### 11.1 Maker-entry execution model (PENDING — see §15 WI-5)
+
+**Status:** specified, not yet implemented. Tracked as Work Item 5 in §15.
+
+**Motivation.** The default execution model — taker on both legs — gives away a lot of edge. Kalshi's taker fee is `ceil(0.07 × C × P × (1−P))` per fill; makers pay zero. Combined with the bid-ask spread on each leg, round-trip costs are approximately **3.5% of position notional** before slippage. On a strategy whose net edge barely clears the 2% Kelly tier floor, that's most of the available P&L going to fees and spread. Switching the entry leg from taker to maker recovers the entry fee (≈1.75% at p=0.5) and the half-spread (typically 1-1.5¢ on Kalshi), reducing round-trip cost to roughly 1.75%. If entry fill rate is high enough, this roughly **doubles** realized P&L per trade.
+
+**Worked cost example** (same numbers as the §6.6 example, both modes side-by-side):
+
+```
+yes_ask = 0.64, yes_bid = 0.62, q_settled = 0.79
+Lag closes; market moves to yes_ask 0.71, yes_bid 0.69.
+
+TAKER both sides (current behavior):
+  entry: cross to 0.64, fee = 0.07 × 0.64 × 0.36 ≈ 0.016
+  exit:  hit bid 0.69,  fee ≈ 0.015
+  net P&L per $1 = (0.69 − 0.64) − 0.031 = 0.019    (1.9%)
+
+MAKER entry, TAKER exit (this work item):
+  entry: post 0.62, fill 0.62, fee = 0
+  exit:  hit 0.69,             fee ≈ 0.015
+  net P&L per $1 = 0.07 − 0.015 = 0.055              (5.5%)
+```
+
+**The catch — fill probability.** Limit orders only fill when someone takes them. The lag-arb thesis is "edge exists for 15–90 seconds" — if our limit doesn't fill in that window, we miss the trade entirely. Worse, when our limit DOES fill, the counterparty is sometimes the *informed* side: a faster lag-arb bot dumping its now-stale inventory at our limit price (adverse selection). The cost case above is the upper bound; real P&L = (cost savings on fills) − (opportunity cost of misses) − (adverse selection on filled trades). The unknown is the fill rate, which can't be answered from current `logs/decisions.jsonl` data alone.
+
+**The hybrid: maker entry, taker exit.** This is the recommended starting point. Rationale:
+
+- **Entry tolerates fill uncertainty.** The signal window is 15-90 s; if a 30 s limit doesn't fill, we cancel and re-evaluate at the next decision tick. Missing an entry is OK — we just abstain.
+- **Exit does NOT tolerate fill uncertainty.** When `edge_now < LAG_CLOSE_THRESHOLD`, every second we don't exit is risk we carry for free. A limit-exit that fails to fill could turn a profitable trade into a loss when the next adverse move arrives. The 1.75% taker fee on exit is acceptable insurance.
+- **Stop-loss as taker, always.** Same reasoning, more so. When we want out, get out.
+
+This captures most of the maker savings without the tail risk of a stuck position.
+
+**Two-stage implementation plan.** Don't write the full execution machinery before validating the assumption. Do it in two stages:
+
+**Stage A — Phase-1 simulated pilot** (cheap; pure dry-run instrumentation):
+
+1. In `Scheduler._tick()`, when an `entry` event would fire, also log a "would-have-posted-limit-at" record: `{ts, side, post_price, intended_size, signal_at_post}`.
+2. In a follow-up walk over the next N seconds of `decisions.jsonl` (or `ticks.csv`), check whether the post side ever traded at-or-better than `post_price`. Mark the simulated order as `filled` or `unfilled`.
+3. After 1-7 days of data, compute fill rate by post-price strategy:
+   - Passive (post at existing best bid): `P(fill | post = yes_bid_t, within 30s)`
+   - Aggressive (one tick inside the spread): `P(fill | post = yes_bid_t + tick, within 30s)`
+4. Compute simulated P&L using `(filled_trades × maker_savings) − (missed_trades × taker_baseline_pnl)`. Compare to current taker-only baseline.
+
+**Stage A is gating.** Proceed to Stage B only if simulated maker P&L beats taker P&L by ≥ 25% on out-of-sample data. If fill rates are <40% and simulated maker P&L is worse than taker, the strategy is at its execution ceiling — don't build the machinery.
+
+**Stage B — full execution machinery** (real orders; Phase 2):
+
+1. **`OrderManager` class** in `betbot/kalshi/orders.py`:
+   - `place_limit(side, price, size, ttl_s) -> client_order_id`
+   - `cancel(client_order_id)` and `cancel_all()`
+   - Tracks open-orders state; reconciles against `GET /trade-api/v2/portfolio/orders` every decision tick.
+2. **Fill detection.** Poll order status (or subscribe to fill events if Kalshi exposes them) and call back into `Scheduler` when our entry limit fills, transitioning state from "limit-posted" to "open-position".
+3. **Cancel-on-stale logic.** If 30 s elapse without a fill, cancel and re-evaluate the entry signal. If the signal still says go, re-post (possibly at an updated price). If not, abstain.
+4. **Edge-calc update in `_tick()`.** When maker entry is enabled, `fee_up = 0.0` (not `THETA × p × (1-p)`); `fee_no = 0.0`. Exit fee unchanged. The Kelly tier floor effectively rises (more edge captured per dollar) but the floor itself stays at 0.02.
+5. **State machine.** `_pos` becomes `Optional[Position | PendingOrder]`. New states: `pending_entry` (limit posted, waiting for fill), `open_position` (filled, watching for exit), `pending_exit` (only used for stop-loss order in flight). Window rollover cancels any pending orders before clearing state.
+6. **Backtest infrastructure.** Add a `--maker-entry` flag to `scripts/backtest.py` that simulates limit fills against logged top-of-book + trade-flow data. Same fill model as Stage A's pilot, applied to historical replays.
+
+**What does NOT change:**
+
+- Feature engineering (§3.3, §6.6).
+- The regression model itself.
+- `q_settled` computation.
+- Sizing / Kelly tier table.
+- Exit logic (still taker on lag-closed, taker on stopped, hold-to-resolution at small τ).
+
+**Configuration.** Add to `betbot/kalshi/config.py`:
+
+```python
+ENTRY_MODE     = os.getenv("ENTRY_MODE", "taker")    # "taker" | "maker"
+MAKER_POST_TTL_S        = 30        # cancel and re-evaluate after this
+MAKER_POST_OFFSET_TICKS = 0         # 0 = at best bid (passive), 1 = one tick inside
+```
+
+Default to `taker` so existing behavior is preserved until Stage B is validated. Flip to `maker` only after Stage A passes the gate.
+
+**Caveat — Phase 2 only.** Stage B writes real orders to Kalshi. It must not be merged or default-enabled until the live `_tick()` order-placement path is otherwise approved (the Phase 2 decision criteria in §10.3 must pass first). Stage A is safe to merge in Phase 1 because it only logs.
+
 ---
 
 ## 12. Algorithm soundness review
@@ -1153,7 +1233,7 @@ For clarity, the following are **not** dead code and must be preserved:
 >
 > **At the start of the session:** if you have not invoked **`/superpowers`** and **`/gsd`**, do not start working through this list. Go back to the top of this file and read the mandatory-workflow block. The work below WILL break things if attempted ad-hoc.
 >
-> **At the end of the session:** before declaring any work item done, removing any PENDING marker, or collapsing this section, you MUST invoke **`/ultra-review`** as the closing verification gate. See §15.8 for what the review covers. The work is not done until ultra-review has passed.
+> **At the end of the session:** before declaring any work item done, removing any PENDING marker, or collapsing this section, you MUST invoke **`/ultra-review`** as the closing verification gate. See §15.9 for what the review covers. The work is not done until ultra-review has passed.
 >
 > **First action of the working session:** post the lines:
 >
@@ -1162,7 +1242,7 @@ For clarity, the following are **not** dead code and must be preserved:
 > Will invoke /ultra-review at the end before marking any work item done.
 > ```
 >
-> and actually invoke `/superpowers` and `/gsd` immediately. Save `/ultra-review` for after WI-1 through WI-4 are merged.
+> and actually invoke `/superpowers` and `/gsd` immediately. Save `/ultra-review` for after WI-1 through WI-5 are merged.
 
 This section is the master checklist. Each work item points at the detailed spec elsewhere in this document. Do them in the suggested order; later items assume earlier ones are landed.
 
@@ -1174,19 +1254,22 @@ This section is the master checklist. Each work item points at the detailed spec
 | WI-2 | Remove residual Kalshi-WS naming and references   | §14.10   | Low        | ☐ Not started |
 | WI-3 | Pluggable spot feed (Coinbase ↔ Binance)          | §5.6     | Medium     | ☐ Not started |
 | WI-4 | Forward-projection features (`x_proj_*`)          | §6.6     | Medium     | ☐ Not started |
-| **GATE** | **Run `/ultra-review`** — closing verification | §15.8 | Required | ☐ Not run |
+| WI-5 | Maker-entry execution (Stage A pilot + Stage B)   | §11.1    | Medium–High | ☐ Not started |
+| **GATE** | **Run `/ultra-review`** — closing verification | §15.9 | Required | ☐ Not run |
 
-The `/ultra-review` row is **not** an additional WI; it is a mandatory gate that runs after WI-1 through WI-4 are merged. Until it has run and passed, the work is not done — see §15.7 / §15.8.
+The `/ultra-review` row is **not** an additional WI; it is a mandatory gate that runs after WI-1 through WI-5 are merged. Until it has run and passed, the work is not done — see §15.8 / §15.9.
 
 ### 15.2 Suggested execution order and rationale
 
 1. **WI-1 first.** Removing the dead Polymarket directories and config cruft strips ~250 KB of code that breaks `grep`-based search and confuses any reader (including future Claude Code sessions). Doing this first means every subsequent step works against a cleaner mental model. Commit and push after WI-1 lands; do not bundle it with later items.
 2. **WI-2 second.** Tiny renaming/docstring pass. Catches `self._ws` and a few historical comments. Commit separately.
 3. **WI-3 third.** This is the biggest refactor: rename `CoinbaseBook` → `SpotBook`, introduce `BinanceFeed`, rename feature columns, add `SPOT_SOURCE` config. Doing this AFTER WI-1 means there's no risk of accidentally salvaging dead code; doing it BEFORE WI-4 means the projection features in WI-4 can use the final feature names (`spot_momentum_*`) directly.
-4. **WI-4 last.** Adds three new features and validates them against backtest. Builds on the cleaned, abstracted base from WI-1/2/3.
-5. **`/ultra-review` after all four merge.** Closing verification gate per §15.8. Only after this passes do you remove PENDING markers and collapse §15.
+4. **WI-4 fourth.** Adds three new features and validates them against backtest. Builds on the cleaned, abstracted base from WI-1/2/3.
+5. **WI-5 Stage A fifth.** Once features are stable, instrument the dry-run loop to log "would-have-posted limit" records and start collecting fill-rate data. Completely safe — no real orders. Run for at least a week before deciding on Stage B.
+6. **WI-5 Stage B last (and only conditionally).** Build the full execution machinery only if Stage A's pilot data shows maker entry is worth it (≥25% P&L lift, ≥50% fill rate). If pilot data says no, skip Stage B and document the decision in CAVEATS.md.
+7. **`/ultra-review` after all merge.** Closing verification gate per §15.9. Only after this passes do you remove PENDING markers and collapse §15.
 
-Each WI is its own pull request. Do not stack them. `/ultra-review` runs against the post-merge `kalshi` branch HEAD, not against any individual PR.
+Each WI is its own pull request (Stage A and Stage B of WI-5 are separate PRs). Do not stack them. `/ultra-review` runs against the post-merge `kalshi` branch HEAD, not against any individual PR.
 
 ### 15.3 WI-1 — Remove Polymarket-era dead code
 
@@ -1256,33 +1339,82 @@ Each WI is its own pull request. Do not stack them. `/ultra-review` runs against
 
 **PR title:** `Add forward-projection features to capture Coinbase drift expectation`
 
-### 15.7 Definition of done — across all four work items
+### 15.7 WI-5 — Maker-entry execution (limit orders on entry, taker on exit)
+
+**Spec:** §11.1.
+
+**Two-stage. Do NOT skip Stage A.**
+
+#### Stage A — Phase-1 simulated pilot (cheap; safe to run during dry-run)
+
+**Files touched:**
+- `betbot/kalshi/scheduler.py` — when an `entry` event would fire, append a `would_have_posted` record to `decisions.jsonl` (or a parallel `maker_pilot.jsonl`) with `{ts, side, post_price, intended_size}`. No real orders.
+- `scripts/analyze_run.py` (or a new `scripts/analyze_maker_pilot.py`) — walk forward from each `would_have_posted` record and check whether the post side ever traded at-or-better than `post_price` within `MAKER_POST_TTL_S` (default 30 s). Emit fill-rate and simulated maker-vs-taker P&L tables.
+
+**Acceptance criteria for Stage A:**
+- 1-7 days of pilot data collected during the standard dry run.
+- Fill-rate report broken down by post strategy: passive (post at `yes_bid`) and aggressive (`yes_bid + 1 tick`).
+- Simulated maker P&L vs current taker baseline computed on the same trade signals.
+- **Gate to Stage B:** simulated maker P&L beats taker baseline by ≥ 25% on out-of-sample data, AND fill rate ≥ 50% on at least one post strategy. If either fails, **stop**: the strategy is at its execution ceiling on takers; do not build the order machinery.
+
+**PR title (Stage A):** `Add maker-entry simulation pilot to dry-run logging`
+
+#### Stage B — Full execution machinery (Phase 2 only)
+
+**Do not start Stage B until:** Stage A passes the gate above, AND all four Phase-2 decision criteria in §10.3 are met (model is healthy, edge is real, etc.).
+
+**Files touched:**
+- `betbot/kalshi/orders.py` — **new file**, `OrderManager` class with `place_limit()`, `cancel()`, `cancel_all()`, plus state reconciliation against `GET /trade-api/v2/portfolio/orders`.
+- `betbot/kalshi/scheduler.py` — extend the position state machine to include `pending_entry` and `pending_exit`. Window rollover cancels pending orders before clearing state. Update `_tick()` so that when `ENTRY_MODE == "maker"`, entry posts a limit instead of crossing; cancel-on-stale after `MAKER_POST_TTL_S`. Edge calc updated: `fee_up = 0.0` when maker entry is in use.
+- `betbot/kalshi/config.py` — add `ENTRY_MODE`, `MAKER_POST_TTL_S`, `MAKER_POST_OFFSET_TICKS` (defaults: `taker`, 30, 0).
+- `scripts/backtest.py` — add `--maker-entry` flag that simulates limit fills against logged top-of-book + trade-flow data using the same model as Stage A.
+- `.env.example` — document `ENTRY_MODE` flag.
+
+**Acceptance criteria for Stage B:**
+- `ENTRY_MODE=taker python scripts/run_kalshi_bot.py` runs with identical behavior to pre-WI-5 (no regression).
+- `ENTRY_MODE=maker` mode can be exercised end-to-end on Kalshi demo / paper environment.
+- `OrderManager` correctly cancels stale orders within `MAKER_POST_TTL_S` of posting.
+- Realized fill rate on real Kalshi within 20% of Stage-A simulated fill rate. If real fills are dramatically lower, the simulation model needs work — kick back to Stage A before scaling.
+- One small live trial ($25-50 wallet) shows realized P&L per trade higher than the matched taker-mode baseline, with no orders left orphaned (no leaked limits sitting open after a window rollover).
+
+**PR title (Stage B):** `Add OrderManager and maker-entry execution mode (off by default)`
+
+**What does NOT change:**
+
+- Feature engineering, the regression model, `q_settled` computation, sizing, exit logic. WI-5 is purely an execution change. The strategy decision "should we be long YES" is identical; only "how do we get long" changes.
+
+**Risk note.** The exit leg stays as a taker (cross to bid on `lag_closed`, cross to bid on `stopped_out`). This is non-negotiable for now. Maker exits are tempting (zero fee on both legs!) but introduce fill-uncertainty on the time-critical leg, which can turn winners into losers when the next adverse Coinbase move arrives before the exit limit fills. Maker-exits would be a separate WI-6 if Stage B succeeds and we want to push further.
+
+### 15.8 Definition of done — across all five work items
 
 The whole sequence is "done" when, **in this exact order**:
 
-1. All four PRs are merged.
+1. All five PRs are merged (WI-1 through WI-4 plus WI-5 Stage A; WI-5 Stage B may be deferred — see below).
 2. The bot runs for 24+ hours under `SPOT_SOURCE=coinbase` plus a short startup verification under `SPOT_SOURCE=binance`.
 3. A backtest sweep on the new feature set shows positive P&L on out-of-sample data.
-4. `grep` smoke tests in §14.11 are clean.
-5. **`/ultra-review` is invoked and passes.** See §15.8 for what the review covers and what counts as passing. Do not proceed to step 6 until this gate is green.
-6. CLAUDE.md is updated: remove "PENDING" markers from §5.6 and §6.6 headers; collapse §15 to a brief "all WIs complete as of `<date>`" note (or delete it entirely).
-7. `CAVEATS.md` (if it exists) has the corresponding caveats moved to a "resolved" section.
+4. Stage A pilot data has been collected and analyzed; the maker-vs-taker P&L comparison and fill-rate report are committed to the repo (e.g. `docs/maker_pilot_2026-MM-DD.md`).
+5. `grep` smoke tests in §14.11 are clean.
+6. **`/ultra-review` is invoked and passes.** See §15.9 for what the review covers and what counts as passing. Do not proceed to step 7 until this gate is green.
+7. CLAUDE.md is updated: remove "PENDING" markers from §5.6, §6.6, and §11.1 headers; collapse §15 to a brief "all WIs complete as of `<date>`" note (or delete it entirely). If WI-5 Stage B is deferred, leave §11.1 marked PENDING and §15.7-Stage-B in §15 with a note explaining the defer.
+8. `CAVEATS.md` (if it exists) has the corresponding caveats moved to a "resolved" section.
 
-**The order matters.** Steps 1-4 are work; step 5 is review; steps 6-7 are documentation that records the work as done. Updating CLAUDE.md (step 6) before `/ultra-review` (step 5) has run is forbidden — the doc is the source of truth and must not claim "done" before the review confirms it.
+**On deferring WI-5 Stage B.** Stage B is the only WI that touches real money. It's reasonable to merge Stages 1-4 plus WI-5 Stage A, run the dry-run pilot for a week or two, then make the Stage B decision based on the pilot data. If pilot data says maker entry isn't worth it, drop Stage B entirely and document the decision in CAVEATS.md.
 
-### 15.8 `/ultra-review` — what it covers and what passing means
+**The order matters.** Steps 1-5 are work and data collection; step 6 is review; steps 7-8 are documentation that records the work as done. Updating CLAUDE.md (step 7) before `/ultra-review` (step 6) has run is forbidden — the doc is the source of truth and must not claim "done" before the review confirms it.
+
+### 15.9 `/ultra-review` — what it covers and what passing means
 
 `/ultra-review` is the closing-step verification skill. It is **mandatory** before any work item is marked done in CLAUDE.md or any PENDING marker is removed.
 
 **What `/ultra-review` is expected to check** (this is the spec for the assistant invoking it; the skill itself defines the exact procedure):
 
-1. **Spec ↔ implementation alignment.** For each work item (WI-1 through WI-4), every concrete instruction in its spec section (§14, §5.6, §6.6) maps to a real change in the merged code. No spec bullet is silently skipped. No code change exists that isn't traceable back to a spec bullet.
-2. **Acceptance criteria are met.** Re-run every acceptance check listed under §15.3 – §15.6. Every grep returns the expected zero/non-zero result. Every smoke test passes. No "passes locally" hand-waving.
-3. **Cross-references in CLAUDE.md still resolve.** Every `§N.M` and `§N WI-X` pointer in the document points at a real, correctly-numbered section. After step 6 collapses §15, audit the doc again for broken pointers.
+1. **Spec ↔ implementation alignment.** For each work item (WI-1 through WI-5), every concrete instruction in its spec section (§14, §5.6, §6.6, §11.1) maps to a real change in the merged code. No spec bullet is silently skipped. No code change exists that isn't traceable back to a spec bullet.
+2. **Acceptance criteria are met.** Re-run every acceptance check listed under §15.3 – §15.7. Every grep returns the expected zero/non-zero result. Every smoke test passes. No "passes locally" hand-waving. For WI-5, this includes verifying the Stage A pilot actually ran for the required duration and the fill-rate analysis was committed.
+3. **Cross-references in CLAUDE.md still resolve.** Every `§N.M` and `§N WI-X` pointer in the document points at a real, correctly-numbered section. After step 7 collapses §15, audit the doc again for broken pointers.
 4. **No half-finished refactors.** Search for stray references to deleted symbols (`CoinbaseBook`, `cb_momentum_*`, `polybot.*`, `self._ws`, etc.) anywhere in the repo, not just in `betbot/kalshi/`. A name that survived in a comment or a docstring counts as a finding.
-5. **Behavior preservation where claimed.** §6.6 and §5.6 both claim "no behavior change in the regression's pure fitting path." Verify this empirically: refit on the same training data before and after WI-3/WI-4 and confirm the lag-feature β coefficients are unchanged within numerical noise (the new `spot_*` names should produce identical fits to the old `cb_*` names; the new `x_proj_*` features should not perturb existing β estimates beyond what ridge regularization mechanically does when feature dimensionality grows).
+5. **Behavior preservation where claimed.** §6.6 and §5.6 both claim "no behavior change in the regression's pure fitting path." Verify this empirically: refit on the same training data before and after WI-3/WI-4 and confirm the lag-feature β coefficients are unchanged within numerical noise. §11.1 claims "WI-5 Stage A is logging-only and does not change live behavior" — verify by diffing decision-loop output before and after WI-5 Stage A on the same input.
 6. **Documentation honesty.** Every "FIXED" or "complete" claim in CLAUDE.md, CAVEATS.md, and PR descriptions corresponds to actual code state. No aspirational claims.
-7. **Operational readiness.** Bot starts cleanly, runs for at least 30 minutes without crashing, produces sensible `[Refit]` log lines, and abstains for the right reasons during the warmup period.
+7. **Operational readiness.** Bot starts cleanly, runs for at least 30 minutes without crashing, produces sensible `[Refit]` log lines, and abstains for the right reasons during the warmup period. If WI-5 Stage B was implemented, also verify no orphaned limit orders remain after a forced shutdown + restart.
 
 **What "passing" means:**
 
@@ -1292,7 +1424,7 @@ The whole sequence is "done" when, **in this exact order**:
 
 **What "not passing" means:**
 
-- Do not remove PENDING markers from §5.6 / §6.6.
+- Do not remove PENDING markers from §5.6 / §6.6 / §11.1.
 - Do not collapse §15.
 - Do not declare the work item complete in any PR description, commit message, or external communication.
 - File the failures as new caveats in CAVEATS.md or as new work items in §15, then either fix them or explicitly accept them with reason.
