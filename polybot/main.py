@@ -25,10 +25,12 @@ import structlog
 from polybot.infra.config import ASSETS, DRY_RUN, PARQUET_DIR
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.infra.scheduler import Scheduler
+from polybot.infra.refitter import RegressionRefitter
 from polybot.clients.binance_ws import BinanceWS
 from polybot.clients.coinbase_ws import CoinbaseWS
 from polybot.clients.polymarket_ws import PolymarketWS
 from polybot.clients.polymarket_rtds import PolymarketRTDS
+from polybot.models.regression import RegressionModel
 from polybot.state.spot_book import SpotBook
 from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
@@ -60,19 +62,22 @@ async def _run() -> None:
     log.info("polybot starting DRY_RUN=%s parquet_dir=%s", DRY_RUN, PARQUET_DIR)
 
     # --- Shared state objects ---
-    spot_books:     dict[str, SpotBook]     = {a: SpotBook(a)     for a in ASSETS}
-    coinbase_books: dict[str, CoinbaseBook] = {a: CoinbaseBook(a) for a in ASSETS}
-    poly_books:     dict[str, PolyBook]     = {a: PolyBook(a)     for a in ASSETS}
-    windows:        dict[str, WindowState]  = {a: WindowState(a)  for a in ASSETS}
+    spot_books:     dict[str, SpotBook]        = {a: SpotBook(a)        for a in ASSETS}
+    coinbase_books: dict[str, CoinbaseBook]    = {a: CoinbaseBook(a)    for a in ASSETS}
+    poly_books:     dict[str, PolyBook]        = {a: PolyBook(a)        for a in ASSETS}
+    windows:        dict[str, WindowState]     = {a: WindowState(a)     for a in ASSETS}
+    models:         dict[str, RegressionModel] = {a: RegressionModel(a) for a in ASSETS}
 
     # --- Infrastructure ---
     writer    = ParquetWriter(parquet_dir=PARQUET_DIR)
+    refitter  = RegressionRefitter(models=models, writer=writer)
     scheduler = Scheduler(
         spot_books=spot_books,
         coinbase_books=coinbase_books,
         poly_books=poly_books,
         windows=windows,
         writer=writer,
+        model=models,   # dict; scheduler picks per-asset model
     )
 
     # --- Feed clients ---
@@ -107,7 +112,7 @@ async def _run() -> None:
     def _handle_signal(*_):
         log.warning("shutdown signal received")
         stop_event.set()
-        for client in (binance_ws, coinbase_ws, poly_ws, rtds, scheduler):
+        for client in (binance_ws, coinbase_ws, poly_ws, rtds, scheduler, refitter):
             client.stop()
         writer.stop()
 
@@ -127,6 +132,7 @@ async def _run() -> None:
             tg.create_task(poly_ws.run(),      name="poly_ws")
             tg.create_task(rtds.run(),         name="rtds")
             tg.create_task(scheduler.run(),    name="scheduler")
+            tg.create_task(refitter.run(),     name="refitter")
             tg.create_task(writer.run(),       name="parquet_writer")
             tg.create_task(_shutdown_watcher(stop_event, tg), name="shutdown")
     except* KeyboardInterrupt:

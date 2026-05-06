@@ -428,8 +428,42 @@ class ParquetWriter:
     def write_window_outcome(self, asset: str, row: dict) -> None:
         self._get_writer("window_outcomes", asset).append(row)
 
-    def write_model_version(self, asset: str, row: dict) -> None:
+    def write_model_version(self, asset: str, row) -> None:
+        """Accept a ModelDiagnostics dataclass or a plain dict."""
+        from polybot.models.regression import ModelDiagnostics
+        if isinstance(row, ModelDiagnostics):
+            flat = {
+                "ts_ns":                     row.ts_ns,
+                "asset":                     row.asset,
+                "model_version_id":          row.model_version_id,
+                "n_train_samples":           row.n_train_samples,
+                "training_window_start_ns":  row.training_window_start_ns,
+                "ridge_alpha":               row.ridge_alpha,
+                "r2_in_sample":              row.r2_in_sample,
+                "r2_cv_mean":                row.r2_cv_mean,
+                "r2_held_out_30min":         row.r2_held_out_30min,
+                "coef_alpha":                row.coef_alpha,
+                "estimated_lag_seconds":     row.estimated_lag_seconds,
+                "coef_delta_l2":             row.coef_delta_l2,
+            }
+            flat.update({f"coef_{k}": v for k, v in row.coefs.items()})
+            row = flat
         self._get_writer("model_versions", asset).append(row)
+
+    def get_decision_rows(self, asset: str, since_ns: int) -> list[dict]:
+        """
+        Return in-memory buffered decision rows for `asset` with ts_ns >= since_ns.
+        Used by the refitter to train on data not yet flushed to disk.
+        """
+        rows = []
+        for (table, a, dt, h), pw in self._writers.items():
+            if table != "decisions" or a != asset:
+                continue
+            for row in pw._rows:
+                ts = row.get("ts_ns", 0)
+                if ts and ts >= since_ns:
+                    rows.append(row)
+        return rows
 
     def force_flush(self) -> None:
         """Flush immediately — called by scheduler on graceful shutdown."""

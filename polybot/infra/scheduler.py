@@ -22,9 +22,9 @@ from polybot.infra.config import (
     ASSETS, DECISION_INTERVAL, WINDOW_SECONDS,
     BINANCE_STALE_MS_MAX, COINBASE_STALE_MS_MAX, POLY_STALE_MS_MAX, RTDS_STALE_MS_MAX,
     WIDE_SPREAD_THRESHOLD, KILL_SWITCH_PATH, DRY_RUN,
-    LOOKBACK_HORIZONS_S,
 )
 from polybot.infra.parquet_writer import ParquetWriter
+from polybot.models.features import build_features
 from polybot.state.spot_book import SpotBook
 from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
@@ -48,14 +48,14 @@ class Scheduler:
         windows: dict[str, WindowState],
         writer: ParquetWriter,
         coinbase_books: dict[str, CoinbaseBook] | None = None,
-        model=None,          # RegressionModel; None until Stage 2B
+        model=None,   # dict[str, RegressionModel] or None until Stage 2B
     ):
         self.spot_books     = spot_books
         self.poly_books     = poly_books
         self.windows        = windows
         self.writer         = writer
         self.coinbase_books = coinbase_books or {}
-        self.model          = model
+        self.models         = model or {}   # asset -> RegressionModel
         self._running       = False
 
     async def run(self) -> None:
@@ -213,49 +213,25 @@ class Scheduler:
             self.writer.write_decision(asset, row)
             return
 
-        # --- Compute lagged Binance log-K features ---
-        if spot.ready and win.K and win.K > 0:
-            K = win.K
-            for lag_s in LOOKBACK_HORIZONS_S:
-                key = f"x_{lag_s}_logKratio" if lag_s > 0 else "x_now_logKratio"
-                mp = spot.microprice_at(lag_s)
-                if mp and mp > 0:
-                    row[key] = float(math.log(mp / K))
-
-            # Momentum features
-            mp_now = spot.microprice_at(0)
-            mp_30  = spot.microprice_at(30)
-            mp_60  = spot.microprice_at(60)
-            if mp_now and mp_30 and mp_30 > 0:
-                row["momentum_30s"] = float(math.log(mp_now / mp_30))
-            if mp_now and mp_60 and mp_60 > 0:
-                row["momentum_60s"] = float(math.log(mp_now / mp_60))
-
-        # --- Compute lagged Coinbase log-K features ---
-        if cb_book and cb_book.ready and win.K and win.K > 0:
-            K = win.K
-            for lag_s, col in [(0, "cb_x_now_logKratio"), (15, "cb_x_15_logKratio"),
-                                (30, "cb_x_30_logKratio"), (60, "cb_x_60_logKratio")]:
-                mp = cb_book.microprice_at(lag_s)
-                if mp and mp > 0:
-                    row[col] = float(math.log(mp / K))
-
-        # --- OFI (drain accumulator) ---
+        # --- Drain OFI before feature computation (destructive — must happen once) ---
         ofi_l1, ofi_l5 = spot.drain_ofi()
-        row["ofi_l1"]          = float(ofi_l1)
-        row["ofi_l5_weighted"] = float(ofi_l5)
 
-        # --- Cross-asset momentum ---
+        # --- Build full feature vector ---
         cross_asset = "eth" if asset == "btc" else "btc"
-        cross_spot  = self.spot_books[cross_asset]
-        cross_K     = self.windows[cross_asset].K
-        if cross_spot.ready and cross_K and cross_K > 0:
-            cross_now = cross_spot.microprice_at(0)
-            cross_60  = cross_spot.microprice_at(60)
-            if cross_now and cross_60 and cross_60 > 0:
-                row["cross_asset_momentum_60s"] = float(math.log(cross_now / cross_60))
+        fv = build_features(
+            spot=spot,
+            cb_book=cb_book,
+            poly=poly,
+            win=win,
+            now_s=now_s,
+            ofi_l1=ofi_l1,
+            ofi_l5=ofi_l5,
+            cross_spot=self.spot_books[cross_asset],
+            cross_win=self.windows[cross_asset],
+        )
+        row.update(fv.as_dict())
 
-        # --- Polymarket book state ---
+        # --- Polymarket book state (needed for edge calc, logged regardless) ---
         if poly.ready and poly.up and poly.down:
             up, dn = poly.up, poly.down
             row.update({
@@ -269,26 +245,35 @@ class Scheduler:
                 "poly_spread_down":  float(dn.spread),
                 "poly_depth_up_l1":  float(up.depth_l1),
                 "poly_depth_down_l1": float(dn.depth_l1),
-                "pm_book_imbalance": float(poly.book_imbalance()),
-                "pm_trade_flow_30s": float(poly.trade_flow_30s()),
             })
 
-            # Wide spread circuit breaker (Polymarket spread in prob units)
+            # Wide spread circuit breaker
             if up.spread > WIDE_SPREAD_THRESHOLD or dn.spread > WIDE_SPREAD_THRESHOLD:
                 row["abstention_reason"] = "wide_spread"
                 row["circuit_active"]    = "wide_spread"
                 self.writer.write_decision(asset, row)
                 return
 
-        # --- Model (Stage 2B wires this in) ---
-        if self.model is None:
+        # --- Model predictions ---
+        model = self.models.get(asset)
+        if model is None or not model.is_fit:
             row["abstention_reason"] = "model_warmup"
             row["event"]             = "abstain"
             self.writer.write_decision(asset, row)
             logger.debug("tick asset=%s tau=%.0f abstain=model_warmup", asset, tau_s)
             return
 
-        # Stage 2D will fill in edge computation and entry/exit logic here.
+        row["model_version_id"] = model.version_id
+        q_pred    = model.q_predicted(fv)
+        q_settled = model.q_settled(fv)
+        if q_pred is not None:
+            row["q_predicted"] = float(q_pred)
+        if q_settled is not None:
+            row["q_settled"] = float(q_settled)
+        if q_pred is not None and row.get("q_up_ask") is not None:
+            row["q_predicted_minus_q_actual"] = float(q_pred - row["q_up_ask"])
+
+        # Stage 2C/2D will add edge calculation and entry/exit logic here.
         row["event"] = "abstain"
         row["abstention_reason"] = "model_warmup"
         self.writer.write_decision(asset, row)
