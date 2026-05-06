@@ -14,8 +14,15 @@ from py_clob_client.clob_types import (
     AssetType,
     BalanceAllowanceParams,
     OrderArgs,
+    OrderType,
 )
 from py_clob_client.constants import POLYGON
+
+# Some SDK versions expose PartialCreateOrderOptions; fall back gracefully.
+try:
+    from py_clob_client.clob_types import PartialCreateOrderOptions
+except ImportError:
+    PartialCreateOrderOptions = None  # type: ignore
 
 from polybot.state.wallet import signer_address
 
@@ -75,6 +82,18 @@ class OrderClient:
             logger.warning(f"Could not fetch CLOB balance: {e} — using 0")
             return 0.0
 
+    def _is_neg_risk(self, token_id: str) -> bool:
+        """Query the CLOB to check if this token is part of a neg-risk market."""
+        try:
+            result = self.client.get_neg_risk(token_id)
+            # SDK returns a bool or {"neg_risk": bool} depending on version
+            if isinstance(result, dict):
+                return bool(result.get("neg_risk", False))
+            return bool(result)
+        except Exception as exc:
+            logger.warning(f"get_neg_risk failed for {token_id[:12]}…: {exc} — assuming False")
+            return False
+
     def place_order(
         self,
         token_id: str,
@@ -82,7 +101,12 @@ class OrderClient:
         size_usd: float,
         price: float,
     ) -> Optional[str]:
-        """Place a GTC limit order. Returns order_id or None."""
+        """Place a GTC limit order. Returns order_id or None.
+
+        Auto-detects neg-risk markets (the 5-min crypto Up/Down markets are
+        all neg-risk) and signs accordingly. Without neg_risk=True the CLOB
+        rejects with 'order_version_mismatch'.
+        """
         size_shares = round(size_usd / price, 2)
 
         if self.dry_run:
@@ -99,11 +123,27 @@ class OrderClient:
                 size=size_shares,
                 side=side,
             )
-            resp = self.client.create_and_post_order(order_args)
+
+            neg_risk = self._is_neg_risk(token_id)
+            logger.debug(f"placing order neg_risk={neg_risk} token={token_id[:12]}…")
+
+            if PartialCreateOrderOptions is not None:
+                options = PartialCreateOrderOptions(neg_risk=neg_risk)
+                signed = self.client.create_order(order_args, options)
+            else:
+                # Older SDK without options arg — only path is the simple call,
+                # which will fail on neg-risk markets.
+                signed = self.client.create_order(order_args)
+
+            resp = self.client.post_order(signed, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("id")
+            if not order_id:
+                logger.error(f"post_order returned no id; full response: {resp}")
+                return None
             logger.info(
                 f"ORDER PLACED | token={token_id[:12]}... | side={side} | "
-                f"shares={size_shares} | price={price:.4f} | order_id={order_id}"
+                f"shares={size_shares} | price={price:.4f} | "
+                f"neg_risk={neg_risk} | order_id={order_id}"
             )
             return order_id
         except Exception as e:
