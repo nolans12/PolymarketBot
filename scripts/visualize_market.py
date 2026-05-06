@@ -51,7 +51,8 @@ def parse_args():
 async def _coinbase_ticker(data: dict, stop_flag: asyncio.Event) -> None:
     """
     Subscribe to Coinbase Advanced Trade WS ticker channel for BTC-USD.
-    Appends (timestamp, price) to data['cb_times'] / data['cb_price'].
+    Captures last-trade price and computes microprice from best bid/ask when available.
+    Appends to data['cb_times'] / data['cb_price'] / data['cb_micro'].
     """
     subscribe_msg = {
         "type": "subscribe",
@@ -60,15 +61,18 @@ async def _coinbase_ticker(data: dict, stop_flag: asyncio.Event) -> None:
     }
     last_cb_t = 0.0
     reconnect_delay = 2.0
+    attempt = 0
 
     while not stop_flag.is_set():
         try:
+            attempt += 1
             async with websockets.connect(
                 COINBASE_WS,
                 ping_interval=20,
                 ping_timeout=10,
-                extra_headers={"User-Agent": "polybot-visualizer/1.0"},
+                open_timeout=10,
             ) as ws:
+                attempt = 0
                 await ws.send(json.dumps(subscribe_msg))
                 async for raw in ws:
                     if stop_flag.is_set():
@@ -77,31 +81,63 @@ async def _coinbase_ticker(data: dict, stop_flag: asyncio.Event) -> None:
                         msg = json.loads(raw)
                     except Exception:
                         continue
+
                     channel = msg.get("channel", "")
-                    if channel != "ticker":
+                    # subscriptions ack and heartbeats — skip
+                    if channel not in ("ticker", ""):
                         continue
+
                     for ev in msg.get("events", []):
                         for tick in ev.get("tickers", []):
+                            if tick.get("product_id") != "BTC-USD":
+                                continue
+
                             price_str = tick.get("price")
+                            bid_str   = tick.get("best_bid")
+                            ask_str   = tick.get("best_ask")
+                            bid_qty   = tick.get("best_bid_quantity")
+                            ask_qty   = tick.get("best_ask_quantity")
+
                             if not price_str:
                                 continue
                             try:
                                 price = float(price_str)
                             except ValueError:
                                 continue
+
                             t = time.time()
                             if t - last_cb_t < 0.1:
                                 continue
                             last_cb_t = t
                             data["cb_times"].append(t)
                             data["cb_price"].append(price)
+
+                            # Compute microprice if bid/ask/sizes are present
+                            try:
+                                if bid_str and ask_str and bid_qty and ask_qty:
+                                    bid  = float(bid_str)
+                                    ask  = float(ask_str)
+                                    bsz  = float(bid_qty)
+                                    asz  = float(ask_qty)
+                                    if bsz + asz > 0:
+                                        mp = (bid * asz + ask * bsz) / (bsz + asz)
+                                        data["cb_micro"].append(mp)
+                                    else:
+                                        data["cb_micro"].append(price)
+                                else:
+                                    data["cb_micro"].append(price)
+                            except (ValueError, TypeError):
+                                data["cb_micro"].append(price)
+
         except asyncio.CancelledError:
             return
         except Exception as exc:
             if stop_flag.is_set():
                 return
-            print(f"\r  [Coinbase WS reconnect: {exc}]   ", end="", flush=True)
-            await asyncio.sleep(reconnect_delay)
+            delay = min(reconnect_delay * attempt, 15.0)
+            print(f"\r  [Coinbase WS err={exc!r} retry in {delay:.0f}s]   ",
+                  end="", flush=True)
+            await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +152,7 @@ async def collect(collect_s: int):
         "b_mid":    [],   # Binance plain mid
         "cb_times": [],   # Coinbase timestamps
         "cb_price": [],   # Coinbase last-trade price
+        "cb_micro": [],   # Coinbase microprice (bid*ask_sz + ask*bid_sz / total)
         "p_times":  [],   # Polymarket timestamps
         "p_up_bid": [],
         "p_up_ask": [],
@@ -188,12 +225,12 @@ async def collect(collect_s: int):
         while not stop_flag.is_set():
             el = time.time() - start
             b_last  = f"{data['b_micro'][-1]:,.2f}"  if data["b_micro"]  else "—"
-            cb_last = f"{data['cb_price'][-1]:,.2f}" if data["cb_price"] else "—"
+            cb_last = f"{data['cb_price'][-1]:,.2f}" if data["cb_price"] else "no CB"
             p_last  = f"{data['p_up_mid'][-1]:.4f}"  if data["p_up_mid"] else "—"
             print(
-                f"\r  t={el:4.0f}s  Binance: {b_last} ({len(data['b_micro'])} pts)  "
-                f"Coinbase: {cb_last} ({len(data['cb_price'])} pts)  "
-                f"Poly Up: {p_last} ({len(data['p_up_mid'])} pts)  "
+                f"\r  t={el:4.0f}s  Binance: {b_last} ({len(data['b_micro'])}pts)  "
+                f"Coinbase: {cb_last} ({len(data['cb_price'])}pts)  "
+                f"Poly: {p_last} ({len(data['p_up_mid'])}pts)  "
                 f"[{collect_s - el:.0f}s left]   ",
                 end="", flush=True,
             )
@@ -274,8 +311,11 @@ def plot(data: dict, collect_s: int) -> None:
              label="Binance microprice")
     # Coinbase last-trade (green)
     if has_coinbase:
-        ax1.plot(cb_dt, data["cb_price"], color="#44cc88", linewidth=1.2,
-                 alpha=0.85, linestyle="-", label="Coinbase last trade")
+        ax1.plot(cb_dt, data["cb_price"], color="#44cc88", linewidth=1.0,
+                 alpha=0.55, linestyle="--", label="Coinbase last trade")
+        if data["cb_micro"]:
+            ax1.plot(cb_dt[:len(data["cb_micro"])], data["cb_micro"],
+                     color="#00ff99", linewidth=1.5, label="Coinbase microprice")
 
     if has_poly:
         # Up bid (lower bound)
@@ -353,8 +393,14 @@ def plot(data: dict, collect_s: int) -> None:
     if has_coinbase and len(data["cb_price"]) >= 2:
         base_cb = data["cb_price"][0]
         cb_pct = [(v / base_cb - 1) * 100 for v in data["cb_price"]]
-        ax3.plot(cb_dt, cb_pct, color="#44cc88", linewidth=1.0,
-                 alpha=0.85, label="Coinbase Δ%")
+        ax3.plot(cb_dt, cb_pct, color="#44cc88", linewidth=0.8,
+                 alpha=0.5, linestyle="--", label="Coinbase last trade Δ%")
+    if has_coinbase and len(data["cb_micro"]) >= 2:
+        base_cm = data["cb_micro"][0]
+        cm_pct = [(v / base_cm - 1) * 100 for v in data["cb_micro"]]
+        cb_micro_dt = cb_dt[:len(data["cb_micro"])]
+        ax3.plot(cb_micro_dt, cm_pct, color="#00ff99", linewidth=1.2,
+                 label="Coinbase microprice Δ%")
 
     ax3.set_ylabel("Spot Δ% from start", color="#4da6ff", fontsize=8)
 
@@ -402,7 +448,8 @@ def main():
         sys.exit(0)
 
     print(f"Collected: Binance {len(data['b_micro'])} pts, "
-          f"Coinbase {len(data['cb_price'])} pts, "
+          f"Coinbase last-trade {len(data['cb_price'])} pts "
+          f"(microprice {len(data['cb_micro'])} pts), "
           f"Polymarket {len(data['p_up_mid'])} pts")
     print("Rendering plot…")
     plot(data, args.collect)
