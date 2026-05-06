@@ -50,6 +50,9 @@ POLYGON_RPC     = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 # Gamma REST — slug → token IDs.
 GAMMA_API       = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
 
+# Coinbase Advanced Trade WS — public ticker channel, no auth required.
+COINBASE_WS_HOST = os.getenv("COINBASE_WS_HOST", "wss://advanced-trade-ws.coinbase.com")
+
 # ---------------------------------------------------------------------------
 # Assets
 #
@@ -62,6 +65,11 @@ ASSETS = ["btc", "eth"]
 BINANCE_SYMBOLS = {
     "btc": "btcusdt",
     "eth": "ethusdt",
+}
+
+COINBASE_SYMBOLS = {
+    "btc": "BTC-USD",
+    "eth": "ETH-USD",
 }
 
 CHAINLINK_SYMBOLS = {
@@ -142,6 +150,7 @@ FALLBACK_TAU_S      = 10                   # default to resolution at this τ
 # ---------------------------------------------------------------------------
 
 BINANCE_STALE_MS_MAX  = 5000
+COINBASE_STALE_MS_MAX = 10000   # Coinbase ticker fires less frequently than Binance L2
 POLY_STALE_MS_MAX     = 60000
 RTDS_STALE_MS_MAX     = 90000
 WIDE_SPREAD_THRESHOLD = 0.10

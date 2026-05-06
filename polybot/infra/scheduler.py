@@ -20,12 +20,13 @@ from typing import Optional
 
 from polybot.infra.config import (
     ASSETS, DECISION_INTERVAL, WINDOW_SECONDS,
-    BINANCE_STALE_MS_MAX, POLY_STALE_MS_MAX, RTDS_STALE_MS_MAX,
+    BINANCE_STALE_MS_MAX, COINBASE_STALE_MS_MAX, POLY_STALE_MS_MAX, RTDS_STALE_MS_MAX,
     WIDE_SPREAD_THRESHOLD, KILL_SWITCH_PATH, DRY_RUN,
     LOOKBACK_HORIZONS_S,
 )
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.state.spot_book import SpotBook
+from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
 from polybot.state.window import WindowState
 
@@ -46,14 +47,16 @@ class Scheduler:
         poly_books: dict[str, PolyBook],
         windows: dict[str, WindowState],
         writer: ParquetWriter,
+        coinbase_books: dict[str, CoinbaseBook] | None = None,
         model=None,          # RegressionModel; None until Stage 2B
     ):
-        self.spot_books = spot_books
-        self.poly_books = poly_books
-        self.windows    = windows
-        self.writer     = writer
-        self.model      = model
-        self._running   = False
+        self.spot_books     = spot_books
+        self.poly_books     = poly_books
+        self.windows        = windows
+        self.writer         = writer
+        self.coinbase_books = coinbase_books or {}
+        self.model          = model
+        self._running       = False
 
     async def run(self) -> None:
         self._running = True
@@ -93,15 +96,17 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _tick(self, asset: str, tick_ns: int) -> None:
-        spot  = self.spot_books[asset]
-        poly  = self.poly_books[asset]
-        win   = self.windows[asset]
+        spot     = self.spot_books[asset]
+        poly     = self.poly_books[asset]
+        win      = self.windows[asset]
+        cb_book  = self.coinbase_books.get(asset)
 
         now_s = tick_ns / 1e9
 
         # --- Feed staleness ---
-        binance_stale_ms  = spot.stale_ms()
-        poly_stale_ms     = poly.stale_ms()
+        binance_stale_ms   = spot.stale_ms()
+        coinbase_stale_ms  = cb_book.stale_ms() if cb_book else 999_999
+        poly_stale_ms      = poly.stale_ms()
         chainlink_stale_ms = int((now_s - win.K_capture_ts_ns / 1e9) * 1000) \
                              if win.K_capture_ts_ns > 0 else 999_999
 
@@ -115,16 +120,19 @@ class Scheduler:
             "asset":       asset,
             "window_ts":   window_ts,
             "tau_s":       float(tau_s),
-            # Spot
+            # Binance spot
             "S_mid":           spot.mid if spot.ready else None,
             "microprice":      spot.microprice if spot.ready else None,
             "spot_spread":     float(spot.spread) if spot.ready else None,
             "spot_bid_size_l1": float(spot.best_bid_size) if spot.ready else None,
             "spot_ask_size_l1": float(spot.best_ask_size) if spot.ready else None,
+            # Coinbase spot (L1 from ticker)
+            "cb_mid":       cb_book.mid if cb_book and cb_book.ready else None,
+            "cb_microprice": cb_book.microprice if cb_book and cb_book.ready else None,
             # Strike
             "K":           win.K,
             "K_uncertain": win.K_uncertain,
-            # Lagged spot features (computed below)
+            # Lagged Binance microprice features (computed below)
             "x_now_logKratio": None,
             "x_15_logKratio":  None,
             "x_30_logKratio":  None,
@@ -132,6 +140,11 @@ class Scheduler:
             "x_60_logKratio":  None,
             "x_90_logKratio":  None,
             "x_120_logKratio": None,
+            # Lagged Coinbase microprice features (computed below)
+            "cb_x_now_logKratio": None,
+            "cb_x_15_logKratio":  None,
+            "cb_x_30_logKratio":  None,
+            "cb_x_60_logKratio":  None,
             # Microstructure
             "ofi_l1":                   None,
             "ofi_l5_weighted":          None,
@@ -184,7 +197,8 @@ class Scheduler:
             "position_entry_price":  None,
             "position_edge_at_entry": None,
             # Feed staleness
-            "coinbase_stale_ms":   binance_stale_ms,
+            "binance_stale_ms":    binance_stale_ms,
+            "coinbase_stale_ms":   coinbase_stale_ms,
             "polymarket_stale_ms": poly_stale_ms,
             "chainlink_stale_ms":  chainlink_stale_ms,
             "circuit_active":      None,
@@ -199,7 +213,7 @@ class Scheduler:
             self.writer.write_decision(asset, row)
             return
 
-        # --- Compute lagged log-K features ---
+        # --- Compute lagged Binance log-K features ---
         if spot.ready and win.K and win.K > 0:
             K = win.K
             for lag_s in LOOKBACK_HORIZONS_S:
@@ -216,6 +230,15 @@ class Scheduler:
                 row["momentum_30s"] = float(math.log(mp_now / mp_30))
             if mp_now and mp_60 and mp_60 > 0:
                 row["momentum_60s"] = float(math.log(mp_now / mp_60))
+
+        # --- Compute lagged Coinbase log-K features ---
+        if cb_book and cb_book.ready and win.K and win.K > 0:
+            K = win.K
+            for lag_s, col in [(0, "cb_x_now_logKratio"), (15, "cb_x_15_logKratio"),
+                                (30, "cb_x_30_logKratio"), (60, "cb_x_60_logKratio")]:
+                mp = cb_book.microprice_at(lag_s)
+                if mp and mp > 0:
+                    row[col] = float(math.log(mp / K))
 
         # --- OFI (drain accumulator) ---
         ofi_l1, ofi_l5 = spot.drain_ofi()

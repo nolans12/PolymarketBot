@@ -45,16 +45,19 @@ DECISIONS_SCHEMA = pa.schema([
     ("asset",                    pa.string()),
     ("window_ts",                pa.int32()),
     ("tau_s",                    pa.float32()),
-    # Spot inputs
+    # Binance spot inputs
     ("S_mid",                    pa.float64()),
     ("microprice",               pa.float64()),
     ("spot_spread",              pa.float32()),
     ("spot_bid_size_l1",         pa.float32()),
     ("spot_ask_size_l1",         pa.float32()),
+    # Coinbase spot inputs (L1 from ticker)
+    ("cb_mid",                   pa.float64()),
+    ("cb_microprice",            pa.float64()),
     # Strike
     ("K",                        pa.float64()),
     ("K_uncertain",              pa.bool_()),
-    # Lagged spot features
+    # Lagged Binance microprice features
     ("x_now_logKratio",          pa.float32()),
     ("x_15_logKratio",           pa.float32()),
     ("x_30_logKratio",           pa.float32()),
@@ -62,6 +65,11 @@ DECISIONS_SCHEMA = pa.schema([
     ("x_60_logKratio",           pa.float32()),
     ("x_90_logKratio",           pa.float32()),
     ("x_120_logKratio",          pa.float32()),
+    # Lagged Coinbase microprice features
+    ("cb_x_now_logKratio",       pa.float32()),
+    ("cb_x_15_logKratio",        pa.float32()),
+    ("cb_x_30_logKratio",        pa.float32()),
+    ("cb_x_60_logKratio",        pa.float32()),
     # Microstructure
     ("ofi_l1",                   pa.float32()),
     ("ofi_l5_weighted",          pa.float32()),
@@ -115,6 +123,7 @@ DECISIONS_SCHEMA = pa.schema([
     ("position_entry_price",     pa.float32()),
     ("position_edge_at_entry",   pa.float32()),
     # Feed staleness
+    ("binance_stale_ms",         pa.int32()),
     ("coinbase_stale_ms",        pa.int32()),
     ("polymarket_stale_ms",      pa.int32()),
     ("chainlink_stale_ms",       pa.int32()),

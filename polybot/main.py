@@ -26,9 +26,11 @@ from polybot.infra.config import ASSETS, DRY_RUN, PARQUET_DIR
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.infra.scheduler import Scheduler
 from polybot.clients.binance_ws import BinanceWS
+from polybot.clients.coinbase_ws import CoinbaseWS
 from polybot.clients.polymarket_ws import PolymarketWS
 from polybot.clients.polymarket_rtds import PolymarketRTDS
 from polybot.state.spot_book import SpotBook
+from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
 from polybot.state.window import WindowState
 
@@ -58,21 +60,24 @@ async def _run() -> None:
     log.info("polybot starting DRY_RUN=%s parquet_dir=%s", DRY_RUN, PARQUET_DIR)
 
     # --- Shared state objects ---
-    spot_books: dict[str, SpotBook] = {a: SpotBook(a) for a in ASSETS}
-    poly_books: dict[str, PolyBook] = {a: PolyBook(a) for a in ASSETS}
-    windows:    dict[str, WindowState] = {a: WindowState(a) for a in ASSETS}
+    spot_books:     dict[str, SpotBook]     = {a: SpotBook(a)     for a in ASSETS}
+    coinbase_books: dict[str, CoinbaseBook] = {a: CoinbaseBook(a) for a in ASSETS}
+    poly_books:     dict[str, PolyBook]     = {a: PolyBook(a)     for a in ASSETS}
+    windows:        dict[str, WindowState]  = {a: WindowState(a)  for a in ASSETS}
 
     # --- Infrastructure ---
     writer    = ParquetWriter(parquet_dir=PARQUET_DIR)
     scheduler = Scheduler(
         spot_books=spot_books,
+        coinbase_books=coinbase_books,
         poly_books=poly_books,
         windows=windows,
         writer=writer,
     )
 
     # --- Feed clients ---
-    poly_ws = PolymarketWS(books=poly_books)
+    poly_ws     = PolymarketWS(books=poly_books)
+    coinbase_ws = CoinbaseWS(books=coinbase_books)
 
     def _on_rollover(win: WindowState) -> None:
         """
@@ -102,7 +107,7 @@ async def _run() -> None:
     def _handle_signal(*_):
         log.warning("shutdown signal received")
         stop_event.set()
-        for client in (binance_ws, poly_ws, rtds, scheduler):
+        for client in (binance_ws, coinbase_ws, poly_ws, rtds, scheduler):
             client.stop()
         writer.stop()
 
@@ -117,11 +122,12 @@ async def _run() -> None:
     log.info("starting all tasks")
     try:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(binance_ws.run(),  name="binance_ws")
-            tg.create_task(poly_ws.run(),     name="poly_ws")
-            tg.create_task(rtds.run(),        name="rtds")
-            tg.create_task(scheduler.run(),   name="scheduler")
-            tg.create_task(writer.run(),      name="parquet_writer")
+            tg.create_task(binance_ws.run(),   name="binance_ws")
+            tg.create_task(coinbase_ws.run(),  name="coinbase_ws")
+            tg.create_task(poly_ws.run(),      name="poly_ws")
+            tg.create_task(rtds.run(),         name="rtds")
+            tg.create_task(scheduler.run(),    name="scheduler")
+            tg.create_task(writer.run(),       name="parquet_writer")
             tg.create_task(_shutdown_watcher(stop_event, tg), name="shutdown")
     except* KeyboardInterrupt:
         pass
