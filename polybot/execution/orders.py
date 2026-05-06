@@ -1,27 +1,28 @@
 """
-executor.py — Polymarket CLOB order placement and account management.
+orders.py — Polymarket CLOB order placement and account management.
 
-Assumes all USDC is already in the Polymarket account.
-No on-chain transfers needed — POLYGON_RPC not required.
+Phase 1 keeps this dormant — the scheduler never imports OrderClient until
+Phase 2. Logic ported verbatim from the prior repo's executor.py with the
+on-chain balance reader extracted to polybot.state.wallet.
 """
 
 import logging
-import requests
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import (
+    AssetType,
+    BalanceAllowanceParams,
+    OrderArgs,
+)
 from py_clob_client.constants import POLYGON
-
-# USDC contract on Polygon (bridged USDC / USDC.e)
-_USDC_CONTRACT  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-_POLYGON_RPC    = "https://polygon-rpc.com"
-_BALANCE_OF_SIG = "0x70a08231"  # balanceOf(address) selector
 
 logger = logging.getLogger(__name__)
 
 
-class Executor:
+class OrderClient:
+    """Thin wrapper around py-clob-client for order lifecycle. Phase 2 only."""
+
     def __init__(
         self,
         private_key: str,
@@ -31,10 +32,10 @@ class Executor:
         clob_host: str,
         chain_id: int = POLYGON,
         dry_run: bool = False,
-        funder: str = None,
+        funder: Optional[str] = None,
     ):
         self.dry_run = dry_run
-        self._funder = funder or None  # actual account address holding USDC
+        self._funder = funder or None
         self.client = ClobClient(
             host=clob_host,
             key=private_key,
@@ -46,54 +47,30 @@ class Executor:
         if api_key:
             self.client.set_api_creds(
                 type("Creds", (), {
-                    "api_key": api_key,
-                    "api_secret": api_secret,
+                    "api_key":        api_key,
+                    "api_secret":     api_secret,
                     "api_passphrase": api_passphrase,
                 })()
             )
 
-        logger.info(f"Executor initialised | dry_run={dry_run} | funder={self._funder or 'signer'}")
+        logger.info(
+            f"OrderClient initialised | dry_run={dry_run} | "
+            f"funder={self._funder or 'signer'}"
+        )
 
-    def get_wallet_balance(self) -> float:
+    def get_clob_balance(self) -> float:
         """
-        Return USDC balance for the account address.
-        Queries on-chain via Polygon RPC when a funder address is set
-        (relayer key setup), otherwise falls back to CLOB balance-allowance.
+        CLOB layer USDC balance for the SIGNER (not the funder).
+        Use polybot.state.wallet.usdc_balance_onchain for the funder's balance.
         """
         if self.dry_run:
             return 1000.0
-
-        if self._funder:
-            return self._usdc_balance_onchain(self._funder)
-
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             data = self.client.get_balance_allowance(params)
             return float(data.get("balance", 0.0))
         except Exception as e:
-            logger.warning(f"Could not fetch wallet balance: {e} — using 0")
-            return 0.0
-
-    def _usdc_balance_onchain(self, address: str) -> float:
-        """Read USDC balance directly from Polygon via public RPC."""
-        try:
-            # ERC-20 balanceOf call: pad address to 32 bytes
-            padded = address.lower().replace("0x", "").zfill(64)
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [
-                    {"to": _USDC_CONTRACT, "data": _BALANCE_OF_SIG + padded},
-                    "latest",
-                ],
-                "id": 1,
-            }
-            resp = requests.post(_POLYGON_RPC, json=payload, timeout=10)
-            resp.raise_for_status()
-            raw = resp.json().get("result", "0x0")
-            return int(raw, 16) / 1e6  # USDC has 6 decimals
-        except Exception as e:
-            logger.warning(f"On-chain USDC balance fetch failed: {e} — using 0")
+            logger.warning(f"Could not fetch CLOB balance: {e} — using 0")
             return 0.0
 
     def place_order(
@@ -103,16 +80,7 @@ class Executor:
         size_usd: float,
         price: float,
     ) -> Optional[str]:
-        """
-        Place a GTC limit order on the CLOB.
-
-        token_id:  Polymarket YES token ID
-        side:      "BUY"
-        size_usd:  position size in USD
-        price:     limit price (= q^w, current market mid)
-
-        Returns order_id string, or None on failure.
-        """
+        """Place a GTC limit order. Returns order_id or None."""
         size_shares = round(size_usd / price, 2)
 
         if self.dry_run:
@@ -163,12 +131,12 @@ class Executor:
 
     def derive_api_credentials(self) -> dict:
         """
-        Derive API key/secret/passphrase from private key.
-        Run once on first setup via: python3 test_trade.py --derive-creds
+        Derive API key/secret/passphrase from the private key.
+        Run once on first setup.
         """
         creds = self.client.create_or_derive_api_creds()
         return {
-            "api_key": creds.api_key,
-            "api_secret": creds.api_secret,
+            "api_key":        creds.api_key,
+            "api_secret":     creds.api_secret,
             "api_passphrase": creds.api_passphrase,
         }

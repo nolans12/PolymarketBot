@@ -1,6 +1,23 @@
 .env
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Live data + post-run artifacts
 logs/
 *.log
+*.parquet
+*.duckdb
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Build
+build/
+dist/
+*.egg-info/
