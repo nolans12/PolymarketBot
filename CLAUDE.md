@@ -1,49 +1,62 @@
-# CLAUDE.md — Polymarket 5-Minute Crypto Lag-Arbitrage Bot
+# CLAUDE.md — Kalshi 15-Minute BTC Lag-Arbitrage Bot
 
-> **Status:** Planning / pre-implementation. This document is the source of truth for the project's design, architecture, and reasoning. Read it end-to-end before generating any code.
+> **Status:** Phase 1 dry run — data collection + offline backtest. Real money is **not** placed by the live decision loop. The only path that touches money is `scripts/test_trade.py` (a one-off round-trip sanity check). This document is the source of truth for the project's design, architecture, and reasoning. Read it end-to-end before generating any code.
 
 ---
 
 ## 1. Project goal
 
-Build an automated trading bot that takes positions in Polymarket's 5-minute "Bitcoin Up or Down" and "Ethereum Up or Down" binary prediction markets by exploiting the lag between Coinbase spot price movements and Polymarket order-book repricing. The bot enters when Polymarket has not yet caught up to where Coinbase says fair value is, and exits when Polymarket has caught up — collecting the lag-close as profit, regardless of how the underlying window resolves.
+Build an automated trading bot that takes positions in **Kalshi's 15-minute BTC Up/Down binary markets** (`KXBTC15M` series) by exploiting the lag between **Coinbase BTC spot price movements** and Kalshi's order-book repricing. The bot enters when Kalshi has not yet caught up to where Coinbase says fair value is, and exits when Kalshi has caught up — collecting the lag-close as profit, regardless of how the underlying window resolves.
 
 **The strategy is cash-out lag arbitrage. There is one model, one edge calculation, one entry rule, one exit rule.**
 
-**Edge thesis.** Coinbase's order book is the leading indicator. Polymarket's CLOB takes some number of seconds to reprice after Coinbase moves. During that interval, Polymarket's quoted probability differs from the spot-implied probability by an amount that exceeds round-trip costs (entry fee + entry slippage + exit fee + exit slippage + spread). When that condition holds, we enter. When the lag closes, we exit. This is the entire bot.
+### 1.1 Edge thesis
 
-**The bot's job, distilled to one sentence:** *every 10 seconds, compute a single number — the net edge `delta` in probability points after fees and slippage — and feed that number into the tiered Kelly table to produce a bet size.* If `delta` is below the lowest tier threshold, abstain. Otherwise enter at the prescribed size and exit when `delta` collapses (lag closed) or inverts (thesis broken).
+Coinbase's order book is the leading indicator. Kalshi's REST-quoted YES/NO prices take some number of seconds to reprice after Coinbase moves. During that interval, Kalshi's quoted probability differs from the spot-implied probability by an amount that — when it exceeds round-trip costs (entry fee + entry slippage + exit fee + exit slippage + spread) — is exploitable.
 
-**Why not Black-Scholes binary?** Black-Scholes prices an option by assuming GBM with volatility σ; it answers "what's the no-arbitrage probability the underlying ends above K at horizon τ?" That's a forecasting question. We're not forecasting — we're predicting where Polymarket's *quote* will be in N seconds based on where Coinbase's *spot* is right now. That's a regression problem on (Polymarket price) vs (lagged spot features), and modeling it as such is more honest, more accurate, and removes an entire layer of estimation noise (volatility) from the critical path.
+The user has empirically observed this lag in the `lag_plot_btc.png` plot saved at the repo root. The dry run quantifies it via the regression's fitted coefficients (see §6.4) and confirms it via realized P&L in backtest replay.
 
-**Why not pure latency arbitrage at sub-second timescales?** Polygon-validator-adjacent bots already own that niche. Our edge window is 10-90 seconds, which is achievable with normal infrastructure but invisible to traders who poll Polymarket manually.
+**The bot's job, distilled to one sentence:** every 10 seconds, compute a single number — the net edge `delta` in probability points after fees and slippage — and feed that number into the tiered Kelly table to produce a bet size. If `delta` is below the lowest tier threshold, abstain. Otherwise enter at the prescribed size and exit when `delta` collapses (lag closed) or inverts (thesis broken).
 
-Phase 1 is read-only. We collect 24 hours of tick-level data, fit and validate the regression, simulate the strategy across a sweep of exit-rule parameters, and only commit real capital after verifying that the edge actually realizes as P&L.
+### 1.2 Why Kalshi + Coinbase (the new stack)
 
-**Hard constraint.** Every entry decision is reducible to: "regression-predicted settled probability `q_settled`, market price `q_actual` at Polymarket ask, edge `delta = |q_settled − q_actual| − fee − slippage` clears the tier threshold, bet wallet fraction prescribed by Kelly tier T." Every exit decision is reducible to: "Polymarket has caught up (`delta` has compressed below the lag-close threshold → take profit), or spot reversed (`delta` has inverted by more than the stop threshold → cut loss), or τ is small enough to default to resolution."
+The previous Polymarket + Binance stack didn't work because both venues are **geo-restricted from US IPs**. Polymarket's CLOB blocks US persons; Binance's L2 spot feed blocks US connections. Running the bot from a US machine without a VPN was effectively impossible.
 
-**Non-goals:**
+The Kalshi + Coinbase stack is **fully US-legal**:
 
-- We are not building a market-making bot. No quoting both sides.
-- We are not chasing sub-second latency arbitrage.
-- We are not building anything that requires placing or cancelling orders faster than ~1 second end-to-end.
-- We are not predicting BTC's close-time price. We are predicting Polymarket's *next several seconds* of quote movement.
+- **Kalshi** is the CFTC-regulated US prediction market exchange. It runs `KXBTC15M`, a series of 15-minute "BTC ≥ strike at close" binary markets with multiple strike bins per window. No VPN required.
+- **Coinbase Advanced Trade** is the spot feed. The WebSocket ticker channel exposes top-of-book bid/ask plus quantities, which is enough to compute microprice (the regression's primary spot input). No VPN required.
+
+This branch (`kalshi`) is a fresh implementation built from scratch in `betbot/kalshi/`. The legacy `betbot/clients/`, `betbot/models/`, `betbot/state/`, `betbot/strategy/`, `betbot/infra/`, `betbot/research/`, and `betbot/main.py` directories are **dead code** — they import from a non-existent `polybot.*` package and date back to the Polymarket era. Do not edit or run any of them; the live bot lives entirely under `betbot/kalshi/`.
+
+### 1.3 Why not Black-Scholes binary?
+
+Black-Scholes prices an option by assuming GBM with volatility σ; it answers "what's the no-arbitrage probability the underlying ends above K at horizon τ?" That's a forecasting question. We're not forecasting — we're predicting where Kalshi's *quote* will be in N seconds based on where Coinbase's *spot* is right now. That's a regression problem on (Kalshi price) vs (lagged spot features), and modeling it as such is more honest, more accurate, and removes an entire layer of estimation noise (volatility) from the critical path.
+
+### 1.4 Hard constraint
+
+Every entry decision is reducible to: "regression-predicted settled probability `q_settled`, market price `q_actual` at Kalshi YES ask, edge `delta = |q_settled − q_actual| − fee − slippage` clears the tier threshold, bet wallet fraction prescribed by Kelly tier T." Every exit decision is reducible to: "Kalshi has caught up (`delta` has compressed below the lag-close threshold → take profit), or spot reversed (`delta` has inverted by more than the stop threshold → cut loss), or τ is small enough to default to resolution."
+
+### 1.5 Non-goals
+
+- We are **not** building a market-making bot. No quoting both sides.
+- We are **not** chasing sub-second latency arbitrage. Our edge window is 15-90+ seconds.
+- We are **not** trading anything other than `KXBTC15M`. ETH support is removed; the previous `KXETH15M` plumbing has been deleted.
+- We are **not** predicting BTC's close-time price. We are predicting Kalshi's *next several seconds* of quote movement.
 
 ---
 
 ## 2. The market mechanic
 
-Every 5 minutes, Polymarket opens a new market on each of `BTC`, `ETH`. The market asks: "Will the asset's price at the close of this 5-minute window be ≥ the price at the open?"
+Every 15 minutes, Kalshi opens a fresh batch of `KXBTC15M-{date}{time}` markets — one per strike bin (e.g. one for "BTC ≥ $108,000", one for "BTC ≥ $108,500", etc.). Each market resolves YES = $1 if BTC's settlement price at the close boundary is at-or-above its `floor_strike`, otherwise NO = $1.
 
-- **Strike `K`** = Chainlink BTC/USD oracle price snapshot at the window-open boundary (`t mod 300 == 0`).
-- **Resolution price** = Chainlink BTC/USD oracle price snapshot at the window-close boundary.
-- Yes shares pay $1 if close ≥ open, else $0. No shares are the complement.
-- Yes-share price `q ∈ [0, 1]` *is* the implied probability of Up.
-- Window slug is deterministic: `{asset}-updown-5m-{window_open_unix_ts}`.
+- **Strike `K` (floor_strike):** a fixed dollar threshold set by Kalshi when the market opens. **It is NOT the spot price at window-open.** Each window has multiple strike bins; the bot picks the at-the-money bin (the one whose strike is closest to current BTC spot) for maximum lag-arb potential.
+- **Resolution price:** Kalshi's BTC settlement price at the close boundary (Kalshi publishes its own settlement methodology; the bot doesn't depend on it because the strategy exits before close).
+- **YES contract** pays $1 if close ≥ floor_strike, else $0. NO is the complement. Prices live in `[0.00, 1.00]`.
+- `yes_ask` is the cheapest dollar price to buy a YES share; `yes_bid` is the highest dollar price someone will pay for a YES share. `no_ask = 1.00 − yes_bid` and `no_bid = 1.00 − yes_ask`.
+- Window ticker is deterministic in the form `KXBTC15M-{YYMMMDDHHMM}-{strike_index}`, e.g. `KXBTC15M-26MAY061515-15`.
 
-**Critical:** The strike `K` is the **Chainlink oracle's first observation at or after the window boundary**, not Coinbase or Binance spot at that instant. Subscribe to Polymarket's RTDS WebSocket `crypto_prices_chainlink` channel filtered to `btc/usd` (or `eth/usd`) and capture the first tick at or after each window-open timestamp. This is non-negotiable — wrong K destroys the regression's K-relative features.
-
-**Cash-out is supported.** A Yes-share position can be exited at any time before window close by selling into the order book at the prevailing bid. This is what makes the strategy viable. The exit price is set by the bid, not by resolution — we are exiting *into the market*, not *waiting for the oracle*.
+**Cash-out is supported.** A YES position can be exited at any time before close by selling into the order book at the prevailing YES bid. This is what makes the strategy viable. The exit price is set by the bid, not by resolution — we are exiting *into the market*, not *waiting for settlement*.
 
 ---
 
@@ -51,13 +64,13 @@ Every 5 minutes, Polymarket opens a new market on each of `BTC`, `ETH`. The mark
 
 ### 3.1 Conceptual model
 
-Treat Coinbase as ground truth and Polymarket as a delayed function of Coinbase. At any moment `t`:
+Treat Coinbase as ground truth and Kalshi as a delayed function of Coinbase. At any moment `t`:
 
-- `q_actual_t` = what Polymarket *is* quoting (the Yes-share ask).
-- `q_settled_t` = what Polymarket *would* quote if it had finished digesting all spot moves up to time `t`.
+- `q_actual_t` = what Kalshi *is* quoting (use `yes_mid = (yes_bid + yes_ask) / 2` as the reference).
+- `q_settled_t` = what Kalshi *would* quote if it had finished digesting all spot moves up to time `t`.
 - `delta_t = q_settled_t − q_actual_t` (signed, on the side we're considering).
 
-When `delta` is large and positive on the Up side, Polymarket is offering Up shares cheaper than fair value. We buy. Some seconds later, Polymarket's book updates to reflect the spot move, `q_actual` rises toward `q_settled`, the lag closes, and we sell back at the new (higher) market price.
+When `delta` is large and positive on the YES side, Kalshi is offering YES shares cheaper than fair value. We buy. Some seconds later, Kalshi's book updates to reflect the spot move, `q_actual` rises toward `q_settled`, the lag closes, and we sell back at the new (higher) market bid.
 
 The model's job is to compute `q_settled_t` from observable spot data. That's what the lead-lag regression does.
 
@@ -71,342 +84,295 @@ microprice = (best_bid × ask_size + best_ask × bid_size) / (bid_size + ask_siz
 
 When the bid is heavy, microprice is closer to the ask (next trade likely lifts the ask). When the ask is heavy, microprice is closer to the bid. This is the cleanest available proxy for "where is spot heading in the next few seconds" using only L1 book data.
 
-Using microprice rather than midpoint moves our spot signal forward in time by 1-10 seconds. That compounds with Polymarket's 30-90 second lag to produce a larger and earlier edge signal. Midpoint trails microprice; if we used midpoint we'd be racing other lag-arb bots that already use microprice, and we'd lose.
+Coinbase's `ticker` channel exposes `best_bid`, `best_ask`, `best_bid_quantity`, `best_ask_quantity` on every trade or quote update — exactly what microprice needs. See `betbot/kalshi/coinbase_feed.py` and `CoinbaseBook.apply_ticker()` in `book.py`.
 
 ### 3.3 The lead-lag regression — the only model
 
-We fit a logistic regression that predicts Polymarket's current Yes-share price from Coinbase spot history. The model's parameters are refit every 5 minutes on a rolling 4-hour window of recent (q, features) pairs.
+We fit a ridge regression that predicts the logit of Kalshi's current YES mid-price from Coinbase spot history and a few microstructure features. The model's parameters are refit every 5 minutes on a rolling 4-hour window of recent (X, y) pairs.
 
 **Target:**
 
 ```
-y_t = logit(q_actual_t)        where q_actual_t is the Polymarket Yes-ask at time t
+y_t = logit(yes_mid_t)        where yes_mid_t = (yes_bid_t + yes_ask_t) / 2
 ```
 
-**Features (window-aware — all referenced to the current window's strike K):**
+**Features** (12 total, defined in `betbot/kalshi/features.py:FEATURE_NAMES`):
 
 ```
-x_now    = log(microprice_t      / K)
-x_15     = log(microprice_{t-15s} / K)
-x_30     = log(microprice_{t-30s} / K)
-x_45     = log(microprice_{t-45s} / K)
-x_60     = log(microprice_{t-60s} / K)
-x_90     = log(microprice_{t-90s} / K)
-x_120    = log(microprice_{t-120s}/ K)
+Spot history (microprice / K, in log space) — the lead-lag core:
+  x_0    = log(microprice_now      / K)
+  x_15   = log(microprice_{t-15s}  / K)
+  x_30   = log(microprice_{t-30s}  / K)
+  x_60   = log(microprice_{t-60s}  / K)
+  x_90   = log(microprice_{t-90s}  / K)
+  x_120  = log(microprice_{t-120s} / K)
 
-tau      = τ (seconds remaining in window)
-inv_sqrt_tau = 1/√(τ + 1)
+Time:
+  tau_s         = seconds until window close
+  inv_sqrt_tau  = 1 / √(tau_s + 1)         # near-close moves matter more
 
-# Microstructure features
-ofi_30s          # spot OFI over last 30s
-pm_book_imbalance_t
-momentum_30s
-momentum_60s
-cross_asset_momentum_60s
+Spot momentum:
+  cb_momentum_30s = log(microprice_now / microprice_{t-30s})
+  cb_momentum_60s = log(microprice_now / microprice_{t-60s})
+
+Kalshi microstructure:
+  kalshi_spread       = yes_ask − yes_bid           # liquidity proxy
+  kalshi_momentum_30s = yes_mid_now − yes_mid_{t-30s}
 ```
 
-**Model:**
-
-```
-logit(q_t) = α + Σ βₖ · x_k + γ · tau + δ · inv_sqrt_tau
-                + θ_OFI · ofi_30s + θ_PM · pm_book_imbalance + ...
-```
-
-Ridge regression, regularization chosen by cross-validation. ~12-15 features total, fit on ~14,400 samples per asset (4 hours × 3,600 seconds, downsampled to 1-second observations).
+**Model:** ridge regression with cross-validated regularization. `RidgeCV` over alphas `[0.001, 0.01, 0.1, 1.0, 10.0]`, `TimeSeriesSplit` CV (5 folds when data permits), `StandardScaler` normalization. Implemented in `betbot/kalshi/model.py:KalshiRegressionModel`.
 
 **Two derived predictions are computed at every decision tick:**
 
 ```
-# 1. What the model thinks Polymarket SHOULD be quoting given current data.
-#    Useful as a sanity check: if this is far from q_actual, something is wrong
-#    (regime shift, model is stale, feed problem, etc.)
-q_predicted = sigmoid(logit_q  given current-and-lagged spot)
+# 1. q_predicted: what the model thinks Kalshi SHOULD be quoting given current data.
+#    Sanity check: if this is far from yes_mid, the model is broken or the regime
+#    has shifted (regime change, stale fit, feed problem).
+q_predicted = sigmoid(model.predict(current_features_as_array))
 
-# 2. What Polymarket WILL quote once it has digested current spot.
-#    Substitute current microprice into every lookback slot:
-logit_q_settled = α + (Σ βₖ) · x_now
-                    + γ · tau + δ · inv_sqrt_tau
-                    + θ_OFI · ofi_30s + θ_PM · pm_book_imbalance + ...
-q_settled = sigmoid(logit_q_settled)
+# 2. q_settled: what Kalshi WILL quote once it has digested current spot.
+#    Substitute x_0 (current spot/K) into every lookback slot, then predict.
+q_settled = sigmoid(model.predict(features.settled_array()))
 ```
 
-`q_settled` is our forecast of where Polymarket will arrive once it finishes processing current spot. This is the single most important output of the model.
+`features.settled_array()` clones the live feature vector and replaces every `x_15..x_120` slot with `x_0`. This forces the regression to evaluate "what would the model quote if Kalshi had already seen the current spot in every historical slot?" That output is `q_settled` — our forecast of where Kalshi will arrive once it finishes processing current spot. **This is the single most important output of the model.**
 
 ### 3.4 The lag is learned, not hard-coded
 
-The fitted β coefficients *are* the lag distribution. They tell us how much of Polymarket's current quote is explained by spot at each lookback horizon. Three patterns the data could show:
+The fitted β coefficients on `x_0..x_120` *are* the lag distribution. They tell us how much of Kalshi's current quote is explained by spot at each lookback horizon. Three patterns the data could show:
 
-**Polymarket is fast (no lag).** β₀ (the `x_now` coefficient) is dominant; β₁..β₆ are near zero. Polymarket's quote is best explained by spot right now — no lag to arbitrage. **Strategy thesis is dead.**
+- **Kalshi is fast (no lag).** `β_0` is dominant; `β_15..β_120` are near zero. Kalshi's quote is best explained by spot right now — no lag to arbitrage. **Strategy thesis is dead.**
+- **Kalshi lags by ~60 seconds.** `β_0` is small, `β_60` is largest, neighboring β's decay smoothly. This is the regime our strategy needs.
+- **Mixed / no clear lag.** All β's moderate, no clear peak. Strategy can still work but edge is smaller and noisier.
 
-**Polymarket lags by ~60 seconds.** β₀ is small, β₄ (the 60s-ago coefficient) is largest, neighboring β's decay smoothly on either side. This is the regime our strategy needs.
-
-**Mixed / no clear lag.** All β's moderate, no clear peak. Polymarket responds to a weighted average of recent spot. Strategy can still work but edge is smaller and noisier.
-
-We don't have to pick which regime is true — the regression tells us. For a single human-readable summary number, compute the β-weighted average lag at each refit:
+We don't have to pick which regime is true — the regression tells us. For a single human-readable summary number, the model logs the β-weighted average lag at each refit (`KalshiRegressionModel.fit()` → `ModelDiagnostics.estimated_lag_s`):
 
 ```
-estimated_lag_seconds = (15·β₁ + 30·β₂ + 45·β₃ + 60·β₄ + 90·β₅ + 120·β₆)
-                       / (β₁ + β₂ + β₃ + β₄ + β₅ + β₆)
+estimated_lag_s = (15·|β_15| + 30·|β_30| + 60·|β_60| + 90·|β_90| + 120·|β_120|)
+                / (|β_15| + |β_30| + |β_60| + |β_90| + |β_120|)
 ```
 
-This is logged every 5 minutes for human interpretability and dashboard display. The bot doesn't *use* it (it uses the full coefficient vector); the bot logs it. If `estimated_lag_seconds` drifts from 45s down to 12s over a few days, that's quantitative evidence that Polymarket's market makers are getting faster and our edge is shrinking.
+This is logged every 5 minutes for human interpretability. The bot doesn't *use* it (it uses the full coefficient vector); the bot logs it. If `estimated_lag_s` drifts from 45s down to 12s over a few days, that's quantitative evidence that Kalshi's market makers are getting faster and our edge is shrinking.
 
-### 3.5 Computing the edge — the single number that drives all decisions
+### 3.5 Computing the edge
 
-Every 10 seconds, after computing `q_settled`, compute the edge on each side:
+Every 10 seconds, after computing `q_settled`, compute the edge on each side. Implemented in `Scheduler._tick()` in `scheduler.py`.
 
 ```python
-edge_up_raw   = q_settled - q_up_ask                 # signed; positive = buy Up
-edge_down_raw = (1 - q_settled) - q_down_ask         # signed; positive = buy Down
+edge_up_raw = q_settled - yes_ask                       # buy YES at ask
+edge_no_raw = (1 - q_settled) - (1 - yes_bid)           # buy NO at (1 - yes_bid)
+                                                        # equals  yes_bid - q_settled
 
 # Cost adjustments (per dollar bet):
-#   - Polymarket taker fee: Theta * p * (1-p) where Theta ≈ 0.05
-#   - Slippage: estimated from depth at our intended bet size
-fee_up   = THETA * q_up_ask   * (1 - q_up_ask)
-fee_down = THETA * q_down_ask * (1 - q_down_ask)
-slip_up   = estimate_slippage(asset, side='up',   size=intended_size)
-slip_down = estimate_slippage(asset, side='down', size=intended_size)
+fee_up = THETA_FEE * yes_ask * (1 - yes_ask)            # THETA_FEE = 0.07
+fee_no = THETA_FEE * (1 - yes_bid) * yes_bid
 
-edge_up_net   = edge_up_raw   - fee_up   - slip_up
-edge_down_net = edge_down_raw - fee_down - slip_down
+# Slippage from current Kalshi book depth — see _slippage() helper
+slip_up = min(0.02, intended_size_usd / yes_depth * 0.01)
+slip_no = min(0.02, intended_size_usd / no_depth  * 0.01)
 
-# The "edge" — a single signed number representing best opportunity this tick
-if edge_up_net > edge_down_net:
-    edge_signed = edge_up_net    # positive = buy Up
-    favored_side = 'up'
+edge_up_net = edge_up_raw - fee_up - slip_up
+edge_no_net = edge_no_raw - fee_no - slip_no
+
+# Pick best side, report magnitude for tier lookup
+if edge_up_net >= edge_no_net:
+    edge_signed, favored_side = edge_up_net, "yes"
 else:
-    edge_signed = -edge_down_net # negative = buy Down (sign flipped for consistency)
-    favored_side = 'down'
+    edge_signed, favored_side = edge_no_net, "no"
 
-# The magnitude is what the Kelly tier table consumes
 edge_magnitude = abs(edge_signed)
 ```
 
-`edge_magnitude` is the number that drives every entry decision. If `edge_magnitude < 0.02` (lowest tier floor), abstain. Otherwise look up the tier and bet the corresponding wallet fraction on `favored_side` at the corresponding ask price.
+`edge_magnitude` is the number that drives every entry decision. If it's below the lowest tier floor (0.02), abstain. Otherwise look up the tier and bet the corresponding wallet fraction on `favored_side` at the corresponding ask.
 
 ### 3.6 Worked example
 
-To make the above concrete, consider a single 10-second decision tick on the BTC market:
+Consider a single 10-second decision tick on an at-the-money KXBTC15M market:
 
 ```
-Window opened 2 minutes ago.
-K = 100,000             (Chainlink at window open)
-τ = 180 seconds remaining
+Window opened ~5 minutes ago, 10 minutes (600s) remaining.
+floor_strike (K) = 108,000
+tau_s            = 600
 
 Coinbase right now:
-  microprice_t = 100,500    (BTC is $500 above strike)
-  60 seconds ago, microprice was 100,200    ($200 above)
-  120 seconds ago, microprice was 100,050   ($50 above)
+  microprice_t           = 108,300        ($300 above strike)
+  microprice 60s ago     = 108,150
+  microprice 120s ago    = 108,050
 
-Polymarket right now:
-  q_up_ask = 0.72           (market says 72% chance Up)
+Kalshi right now:
+  yes_bid = 0.62, yes_ask = 0.64, yes_mid = 0.63
+  yes_depth = $400 on the YES bid side
 
-The fitted regression has learned (over the last 4 hours of data):
-  - β₀ (current spot)   = 0.5
-  - β₄ (60s-ago spot)   = 4.2     <-- dominant coefficient, lag is ~60s
-  - β₆ (120s-ago spot)  = 1.8
-  - other β's smaller
+Fitted regression (rolling 4h, cross-validated):
+  β_0   = 0.4          (small — spot-now barely explains Kalshi-now)
+  β_60  = 4.1          (DOMINANT — lag is ~60s)
+  β_120 = 1.5
+  others moderate
 
-Step 1: Confirm Polymarket's current quote is consistent with the lagged history
-        (sanity check; q_predicted should be close to q_actual).
+Step 1 — q_predicted (sanity)
+  Apply model to live feature vector → ≈ logit(0.61). Close to yes_mid 0.63;
+  the model is healthy.
 
-  logit(q_predicted) = α + β₀·log(100500/100000) + β₄·log(100200/100000)
-                       + β₆·log(100050/100000) + ... + tau/microstructure terms
-                     ≈ logit(0.71)            (close to observed 0.72; model is healthy)
+Step 2 — q_settled
+  Substitute x_0 = log(108300/108000) into x_15..x_120 slots and predict.
+  → q_settled ≈ 0.71
 
-Step 2: Compute q_settled by substituting current microprice into all lag slots.
+Step 3 — edge
+  edge_up_raw = 0.71 - 0.64 = 0.07
+  fee_up      = 0.07 * 0.64 * 0.36 = 0.0161
+  slip_up     = min(0.02, 30 / 400 * 0.01) = 0.00075
+  edge_up_net = 0.07 - 0.0161 - 0.00075 = 0.0532
 
-  logit(q_settled) = α + (β₀ + β₄ + β₆ + ...) · log(100500/100000)
-                     + tau/microstructure terms
-                   ≈ logit(0.79)            (this is where Polymarket is heading)
+  edge_magnitude = 0.0532, favored_side = "yes"
 
-Step 3: Compute edge.
+Step 4 — Kelly tier lookup
+  KELLY_TIERS = [(0.30, 0.10), (0.15, 0.08), (0.08, 0.05),
+                 (0.04, 0.03), (0.02, 0.015)]
+  0.0532 falls in the (0.04, 0.03) tier → bet 3% of wallet.
 
-  edge_up_raw = 0.79 - 0.72 = 0.07           (7 cents per share)
-  fee_up      = 0.05 * 0.72 * 0.28 = 0.0101  (~1 cent)
-  slip_up     = ~0.005                       (depth-dependent estimate)
+Step 5 — entry (Phase 2 only; Phase 1 just logs)
+  wallet = $1,000  ⇒  bet_usd = $30
+  contracts = $30 / $0.64 = ~46.9 YES shares
 
-  edge_up_net = 0.07 - 0.0101 - 0.005 = 0.0549
-
-  edge_magnitude = 0.0549
-  favored_side   = 'up'
-
-Step 4: Look up Kelly tier.
-
-  edge_magnitude = 0.0549 falls in the (0.04, 0.03) tier
-    -> bet 3% of wallet on Up at q_up_ask = 0.72
-
-Step 5: Place bet (Phase 2 only; in Phase 1 we just log the would-be entry).
-
-  If wallet = $1,000:
-    bet_size = $30
-    contracts = $30 / $0.72 = ~41.7 Up shares
-
-Step 6: Wait. Over the next ~60 seconds, if the lag closes as predicted:
-
-  q_up_ask rises from 0.72 → ~0.78 (catching up to where spot says it should be)
-  q_up_bid rises correspondingly to ~0.77
-
-  We sell our 41.7 shares at q_up_bid = 0.77:
-    gross proceeds = 41.7 * 0.77 = $32.11
-    exit fee = 0.05 * 0.77 * 0.23 * 32.11 = $0.28
-    entry fee already paid = 0.05 * 0.72 * 0.28 * 30 = $0.30
-    net P&L = 32.11 - 30 - 0.28 - 0.30 = $1.53
-
-  Realized return: $1.53 / $30 = 5.1% on the trade.
+Step 6 — wait. Over the next ~60s, if the lag closes:
+  yes_ask rises 0.64 → ~0.70, yes_bid follows to ~0.69.
+  Sell 46.9 contracts at yes_bid = 0.69:
+    gross         = 46.9 * 0.69 = $32.36
+    entry_fee     = 0.07 * 0.64 * 0.36 * 30 = $0.484
+    exit_fee      = 0.07 * 0.69 * 0.31 * 32.36 = $0.485
+    realized_pnl  = 32.36 - 30 - 0.484 - 0.485 = $1.39
+    ROI on trade  = 4.6%
 ```
 
-The trade made money because Polymarket caught up to spot, regardless of whether BTC ends up above 100,000 at T+0. **That's the entire point of the strategy.** The over/under outcome at resolution doesn't enter into our P&L on this trade — we already exited.
+The trade made money because Kalshi caught up to spot. **The over/under outcome at resolution doesn't enter into the P&L on this trade — we already exited.** That's the entire point.
 
 ### 3.7 Entry rule
 
-Every 10 seconds:
+Every 10 seconds (in `_decision_loop()` → `_tick()`):
 
-```
-1. Active 5m market? If no, idle.
-2. Compute τ.
-3. Read inputs: microprice, lagged microprices, K, τ, OFI, PM book, etc.
-4. Compute q_settled and q_predicted from the latest fitted regression.
-5. Compute edge_up_net, edge_down_net, edge_magnitude, favored_side.
-6. If we already have an open position in this window: skip entry, run exit logic.
-7. If edge_magnitude > tier_floor:
-     Enter on favored_side, size = wallet * kelly_fraction(edge_magnitude).
-   Else:
-     Abstain. Reason = 'edge_below_floor'.
-8. Persist decision row.
-```
+1. Active 15-min market loaded? If `not kb.ready or not cb.ready`, abstain (`data_not_ready`).
+2. Read `tau_s = kb.tau_s()`, `yes_bid`, `yes_ask`, `yes_mid`.
+3. Run sanity gates (see §7) — abstain on any failure.
+4. Build features, compute `q_predicted` and `q_settled`.
+5. If `|q_predicted − yes_mid| > 0.15` → abstain (`model_disagrees_market`).
+6. Compute `edge_up_net`, `edge_no_net`, pick favored side, `edge_magnitude`.
+7. If we already have an open position in this window → skip entry, run exit logic.
+8. If `tau_s < FALLBACK_TAU_S` (60s) → abstain (`tau_too_small`).
+9. If `yes_ask − yes_bid > 0.10` → abstain (`wide_spread`). *(Note: config defines `WIDE_SPREAD_THRESHOLD = 0.12` but the scheduler hardcodes 0.10 — see §12.)*
+10. If `edge_magnitude > tier_floor` (lowest tier = 0.02) → enter on `favored_side` at the corresponding ask. Size = `wallet × kelly_fraction(edge_magnitude)`. Otherwise abstain (`edge_below_floor`).
+11. Persist the `DecisionRow` (JSONL).
 
-**One position per window per asset.** Never flip sides mid-window. Never stack positions on the same side in the same window.
+**One position per window.** Never flip sides mid-window. Never stack on the same side. Positions auto-clear on window rollover (`Scheduler._do_rollover()`).
 
-**Tier table (user-specified):**
+**Tier table** (`KELLY_TIERS` in `config.py`, evaluated top-to-bottom, first match wins):
 
 ```python
 KELLY_TIERS = [
-    (0.30, 0.10),    # delta >= 0.30 -> 10% wallet
-    (0.15, 0.08),    # delta >= 0.15 -> 8%
-    (0.08, 0.05),    # delta >= 0.08 -> 5%
-    (0.04, 0.03),    # delta >= 0.04 -> 3%
-    (0.02, 0.015),   # delta >= 0.02 -> 1.5%
+    (0.30, 0.10),    # delta >= 0.30 → 10% wallet
+    (0.15, 0.08),    # delta >= 0.15 →  8%
+    (0.08, 0.05),    # delta >= 0.08 →  5%
+    (0.04, 0.03),    # delta >= 0.04 →  3%
+    (0.02, 0.015),   # delta >= 0.02 →  1.5%
 ]
 ```
-
-Note that the regression handles the τ-effect implicitly through its coefficients — we don't need a separate τ-conditional tier floor table. At small τ the model's q_settled changes rapidly with spot, so edges naturally appear bigger; at large τ they appear smaller. The tier floor is a flat 0.02 across all τ.
 
 ### 3.8 Exit rule
 
 ```python
-LAG_CLOSE_THRESHOLD = 0.005   # exit when edge has compressed to half a cent
-STOP_THRESHOLD      = 0.03    # exit if edge erodes by 3 cents below entry
-FALLBACK_TAU        = 10      # default to resolution at this τ
-
-def evaluate_exit(position, current_state):
-    """
-    position:
-        side ('up'|'down'), entry_price, entry_tau, size_usd, edge_at_entry
-    current_state:
-        q_settled_now, q_up_ask_now, q_down_ask_now, q_up_bid_now, q_down_bid_now,
-        tau_now
-    """
-    if position.side == 'up':
-        edge_now = current_state.q_settled_now - current_state.q_up_ask_now
-        exit_bid = current_state.q_up_bid_now
-    else:
-        edge_now = (1 - current_state.q_settled_now) - current_state.q_down_ask_now
-        exit_bid = current_state.q_down_bid_now
-
-    # 1. Lag closed -> profit-taking exit
-    if edge_now < LAG_CLOSE_THRESHOLD:
-        return ('exit', 'lag_closed', exit_bid)
-
-    # 2. Thesis broken -> stop-loss exit
-    if edge_now < position.edge_at_entry - STOP_THRESHOLD:
-        return ('exit', 'stopped_out', exit_bid)
-
-    # 3. Resolution fallback at small τ
-    if current_state.tau_now < FALLBACK_TAU:
-        return ('hold_to_resolution', None, None)
-
-    # 4. Otherwise hold
-    return ('hold', None, None)
+LAG_CLOSE_THRESHOLD = 0.005   # exit when edge has compressed to ½ cent
+STOP_THRESHOLD      = 0.03    # exit if edge erodes 3 cents below entry edge
+FALLBACK_TAU_S      = 60      # default to resolution at this τ (1 min before close)
 ```
 
-The thresholds are sweep parameters in the dry-run replay (§10.3).
+Implemented in `Scheduler._evaluate_exit()`:
+
+- For YES position: `edge_now = q_settled − yes_ask`; exit_price = current `yes_bid`.
+- For NO position: `edge_now = (1 − q_settled) − (1 − yes_bid)`; exit_price = `1 − yes_ask`.
+
+Decision priority:
+1. If `edge_now < LAG_CLOSE_THRESHOLD` → **`exit_lag_closed`** (profit-taking).
+2. Else if `edge_now < entry_edge − STOP_THRESHOLD` → **`exit_stopped`** (stop-loss).
+3. Else if `tau_s < FALLBACK_TAU_S` → **`fallback_resolution`** (let the contract settle).
+4. Else hold.
+
+The thresholds are sweep parameters in the dry-run replay (`scripts/backtest.py --sweep`).
 
 ### 3.9 Process model
 
-WebSocket handlers update state (spot book, Polymarket book, Chainlink window). The scheduler tick reads state, calls the regression, applies entry/exit logic. The regression refit runs as a separate background task every 5 minutes on the rolling history table.
+Single Python 3.11+ process, `asyncio.TaskGroup`. Four concurrent tasks (`scripts/run_kalshi_bot.py`):
+
+1. **`CoinbaseFeed.run()`** — Coinbase Advanced Trade WS ticker for BTC-USD. Pushes ticks into `CoinbaseBook` at up to 20 Hz.
+2. **`KalshiRestFeed.run()`** — REST poll `GET /trade-api/v2/markets/{ticker}` every 1 second. Pushes (yes_bid, yes_ask) into `KalshiBook`.
+3. **`Scheduler.run()`** — itself a TaskGroup spawning four sub-loops:
+   - `_sampler_loop()` — 1 Hz: build feature vector, append to `TrainingBuffer`, write raw tick to CSV.
+   - `_refitter_loop()` — every 5 min: pull buffer arrays, fit `KalshiRegressionModel` in a thread executor, atomic-swap coefficients.
+   - `_decision_loop()` — every 10 s: sanity gates, `q_settled`, edge, Kelly tier, entry/exit logic, log JSONL row.
+   - `_window_manager_loop()` — every 10 s: pre-discover next ticker when `tau_s < 120`, switch on rollover when `tau_s ≤ 0`.
 
 ---
 
 ## 4. Architecture
 
-### 4.1 Layout
+### 4.1 Layout (only `betbot/kalshi/` is live)
 
 ```
 /repo
-  /clients
-    coinbase_ws.py           # WebSocket client for live BTC/ETH spot
-    polymarket_ws.py         # WebSocket client for Polymarket CLOB book
-    polymarket_rest.py       # REST client (orders, market metadata, fills)
-    polymarket_rtds.py       # WebSocket client for RTDS Chainlink stream
-  /state
-    spot_book.py             # Live mid, top-N bid/ask, microprice, OFI accumulator
-    poly_book.py             # Live Yes/No best bid/ask, depth, our open orders
-    window.py                # Current window: open_ts, close_ts, K, slug, tokens
-    history.py               # Rolling buffers for returns, OFI, features, q's
-  /models
-    regression.py            # Lead-lag ridge regression: fit, predict, q_settled
-    features.py              # Feature engineering from raw spot/PM state
-    edge.py                  # Computes edge_up_net, edge_down_net, edge_magnitude
-    fees.py                  # Fee curve fee(price) for net-edge calculation
-    slippage.py              # Slippage estimator from current PM book depth
-  /strategy
-    decision.py              # The 8-step decision loop
-    kelly.py                 # Tier table, sizing logic
-    entry.py                 # Entry rule (§3.7)
-    exit.py                  # Cash-out exit rule (§3.8)
-    risk.py                  # Daily loss cap, max open positions, circuit breakers
-  /execution
-    orders.py                # Order placement, retries (Phase 2)
-    fills.py                 # Position tracking, P&L attribution
-  /infra
-    scheduler.py             # Main 10s tick loop
-    refitter.py              # Background task: refit regression every 5 min
-    config.py                # All tunables in one place
-    logger.py                # Structured tick log -> Parquet for backtest replay
-    secrets.py               # API keys, wallet config (env-loaded)
-  /research
-    backtest.py              # Replay logged ticks
-    cashout_simulator.py     # Computes P&L from logged future books
-    refit_offline.py         # Offline regression fitting + cross-validation
-    parameter_sweep.py       # Sweep LAG_CLOSE x STOP x FALLBACK_TAU + ridge_alpha
-    diagnostics.py           # R^2, lag-stability, edge-realization slope
-  /cli
-    polybot_metrics.py       # SSH-friendly metric queries via DuckDB
-    polybot_ctl.py           # Pause/resume/status over Unix domain socket
-  /tests
-    ...
-  CLAUDE.md
-  README.md
-  pyproject.toml
+  /betbot
+    /kalshi                         # ← THE ENTIRE LIVE BOT IS HERE
+      __init__.py
+      config.py                     # All tunables; loads .env
+      auth.py                       # Kalshi RSA-PSS request signing
+      book.py                       # CoinbaseBook + KalshiBook (state)
+      coinbase_feed.py              # Coinbase WS ticker → CoinbaseBook
+      kalshi_rest_feed.py           # Kalshi REST polling → KalshiBook
+      features.py                   # FeatureVec + build_features()
+      model.py                      # KalshiRegressionModel (RidgeCV)
+      training_buffer.py            # Rolling (X, y, ts) buffer
+      tick_logger.py                # 1Hz CSV writer for backtests
+      scheduler.py                  # Sampler / refitter / decision / window mgr
+    /clients, /models, /state,      # ← DEAD legacy code (Polymarket era).
+    /strategy, /infra, /research,   #   Imports from non-existent polybot.*
+    /execution, /cli, main.py       #   Do not touch.
+  /scripts
+    run_kalshi_bot.py               # Live entrypoint
+    backtest.py                     # Walk-forward replay on logs/ticks.csv
+    analyze_run.py                  # Visualize logs/decisions.jsonl
+    test_trade.py                   # One-off real $1 round-trip
+    check_kalshi_balance.py         # Kalshi auth smoke test
+    visualize_market.py             # Live 60s lag-visualization tool
+    demo_binance.py, demo_coinbase.py  # Legacy demo scripts (dead)
+  CLAUDE.md                         # This file
+  DRYRUN.md                         # Step-by-step Phase 1 ops guide
+  RUNBOOK.md                        # Older operations doc (partly stale)
+  lag_plot_btc.png                  # Empirical lag observation
+  pyproject.toml                    # Project metadata (still says "polybot" — vestigial)
+  requirements.txt
+  .env.example                      # Template for KALSHI_* + DRY_RUN
 ```
 
 ### 4.2 Data flow
 
 ```
-Coinbase WS  ──tick──►  spot_book ──┐
-                                    │
-Polymarket WS ──update──► poly_book ┼──► scheduler (10s) ──► features ──► regression ──► edge ──► kelly ──► (Phase 2) orders
-                                    │              │                            │
-RTDS Chainlink ──tick──► window ────┘              ▼                            ▼
-                                              parquet writer                refitter (every 5 min)
-                                                                                │
-                                                                                └──► models/regression.py
+Coinbase WS ──ticker tick──► CoinbaseBook (microprice + 5min ring buffer)
+                                                │
+Kalshi REST 1Hz poll ──(yes_bid, yes_ask)──► KalshiBook (yes_mid + ring buffer)
+                                                │
+                                                ▼
+              build_features() ──FeatureVec──┐
+                                             │
+                                             ▼
+   ┌──────────────► Sampler 1Hz ───► TrainingBuffer ───► Refitter 5min ───┐
+   │                                                                       │
+   └─── Decision 10s ────► q_settled, edge, Kelly tier ──► entry / exit ◄──┘
+                                                              │
+                                                              ▼
+                                                logs/decisions.jsonl
+                                                logs/ticks.csv
 ```
 
 ### 4.3 Process model
 
-Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: Coinbase WS, Polymarket CLOB WS, Polymarket RTDS WS, scheduler, parquet writer, regression refitter. Six tasks total, all under one event loop.
+Single `asyncio` event loop. The CPU-heavy regression refit runs via `loop.run_in_executor(None, model.fit, ...)` so it doesn't block the decision tick. Coefficient swap inside `KalshiRegressionModel` is guarded by a `threading.Lock`.
 
 ---
 
@@ -414,870 +380,408 @@ Single Python 3.11+ process, asyncio, `asyncio.TaskGroup`. Long-running tasks: C
 
 ### 5.1 Coinbase Advanced Trade WebSocket
 
+Implemented in `betbot/kalshi/coinbase_feed.py`.
+
 - **Endpoint:** `wss://advanced-trade-ws.coinbase.com`
-- **Auth:** JWT (ES256), regenerated per subscribe message; tokens expire after 120s. Use `coinbase.jwt_generator.build_ws_jwt(api_key, api_secret)`.
-- **Channels:** `ticker`, `level2` (envelope name `l2_data`), `market_trades`, `heartbeats`. **One subscribe message per channel.**
-- **`level2` semantics:** `new_quantity` is **absolute size at price level**, not a delta. `new_quantity == "0"` means level removed. Initial `type: "snapshot"` event replaces local book; subsequent `type: "update"` events apply diffs. We must compute OFI ourselves from observed size changes.
-- **Sequence:** `sequence_num` strictly monotonic per connection. Gap → drop local book, reconnect, get fresh snapshot.
-- **Library:** `coinbase-advanced-py` for SDK convenience, or raw `websockets` + `coinbase.jwt_generator` for tightest control. Use SDK for Phase 1.
-- **State derived in `spot_book.py`:**
+- **Auth:** none required for the public `ticker` channel. (The legacy plan to use JWT-authed `level2` for OFI features is **not** implemented in the kalshi branch — we use only the unauthenticated ticker channel.)
+- **Subscription:** `{"type":"subscribe","product_ids":["BTC-USD"],"channel":"ticker"}`.
+- **Rate-limit:** ingest is capped client-side at 20 Hz (`MAX_HZ`).
+- **Reconnect:** automatic on disconnect, 2-second backoff.
+- **State derived in `CoinbaseBook`:**
   - `mid` = (best_bid + best_ask) / 2
-  - **`microprice`** — the regression's primary input, updated on every L2 event
-  - `top_5_bid_levels[]`, `top_5_ask_levels[]` (price + size)
-  - `last_trade_price`, `last_trade_size`
-  - 1-second sampled microprice ring buffer over last 300 seconds (this is what the regression's lagged features read from)
-  - per-event OFI accumulator (Cont-Kukanov-Stoikov, levels 1-5)
+  - **`microprice`** — the regression's primary input
+  - 5-minute ring buffer of microprice samples at 1 Hz (powers `microprice_at(lag_s)` for lagged features)
+  - `last_update_ns` — staleness watchdog input
 
-### 5.2 Polymarket CLOB WebSocket
+### 5.2 Kalshi REST polling
 
-- **Endpoint:** `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- **No auth required** for market channel. Subscribe by `assets_ids` (Yes token + No token), not by slug:
-  ```json
-  {"type":"market","assets_ids":["<UP_TOKEN>","<DOWN_TOKEN>"],"custom_feature_enabled":true}
-  ```
-- Send `PING` (literal text, not JSON) every 10s. Server sends `PING` every 5s; reply `PONG` within 10s.
-- **Events:** `book` (full snapshot — bids/asks arrays), `price_change` (incremental — size is new resting size, not delta), `last_trade_price`, `tick_size_change`.
-- **Known issue:** silent freeze ([py-clob-client #292](https://github.com/Polymarket/py-clob-client/issues/292)). Watchdog: if no `book` or `price_change` in 60s, force reconnect; if reconnect fails twice, fall back to REST polling.
-- **REST `/book` is unreliable** ([#180](https://github.com/Polymarket/py-clob-client/issues/180)) — returns stale 0.99/0.01 ghost books. Always prefer WS book; use `get_price()` for sanity checks only.
+Implemented in `betbot/kalshi/kalshi_rest_feed.py`. **The Kalshi branch deliberately does not use Kalshi's WebSocket** — early experiments hit silent-freeze and heartbeat issues, and REST polling at 1 Hz is more reliable and well within Kalshi's basic-tier 20 reads/sec limit.
 
-### 5.3 Polymarket REST
+- **Endpoint:** `GET /trade-api/v2/markets/{ticker}` against `https://api.elections.kalshi.com`.
+- **Auth:** RSA-PSS over `timestamp + method + path`, headers `KALSHI-ACCESS-{KEY,TIMESTAMP,SIGNATURE}`. See `betbot/kalshi/auth.py`.
+- **Cadence:** 1 Hz (`POLL_INTERVAL_S = 1.0`).
+- **Response fields used:** `market.yes_bid_dollars`, `market.yes_ask_dollars` → fed into `KalshiBook.apply_ticker_update()`.
+- **Failure handling:** 5 consecutive failures → close session and reopen; on HTTP 429 → 2 s backoff.
+- **Ticker switching:** `feed.update_ticker(new_ticker)` on window rollover; the next poll uses the new ticker. No reconnect required.
 
-- **Library:** `py-clob-client-v2` (current, post CLOB v2 / pUSD migration). Use the older `py-clob-client` only as fallback.
-- **REST host:** `https://clob.polymarket.com`. **Gamma:** `https://gamma-api.polymarket.com` (slug → token resolution).
-- **Slug format:** `{btc|eth}-updown-5m-{window_open_unix_ts}` where `ts % 300 == 0`. Resolve at each window boundary:
-  ```python
-  now = int(time.time())
-  window_ts = now - (now % 300)
-  slug = f"btc-updown-5m-{window_ts}"
-  # GET https://gamma-api.polymarket.com/markets?slug={slug}
-  # -> conditionId, clobTokenIds [up_token, down_token], tickSize, feesEnabled
-  ```
-- **Phase 1 calls used:** `get_market`, `get_price` (sanity), `get_midpoint`, `get_spread`, `get_tick_size`, `get_server_time`. No order placement.
-- **Auth tiers** (Phase 2 only): L0 read, L1 EOA private key, L2 HMAC API key. For automated trading, L2 with proxy wallet (sig type 1) avoids per-trade gas.
+### 5.3 Kalshi market discovery
 
-### 5.4 Polymarket RTDS (Chainlink prices)
+Implemented in `Scheduler._list_active_markets()` and `_discover_market()`.
 
-- **Endpoint:** `wss://ws-live-data.polymarket.com` — separate from the CLOB WS.
-- **Subscribe BTC:**
-  ```json
-  {"action":"subscribe","subscriptions":[{
-    "topic":"crypto_prices_chainlink","type":"*",
-    "filters":"{\"symbol\":\"btc/usd\"}"}]}
-  ```
-- **Heartbeat:** `PING` every 5s.
-- **Message:** `{topic, type, timestamp, payload:{symbol, timestamp, value}}`. Outer `timestamp` is server send (ms); inner `payload.timestamp` is Chainlink oracle observation time (ms).
-- **K capture algorithm:**
-  ```
-  window_ts_ms = window_open_unix_ts * 1000
-  K = first tick where payload.timestamp >= window_ts_ms
-  ```
-  If no such tick within window_ts_ms + 5000ms, mark window `K_uncertain=true` and abstain from all decisions in this window.
+- Lists `KXBTC15M` markets with `status ∈ {open, active}` via `GET /trade-api/v2/markets?series_ticker=KXBTC15M&status=open`.
+- Sorts by `close_time` (ascending), then by `floor_strike`.
+- Picks the **at-the-money** market in the soonest-closing batch — i.e. the strike whose `floor_strike` is closest to current Coinbase BTC spot. This is the bin with the most uncertainty, and therefore the most lag-arb potential. (Deep ITM/OTM bins sit at 0.99/0.01 and offer no edge.)
+- On rollover (`_window_manager_loop`): pre-discovers the next market when `tau_s < 120s`, switches when `tau_s ≤ 0`.
 
-### 5.5 Polymarket fees
+### 5.4 Kalshi fees (current model)
 
-5-minute crypto markets charge dynamic taker fees, makers free.
+Kalshi charges a taker fee on each filled contract. The bot models it as:
 
 ```
-fee_per_dollar(p) = Theta * p * (1 - p)   # Theta ≈ 0.05, peak ~3.15% at p=0.5
+fee_per_dollar(p) = THETA_FEE * p * (1 - p)        # THETA_FEE = 0.07
 ```
 
-For this strategy, fees are paid on **both legs** (entry as taker; exit as taker if lag-closed or stopped out, fee-free if held to resolution). Total round-trip cost when entering at price `a` and exiting at price `e`:
+Peak ~1.75% per leg at p = 0.5. Round-trip cost (entry as taker + exit as taker) at p = 0.5 is roughly **3.5% of position notional** before slippage. The Kelly tier floor of 2% net edge accounts for this implicitly; the raw edge `q_settled − yes_ask` must exceed ~5% before the trade clears the lowest tier.
 
+`THETA_FEE = 0.07` is a working estimate borrowed from Kalshi's published 2025 schedule and **must be calibrated against actual fills** before any conclusions about live profitability. See `scripts/test_trade.py` for the round-trip sanity check that produces a real fee number.
+
+### 5.5 Slippage
+
+Modeled crudely in `_slippage()`:
+
+```python
+def _slippage(book_depth: float, size_usd: float) -> float:
+    if book_depth <= 0:
+        return 0.02
+    return min(0.02, size_usd / book_depth * 0.01)   # capped at 2 cents
 ```
-total_cost = fee(a) + fee(e) + spread_at_exit + slippage_in + slippage_out
-```
 
-The lag-driven edge (the regression's `q_settled − q_actual`) must exceed this total cost for the trade to be net positive. The actual Θ for 5-min markets is borrowed from 15-min docs and confirmed empirically only after first live trades.
-
-**Maker-rebate optimization (deferred to Phase 2):** Polymarket pays makers a rebate of 25-50% of taker fees from a daily pool. Posting the *exit* leg as a maker order (limit at our target exit price) captures the rebate and dodges the exit fee. In Phase 1 we model exits as takers (worst case); in Phase 2 we add a maker-exit mode and compare.
+This is **not** a VWAP-against-the-ladder model. It assumes a smooth penalty proportional to `size / depth`, capped at 2 cents per share. Phase 1 doesn't trade so this only affects the simulated edge calculation; in Phase 2 it should be replaced with a true depth-walking estimator.
 
 ---
 
 ## 6. The lead-lag regression in detail
 
-### 6.1 Why this is the right model for this strategy
+### 6.1 Why this is the right model
 
-The strategy thesis is "Polymarket lags Coinbase." The most direct way to express that hypothesis as a model is *literally* a regression of Polymarket's quote on lagged Coinbase prices. There's no need to model an option, infer a volatility, or assume a probability distribution. We just need to know how Polymarket's quote depends on recent spot history, and the regression learns that from data.
+The strategy thesis is "Kalshi lags Coinbase." The most direct way to express that hypothesis as a model is *literally* a regression of Kalshi's quote on lagged Coinbase prices. We don't model an option, infer a volatility, or assume a probability distribution. We just need to know how Kalshi's quote depends on recent spot history, and the regression learns that from data.
 
 This formulation has properties no Black-Scholes formulation has:
 
-- **Self-falsifying.** If the regression's R² is poor, Polymarket isn't actually predictable from spot the way we hypothesized. The dry run will tell us this directly.
-- **Self-calibrating to costs.** We can include `q_actual_t-1` as a feature if we want and the model will learn whatever momentum is already priced in; we don't have to worry about double-counting signals.
-- **Self-adapting.** As Polymarket's market makers get faster, the lag profile (β coefficients) shifts; the model picks this up at every refit. No human re-tuning needed.
-- **No σ to be wrong about.** Volatility estimation is no longer a critical-path input. We log realized vol as a diagnostic, but a σ bug can't fake an edge signal anymore.
-- **The edge is a pure number, with units of probability.** `q_settled - q_actual` is already in probability points, the same units as the Kelly tier thresholds. No translation needed.
+- **Self-falsifying.** If R² is poor, Kalshi isn't actually predictable from spot the way we hypothesized. The dry run will tell us this directly.
+- **Self-adapting.** As Kalshi's market makers get faster, the lag profile (β coefficients) shifts; the model picks this up at every refit. No human re-tuning needed.
+- **No σ to be wrong about.** Volatility estimation is no longer a critical-path input.
+- **The edge is a pure number, with units of probability.** `q_settled − yes_ask` is already in probability points, the same units as the Kelly tier thresholds. No translation needed.
 
 ### 6.2 Feature design
 
-Every feature is referenced to the current window's strike K so that windows are comparable across the training data. The lookback grid is intentionally dense in the 0-90s range and sparse beyond, since most plausible Polymarket lags fall in that range.
+See §3.3 for the full list. A few notes on choices:
 
-```
-Spot history (microprice / K, in log space):
-  x_now    = log(microprice_t      / K)
-  x_15     = log(microprice_{t-15s} / K)
-  x_30     = log(microprice_{t-30s} / K)
-  x_45     = log(microprice_{t-45s} / K)
-  x_60     = log(microprice_{t-60s} / K)
-  x_90     = log(microprice_{t-90s} / K)
-  x_120    = log(microprice_{t-120s}/ K)
+- The lookback grid `[0, 15, 30, 60, 90, 120]` seconds is intentionally dense in the 0-90s range and sparse beyond, since the user's empirical observation suggests Kalshi's lag falls in that range.
+- `kalshi_spread` and `kalshi_momentum_30s` give the regression a way to learn that wide-spread or fast-moving Kalshi books need different treatment.
+- All spot history is in `log(microprice / K)` so windows are comparable across the training data regardless of strike level.
 
-Time:
-  tau           = τ in seconds
-  inv_sqrt_tau  = 1 / √(τ + 1)         # makes near-close moves matter more
+### 6.3 Refitting
 
-Spot microstructure:
-  ofi_30s             # signed Order Flow Imbalance over last 30s, z-scored
-  ofi_l5_weighted     # multi-level OFI
-  momentum_30s        # log(microprice_t / microprice_{t-30s})
-  momentum_60s
+Implemented in `Scheduler._refitter_loop()` and `KalshiRegressionModel.fit()`.
 
-Polymarket microstructure:
-  pm_book_imbalance   # (depth_up - depth_down) / total
-  pm_trade_flow_30s   # net Yes-buying minus No-buying volume
+- **Cadence:** every `REFIT_INTERVAL_S = 300` seconds (5 min).
+- **Training data:** rolling `TRAINING_WINDOW_S = 4 * 3600` seconds (4 h).
+- **Filter:** only train on samples where `yes_mid ∈ [0.05, 0.95]`. Extreme tails have huge logit values that disproportionately pull the regression and don't carry lag-arb signal anyway (the bot abstains in those regimes regardless).
+- **Hold-out:** the most recent 20% of the time span is used for `r2_held_out` (out-of-sample sanity).
+- **Cross-validation:** `TimeSeriesSplit(n_splits=min(5, n_train // 50))` over `RIDGE_ALPHAS = [0.001, 0.01, 0.1, 1.0, 10.0]`.
+- **Diagnostics logged every refit** (`ModelDiagnostics`): `n_train`, `ridge_alpha`, `r2_in_sample`, `r2_cv`, `r2_held_out`, all 12 coefficients, `estimated_lag_s`, `coef_delta_l2`.
+- **Atomic swap:** new coefficients replace old under a lock; the decision loop never sees a half-updated model.
 
-Cross-asset (when modeling BTC, this is ETH; vice versa):
-  cross_momentum_60s
-```
+### 6.4 Cold start vs bootstrap
 
-About 14-16 features total. Ridge regression with regularization `α` chosen by 5-fold time-series cross-validation each refit. (`α` is a Phase 1 sweep parameter alongside the exit thresholds.)
+The regression needs about `MIN_TRAIN_SAMPLES = 360` samples (≈ 6 minutes at 1 Hz) before the first fit, and ideally several hours before coefficients are stable.
 
-The features are computed at every 10-second decision tick AND at every 1-second sample for training. The training samples vastly outnumber decision ticks, which is fine — we want a richly-trained model.
+**Cold start:** if `logs/ticks.csv` doesn't exist, the bot enters a `model_warmup` abstention loop until enough live samples accumulate.
 
-### 6.3 The training loop
+**Bootstrap from history:** if `logs/ticks.csv` exists from a prior run, `Scheduler._bootstrap_from_history()` replays the last 4 h of ticks at startup, rebuilds feature vectors using historical lagged microprices, and seeds the `TrainingBuffer`. If ≥ 360 samples are loaded, the model fits **before the first decision tick** so we don't waste an entire warmup phase. This is one of the most useful features for iterative development — kill the bot, change a feature, restart, and you're trading-ready immediately.
+
+### 6.5 Computing `q_settled`
+
+The core computation (`KalshiRegressionModel.q_settled()`):
 
 ```python
-class RegressionRefitter:
-    """
-    Background task: every 5 minutes, refit the regression from the last 4 hours
-    of (q_actual, features) pairs. New coefficients are atomically swapped into
-    the live model used by the scheduler tick.
-    """
-    REFIT_INTERVAL_SECS = 300
-    TRAINING_WINDOW_SECS = 4 * 3600
+def q_settled(self, fv: FeatureVec) -> Optional[float]:
+    if not self.is_fit or not fv.complete:
+        return None
+    logit = self._predict_raw(fv.settled_array())   # x_15..x_120 := x_0
+    return _sigmoid(logit) if logit is not None else None
 
-    async def run(self, history: HistoryStore, model: RegressionModel):
-        while True:
-            await asyncio.sleep(self.REFIT_INTERVAL_SECS)
-            try:
-                training_data = history.fetch_window(self.TRAINING_WINDOW_SECS)
-                if len(training_data) < MIN_TRAIN_SIZE:
-                    continue                                # cold-start, skip
-                X, y = build_design_matrix(training_data)
-                new_coefs, diagnostics = fit_ridge_cv(X, y)
-                model.atomic_swap(new_coefs)
-                log_model_version(new_coefs, diagnostics)
-            except Exception as e:
-                logger.exception("refit_failed", error=str(e))
-                # Keep using current coefficients; do not crash
+def q_predicted(self, fv: FeatureVec) -> Optional[float]:
+    if not self.is_fit or not fv.complete:
+        return None
+    logit = self._predict_raw(fv.as_array())        # genuine lagged history
+    return _sigmoid(logit) if logit is not None else None
 ```
 
-Refit diagnostics logged at every refit: `R²` (in-sample and CV), `n_train_samples`, fitted coefficients, the derived `estimated_lag_seconds`, prediction MSE on the most recent 30 minutes (which is held out from training), and L2 norm of coefficient delta vs previous fit (stability metric — large deltas suggest regime shift).
-
-### 6.4 Cold start
-
-The regression needs ~1 hour of data minimum to fit anything meaningful, ~4 hours for stable coefficients. During this period, the bot abstains entirely. Phase 1 dry run divides into:
-
-```
-Hour 0-1:    All WS feeds live, history accumulating, σ warming up.
-             Decisions table is being populated, but every row has
-             event = 'abstain' with abstention_reason = 'model_warmup'.
-
-Hour 1:      First regression fit attempted. If R² > 0.1, model goes live.
-             Otherwise wait another hour and retry.
-
-Hour 1-4:    Model is live but coefficients still settling. Bot operates
-             normally. Trades are simulated/logged, no real money even in
-             Phase 2 trial mode.
-
-Hour 4-24:   Model has 4 hours of training data. Considered fully warmed up.
-             Refits every 5 min on rolling 4-hour window.
-```
-
-For future runs (after we've collected one good 24-hour history), we can bootstrap from a pickled prior model. Phase 1 starts cold.
-
-### 6.5 Computing q_settled
-
-This is the core computation each decision tick uses.
-
-```python
-def compute_q_settled(model, current_features):
-    """
-    What WILL Polymarket be quoting once it has digested current spot?
-    Substitute current microprice into every lag slot.
-    """
-    # Build a "settled" feature vector: every spot lookback uses x_now
-    settled_features = current_features.copy()
-    for lag_key in ['x_15', 'x_30', 'x_45', 'x_60', 'x_90', 'x_120']:
-        settled_features[lag_key] = current_features['x_now']
-    # Microstructure features stay as-is (they describe current conditions)
-
-    logit_q_settled = model.predict_logit(settled_features)
-    return sigmoid(logit_q_settled)
-
-
-def compute_q_predicted(model, current_features):
-    """
-    What SHOULD Polymarket be quoting right now given lagged spot history?
-    Sanity check: should be close to q_actual under healthy conditions.
-    """
-    return sigmoid(model.predict_logit(current_features))
-```
-
-`q_settled` is the headline output. `q_predicted` is a diagnostic — if it diverges substantially from `q_actual`, something is wrong (regime shift, stale model, feed problem) and we should be more cautious.
+`q_settled` is the headline output. `q_predicted` is a diagnostic — if it diverges substantially from `yes_mid`, the model is broken or the regime has shifted, and the bot abstains via `model_disagrees_market`.
 
 ---
 
-## 7. Sanity gates and circuit breakers around the regression
+## 7. Sanity gates and circuit breakers
 
-The regression is the entire model, so we need to be careful when to trust it.
+The regression is the entire model, so we're careful about when to trust it. From `Scheduler._tick()`:
 
-| Condition                                          | Action                                  |
-|----------------------------------------------------|-----------------------------------------|
-| Model not yet fit                                  | Abstain. `abstention_reason='model_warmup'` |
-| Model R² (rolling 30-min held-out) < 0.10          | Abstain. `abstention_reason='model_low_r2'` |
-| `\|q_predicted − q_actual\| > 0.15` (model very wrong) | Abstain. `abstention_reason='model_disagrees_market'` |
-| Coefficient delta vs previous fit > some threshold | Log + run normally (regime shift is real); refit window may need to shrink |
-| Last successful refit > 15 minutes ago             | Abstain. `abstention_reason='model_stale'`  |
+| Condition                                          | Action                                            |
+|----------------------------------------------------|---------------------------------------------------|
+| `not kb.ready or not cb.ready`                     | Abstain. `data_not_ready`                         |
+| Model not yet fit                                  | Abstain. `model_warmup`                           |
+| `model.stale_s() > 900` (last refit > 15 min ago)  | Abstain. `model_stale`                            |
+| `model.r2_cv < 0.10`                               | Abstain. `model_low_r2` *(config says 0.05 — see §12)* |
+| `fv is None` or `not fv.complete`                  | Abstain. `features_incomplete`                    |
+| `q_pred is None or q_set is None`                  | Abstain. `model_predict_failed`                   |
+| `\|q_predicted − yes_mid\| > 0.15`                 | Abstain. `model_disagrees_market`                 |
+| `tau_s < FALLBACK_TAU_S` (60s)                     | Abstain (entry). `tau_too_small`                  |
+| `yes_ask − yes_bid > 0.10`                         | Abstain. `wide_spread` *(config says 0.12 — see §12)* |
+| `edge_magnitude < 0.02` (lowest tier floor)        | Abstain. `edge_below_floor`                       |
+| Open position exists in current window             | Skip entry, run exit logic                        |
+| Window rollover                                    | Drop position state (positions don't carry across windows) |
 
-These gates collectively express: *we only trade when the model has been validated on recent data and currently agrees on Polymarket's level (even if we believe the level will move)*. A model that thinks Polymarket should be at 0.40 when it's actually at 0.72 isn't telling us about lag — it's telling us the model is broken or the regime has shifted.
+**Note:** `_tick()` checks `cb.ready` and `kb.ready` but does not gate on staleness within the tick. A book that received one update minutes ago and went silent will still report `ready=True`. The constants `COINBASE_STALE_MS_MAX` and `KALSHI_STALE_MS_MAX` exist in `config.py` but are unused in the decision path. See §12 for the full caveat.
+
+These collectively express: *we only trade when the model has been validated on recent data, currently agrees on Kalshi's level, and the market itself looks tradeable.*
 
 ---
 
-## 8. Phase 1 — 24-hour dry run
+## 8. Phase 1 — data collection and dry-run analysis
 
 ### 8.1 Goals
 
-1. Verify all four data feeds run cleanly for 24 hours under systemd on the Ubuntu VM.
-2. Log every input the regression and the cash-out simulator could possibly need: spot, microprice, lagged microprices, K, q's, microstructure features, model predictions, fitted coefficients, hypothetical entry decisions, hypothetical exit triggers.
-3. Resolve every window's outcome and write a clean `window_outcomes` table.
-4. Validate the strategy thesis quantitatively via the regression's fit quality and the edge-realization slope.
-5. Sweep exit-rule parameters and the ridge regularization to find the best operating point.
+1. Verify both feeds (Coinbase WS, Kalshi REST) run cleanly for many hours.
+2. Log every input the regression and the exit simulator could possibly need: spot, microprice, lagged microprices, K, yes_bid/ask/mid, computed features, model predictions, fitted coefficients, hypothetical entry decisions, hypothetical exit triggers.
+3. Validate the strategy thesis quantitatively via the regression's fit quality (`r2_cv`, `estimated_lag_s` stability) and the realized P&L from `scripts/backtest.py`.
+4. Sweep entry/exit thresholds to find the best operating point.
 
 ### 8.2 What is NOT done in Phase 1
 
-- No order placement. No authenticated Polymarket calls. No real money at risk.
-- No live tuning of the regression's structural parameters (lookback grid, feature set). The regression refits its coefficients automatically, but we don't change feature engineering during the run.
-- No live exit decisions — exits are simulated at replay time against the logged future order book.
+- No order placement. No authenticated Kalshi POST. No real money at risk via the bot.
+- The single exception is `scripts/test_trade.py`, which places one $1 buy + one $1 sell to verify auth and fee accounting — run manually, never from the bot loop.
+- No live tuning of the regression's structural parameters. The regression refits its coefficients automatically, but we don't change feature engineering during a run.
+- No live exit decisions in the JSONL — exits are simulated at backtest time against the logged book.
 
 ### 8.3 Pre-flight checks
 
-- All four WS connections established and streaming for 30+ minutes.
-- Microprice computation produces values that track midpoint in calm regimes (typical |microprice − mid| < 0.5 × spread) and diverge during bursts.
-- At least one full 5-minute window has resolved cleanly with `K` captured at boundary and `close_price` captured at close.
-- DuckDB query against the parquet directory returns expected row counts.
-- systemd unit auto-restarts on simulated crash.
-- Disk has ≥ 5GB free.
+- Both feeds streaming for 5+ minutes:
+  - `cb_book.last_update_ns` advancing on every Coinbase tick
+  - `kb_book.last_update_ns` advancing on every Kalshi poll
+- `floor_strike` populated (non-zero) on the discovered ticker.
+- At least one full 15-min window has rolled over cleanly (look for the `INFO  window rollover -> ...` line).
+- `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_FILE` (or `_PEM`) loaded from `.env` (verify with `python scripts/check_kalshi_balance.py`).
+- `logs/` directory writable, ≥ 1 GB free on disk (CSV + JSONL grow ~50 MB/day).
 
 ### 8.4 During the run
 
-Manual SSH check-ins via `polybot-metrics summary --since=runstart` are safe — read-only DuckDB queries against parquet. After hour 4, also check `polybot-metrics model --latest` to inspect the live regression (coefficients, R², estimated_lag_seconds).
+Leave `python scripts/run_kalshi_bot.py` running in a terminal (or under `nohup` / `tmux` / a headless VM). One line per 10s scheduler tick prints to stdout, plus one `[Refit]` line every 5 minutes. Tail the JSONL with:
 
-Resist tuning anything live. Fixed inputs over 24 hours is the entire point.
+```bash
+tail -f logs/decisions.jsonl | jq 'select(.event != "abstain")'
+```
+
+Resist tuning anything live. Fixed inputs over many hours is the entire point.
 
 ### 8.5 Post-run validation
 
-Sanity checks before declaring the run successful:
+Run `python scripts/analyze_run.py` after at least 1-4 hours of data. The script produces (a) charts of yes_mid vs `q_settled` / `q_predicted`, (b) edge magnitude over time, (c) `r2_cv` and `estimated_lag_s` over time, (d) hypothetical cumulative P&L from logged entry/exit pairs, and (e) a terminal summary. See `DRYRUN.md` for a full walkthrough.
 
-1. **No data gaps.** Coinbase `sequence_num` strictly monotonic; heartbeats ≥ 1/s; Polymarket WS produced events per active window; Chainlink RTDS produced ≥ 1 tick per 60s.
-2. **All windows resolved.** Expected ≈ 288 windows × 2 assets = 576. Allow 1-2% loss to startup/shutdown edges.
-3. **Microprice rarely extreme** in calm regimes; excursions correlate with subsequent midpoint moves (validates microprice as forward predictor).
-4. **Each window has ≈ 30 decision rows** (5 min / 10 s) with 1 K-capture event each.
-5. **Model R² distribution.** Histogram CV-R² across all refits; median should be > 0.3 for healthy operation. If median < 0.1, Polymarket isn't actually predictable from spot the way the strategy assumes.
-6. **Lag-stability.** `estimated_lag_seconds` should be relatively stable hour-to-hour, ideally in the 15-90s range. Wild swings (5s one hour, 200s the next) suggest the model is fitting noise, not signal.
-7. **`q_predicted` tracks `q_actual` closely.** Plot q_predicted vs q_actual over the run; should hug the diagonal with low residual variance. This is the cleanest sanity check on the model.
-8. **Model-disagreement abstention rate < 5%.** If the model frequently disagrees with the market (`|q_predicted - q_actual| > 0.15`), the model is mis-specified.
+Healthy thresholds:
+
+| Metric                 | Healthy        | Bad           |
+|------------------------|----------------|---------------|
+| Median R²_cv           | > 0.25         | < 0.10        |
+| Estimated lag          | 15-90s, stable | <5s or >150s  |
+| % exits as `lag_closed`| > 50%          | < 30%         |
+| Edge p90 magnitude     | > 0.03         | < 0.01        |
+| `\|q_pred − yes_mid\|` | mean < 0.03    | mean > 0.10   |
+| Simulated P&L          | positive       | negative      |
+
+If **median R² < 0.10**: Kalshi is not predictable from Coinbase on today's data — the strategy thesis doesn't hold. Don't advance.
+
+If **estimated lag < 5s**: Kalshi's market makers are already fast enough to eliminate the edge. Try again during higher-volatility periods.
 
 ---
 
 ## 9. Logging and storage
 
-### 9.1 Format and partitioning
+The kalshi branch uses **plain text formats** (CSV + JSONL), not Parquet. This is a deliberate simplification — at our data volume, Parquet's compression and columnar advantages don't matter, and CSV/JSONL is trivially inspectable from any shell.
 
-Apache Parquet, zstd compression level 3, hive-partitioned:
+### 9.1 `logs/decisions.jsonl`
+
+One line per 10s scheduler tick, written by `Scheduler._log_decision()`. Schema (`DecisionRow`):
 
 ```
-logs/
-  decisions/dt=2026-05-04/asset=btc/h=14.parquet
-  decisions/dt=2026-05-04/asset=eth/h=14.parquet
-  coinbase_ticks/dt=2026-05-04/asset=btc/h=14.parquet
-  polymarket_book_snapshots/dt=2026-05-04/asset=btc/h=14.parquet
-  polymarket_trades/dt=2026-05-04/asset=btc/h=14.parquet
-  chainlink_ticks/dt=2026-05-04/asset=btc/h=14.parquet
-  window_outcomes/dt=2026-05-04/asset=btc.parquet      (no h= partition)
-  model_versions/dt=2026-05-04/asset=btc.parquet       (no h= partition)
+ts_ns               int       wall-clock receipt nanoseconds
+tau_s               float     seconds until window close
+yes_bid             float     Kalshi YES bid
+yes_ask             float     Kalshi YES ask
+yes_mid             float     (yes_bid + yes_ask) / 2
+q_predicted         float?    sigmoid(model.predict(features))
+q_settled           float?    sigmoid(model.predict(features.settled_array()))
+edge_up_raw         float?    q_settled − yes_ask
+edge_up_net         float?    edge_up_raw − fee − slippage
+edge_magnitude      float     abs(best signed edge); -99 sentinel when not computed
+favored_side        str?      "yes" / "no"
+event               str       abstain / entry / hold / exit_lag_closed / exit_stopped / fallback_resolution
+abstention_reason   str?      e.g. "model_warmup", "edge_below_floor"
+tier                int       0 = abstain; 1-5 = Kelly tier index
+would_bet_usd       float
+has_open            bool
+model_r2_cv         float
+model_lag_s         float     β-weighted average lag at the active fit
+window_ticker       str       e.g. "KXBTC15M-26MAY061515-15"
 ```
 
-One file per hour per asset. Use `pyarrow.parquet.ParquetWriter` opened once per hour, batch-flushed every 60 seconds.
+### 9.2 `logs/ticks.csv`
 
-Estimated total disk: ~50 MB/day compressed, both assets combined.
+One row per 1 Hz sampler tick, written by `TickLogger.log()`. Schema:
 
-### 9.2 The `decisions` table — primary tuning source
+```
+ts_ns           int
+tau_s           float
+btc_microprice  float
+btc_bid         float
+btc_ask         float
+yes_bid         float
+yes_ask         float
+yes_mid         float
+floor_strike    float
+window_ticker   str
+```
 
-One row per 10s scheduler tick.
-
-| Column                      | Type    | Notes |
-|-----------------------------|---------|-------|
-| ts_ns                       | int64   | wall-clock receipt timestamp |
-| asset                       | dict    | "btc"/"eth" |
-| window_ts                   | int32   | window open unix s |
-| tau_s                       | float32 | seconds until close |
-| **Spot inputs**             |         |       |
-| S_mid                       | float64 | Coinbase midpoint |
-| microprice                  | float64 | imbalance-weighted fair value |
-| spot_spread                 | float32 | Coinbase ask − bid |
-| spot_bid_size_l1            | float32 | |
-| spot_ask_size_l1            | float32 | |
-| **Strike**                  |         |       |
-| K                           | float64 | Chainlink window-open snapshot |
-| K_uncertain                 | bool    | true if K was estimated, not observed |
-| **Lagged spot features**    |         |       |
-| x_now_logKratio             | float32 | log(microprice_t / K) |
-| x_15_logKratio              | float32 | log(microprice_{t-15} / K) |
-| x_30_logKratio              | float32 | |
-| x_45_logKratio              | float32 | |
-| x_60_logKratio              | float32 | |
-| x_90_logKratio              | float32 | |
-| x_120_logKratio             | float32 | |
-| **Microstructure**          |         |       |
-| ofi_l1                      | float32 | |
-| ofi_l5_weighted             | float32 | |
-| pm_book_imbalance           | float32 | |
-| pm_trade_flow_30s           | float32 | |
-| momentum_30s                | float32 | |
-| momentum_60s                | float32 | |
-| cross_asset_momentum_60s    | float32 | |
-| **Diagnostic vol** (logged but not used) |    |       |
-| sigma_per_sec_realized      | float32 | EWMA realized vol; logged for diagnostics only |
-| **Polymarket book**         |         |       |
-| q_up_bid                    | float32 | |
-| q_up_ask                    | float32 | |
-| q_up_mid                    | float32 | |
-| q_down_bid                  | float32 | |
-| q_down_ask                  | float32 | |
-| q_down_mid                  | float32 | |
-| poly_spread_up              | float32 | |
-| poly_spread_down            | float32 | |
-| poly_depth_up_l1            | float32 | top-of-book size for Up bid+ask |
-| poly_depth_down_l1          | float32 | |
-| **Model output**            |         |       |
-| model_version_id            | string  | links to model_versions table |
-| q_predicted                 | float32 | model's prediction of current q_actual (sanity) |
-| q_settled                   | float32 | model's prediction of where q is heading |
-| q_predicted_minus_q_actual  | float32 | sanity-check residual; should be small |
-| **Edge (the headline number)** |       |       |
-| edge_up_raw                 | float32 | q_settled − q_up_ask |
-| edge_down_raw               | float32 | (1 − q_settled) − q_down_ask |
-| fee_up_per_dollar           | float32 | THETA * q_up_ask * (1 - q_up_ask) |
-| fee_down_per_dollar         | float32 | |
-| slippage_up_per_dollar      | float32 | from depth model |
-| slippage_down_per_dollar    | float32 | |
-| edge_up_net                 | float32 | edge_up_raw − fee_up − slippage_up |
-| edge_down_net               | float32 | edge_down_raw − fee_down − slippage_down |
-| edge_signed                 | float32 | best signed edge (positive=Up favored, negative=Down) |
-| edge_magnitude              | float32 | abs(edge_signed) — Kelly tier input |
-| favored_side                | dict    | "up"/"down" |
-| **Action this tick**        |         |       |
-| event                       | dict    | "abstain" / "entry" / "hold" / "exit_lag_closed" / "exit_stopped" / "fallback_resolution" |
-| chosen_side                 | dict    | "up"/"down"/null |
-| tier                        | int8    | 0=abstain, 1..5 (only at entry) |
-| would_bet_usd               | float32 | Kelly tier × wallet, 0 if not entering |
-| bet_price                   | float32 | q_ask of chosen side at entry, null otherwise |
-| bet_payout_contracts        | float32 | would_bet_usd / bet_price at entry |
-| abstention_reason           | dict    | nullable; one of: edge_below_floor, model_warmup, model_low_r2, model_disagrees_market, model_stale, circuit_breaker_*, data_stale, sigma_uninitialized, wide_spread, already_engaged, k_uncertain |
-| **Position state**          |         |       |
-| has_open_position           | bool    | |
-| position_side               | dict    | nullable |
-| position_entry_tau          | float32 | nullable |
-| position_entry_price        | float32 | nullable |
-| position_edge_at_entry      | float32 | signed entry edge for stop-loss reference |
-| **Feed staleness**          |         |       |
-| coinbase_stale_ms           | int32   | |
-| polymarket_stale_ms         | int32   | |
-| chainlink_stale_ms          | int32   | |
-| circuit_active              | dict    | nullable; circuit breaker name if any |
-
-**Invariants:**
-
-1. **One row per 10s tick, always.** Even when abstaining.
-2. **`edge_magnitude` is always populated when the model is fit.** Sentinel `-99.0` if model is warming up or unfit.
-3. **The `event` column is the canonical record.** Downstream queries filter on it.
-4. **Position state is updated immediately after an entry/exit event.**
-
-### 9.3 The `model_versions` table
-
-One row per regression refit (every 5 minutes). Keyed by `model_version_id` for joins from `decisions`.
-
-| Column                      | Type    | Notes |
-|-----------------------------|---------|-------|
-| ts_ns                       | int64   | refit completion time |
-| asset                       | dict    | |
-| model_version_id            | string  | UUID |
-| n_train_samples             | int32   | rows used for training |
-| training_window_start_ns    | int64   | |
-| ridge_alpha                 | float32 | regularization param |
-| r2_in_sample                | float32 | |
-| r2_cv_mean                  | float32 | 5-fold time-series CV |
-| r2_held_out_30min           | float32 | held-out validation slice |
-| coef_alpha                  | float32 | intercept |
-| coef_x_now                  | float32 | β₀ |
-| coef_x_15                   | float32 | |
-| coef_x_30                   | float32 | |
-| coef_x_45                   | float32 | |
-| coef_x_60                   | float32 | |
-| coef_x_90                   | float32 | |
-| coef_x_120                  | float32 | |
-| coef_tau                    | float32 | |
-| coef_inv_sqrt_tau           | float32 | |
-| coef_ofi_l1                 | float32 | |
-| coef_ofi_l5_weighted        | float32 | |
-| coef_pm_book_imbalance      | float32 | |
-| coef_pm_trade_flow_30s      | float32 | |
-| coef_momentum_30s           | float32 | |
-| coef_momentum_60s           | float32 | |
-| coef_cross_asset_momentum_60s | float32 | |
-| estimated_lag_seconds       | float32 | β-weighted average lag, see §3.4 |
-| coef_delta_l2               | float32 | L2 norm of coef change vs previous fit |
-
-The `model_versions` table is essential for backtest replay: the cash-out simulator and the parameter sweep both need to know which coefficients were live at any given decision tick.
-
-### 9.4 The `window_outcomes` table
-
-| Column                          | Type    | Notes |
-|---------------------------------|---------|-------|
-| asset                           | dict    | |
-| window_ts                       | int32   | |
-| close_ts                        | int32   | |
-| K                               | float64 | |
-| close_price                     | float64 | Chainlink at close |
-| outcome                         | int8    | 1 if close ≥ K else 0 |
-| n_decisions                     | int16   | |
-| n_entries_attempted             | int16   | always 0 or 1 by policy |
-| **Entry info (if entered)**     |         |       |
-| entry_tier                      | int8    | |
-| entry_tau_s                     | float32 | |
-| entry_side                      | dict    | |
-| entry_size_usd                  | float32 | |
-| entry_price                     | float32 | |
-| entry_edge_signed               | float32 | |
-| entry_payout_contracts          | float32 | |
-| entry_q_settled                 | float32 | model output at entry, for diagnostic |
-| entry_model_version_id          | string  | |
-| **Exit info (computed at replay)** | |  |
-| exit_reason                     | dict    | "lag_closed"/"stopped_out"/"resolution"/null |
-| exit_tau_s                      | float32 | |
-| exit_price                      | float32 | bid we sold into (or 0/1 if held to resolution) |
-| exit_holding_seconds            | float32 | |
-| **P&L**                         |         |       |
-| realized_pnl_usd                | float32 | per the cash-out P&L formula in §10 |
-| realized_pnl_per_dollar         | float32 | |
-
-In Phase 1, exit and P&L fields are populated **only at backtest/replay time**.
-
-### 9.5 Other tables
-
-- **`coinbase_ticks`**: raw L2 events and trades. Used to reconstruct microprice and lagged features offline at finer granularity than the live aggregation.
-- **`polymarket_book_snapshots`**: every WS book/price_change event with full top-5 levels per side. **The cash-out simulator uses this for VWAP exit-fill modeling.**
-- **`polymarket_trades`**: trade prints from PM, for trade flow features.
-- **`chainlink_ticks`**: every Chainlink observation. Validates K capture and resolution prices.
+This is the canonical input for `scripts/backtest.py` (which rebuilds features from these raw columns and replays a strategy variant) and for `Scheduler._bootstrap_from_history()` (which seeds the live training buffer from prior runs).
 
 ---
 
 ## 10. Phase 1 backtest — tuning the strategy
 
-The central analytic question of the dry run: **given the logged data, what choice of regression hyperparameters and exit thresholds produces the best P&L per unit risk, and is that P&L positive after all costs?**
+### 10.1 `scripts/backtest.py`
 
-### 10.1 Replay invariants
+Walk-forward replay on `logs/ticks.csv`:
 
-- Read decision rows in `ts_ns` order. Never join on a future row except via the explicit cash-out simulator.
-- When evaluating a hypothetical strategy variant, use the model coefficients that were **live at that decision tick** (via `model_version_id`). Do not retroactively apply a better-trained model to old decisions; that's look-ahead bias.
-- Use the `ts_ns` you assigned on receipt as the canonical clock. Do NOT use venue-supplied event times for ordering.
+1. Load all ticks; group by `window_ticker` so lagged features don't bleed across boundaries.
+2. Build the same 12 features used live (plus `kalshi_mom_30`, etc.).
+3. Fit `RidgeCV` on the train fraction (default 65%); evaluate on the test fraction.
+4. Replay the test fraction tick-by-tick with parameterized entry/exit thresholds.
+5. Report per-trade P&L, cumulative P&L curve, R² on train/test.
 
-### 10.2 Cash-out simulator (`research/cashout_simulator.py`)
-
-Same structure as before. For each entry, walk forward through `decisions` and `polymarket_book_snapshots` applying the exit rules.
-
-```python
-def simulate_exit(entry_row, decisions_after_entry, book_snapshots, outcome,
-                  LAG_CLOSE=0.005, STOP=0.03, FALLBACK_TAU=10):
-    edge_at_entry = entry_row.entry_edge_signed
-
-    for next_dec in decisions_after_entry:
-        # Strategy uses live edge_*_net columns from the logged decision —
-        # those columns already incorporate the live model's q_settled.
-        if entry_row.entry_side == 'up':
-            edge_now = next_dec.edge_up_net
-            exit_target_bid = next_dec.q_up_bid
-        else:
-            edge_now = next_dec.edge_down_net
-            exit_target_bid = next_dec.q_down_bid
-
-        # VWAP fill against logged book depth
-        exit_price = vwap_fill_against_book(
-            book_snapshots, next_dec.ts_ns,
-            side=entry_row.entry_side,
-            size_contracts=entry_row.entry_payout_contracts,
-            target_bid=exit_target_bid,
-        )
-
-        if edge_now < LAG_CLOSE:
-            return ('lag_closed', next_dec.tau_s, exit_price,
-                    entry_row.entry_tau_s - next_dec.tau_s)
-
-        if edge_now < edge_at_entry - STOP:
-            return ('stopped_out', next_dec.tau_s, exit_price,
-                    entry_row.entry_tau_s - next_dec.tau_s)
-
-        if next_dec.tau_s < FALLBACK_TAU:
-            terminal = 1.0 if (entry_row.entry_side == 'up') == (outcome == 1) else 0.0
-            return ('resolution', 0, terminal, entry_row.entry_tau_s)
-
-    terminal = 1.0 if (entry_row.entry_side == 'up') == (outcome == 1) else 0.0
-    return ('resolution', 0, terminal, entry_row.entry_tau_s)
-
-
-def realized_pnl(entry_row, exit_reason, exit_price, THETA=0.05):
-    contracts = entry_row.entry_payout_contracts
-    cost = entry_row.entry_size_usd
-    entry_fee = THETA * entry_row.entry_price * (1 - entry_row.entry_price) * cost
-
-    if exit_reason in ('lag_closed', 'stopped_out'):
-        gross_proceeds = contracts * exit_price
-        exit_fee = THETA * exit_price * (1 - exit_price) * gross_proceeds
-        return gross_proceeds - cost - entry_fee - exit_fee
-    else:  # 'resolution'
-        if exit_price >= 1.0:
-            return contracts - cost - entry_fee
-        else:
-            return -cost - entry_fee
+```bash
+python scripts/backtest.py                     # defaults
+python scripts/backtest.py --entry 0.030 --exit 0.008 --hold-s 45
+python scripts/backtest.py --sweep             # grid over (entry, exit, hold)
+python scripts/backtest.py --save backtest.png
 ```
 
-### 10.3 Parameter sweep
+### 10.2 Parameter sweep
 
-Sweep three exit thresholds plus the regression's ridge regularization:
+The sweep grid is defined in `backtest.py`. It iterates over `entry_threshold ∈ {0.020, 0.025, 0.030, ...}`, `exit_threshold` (the equivalent of `LAG_CLOSE_THRESHOLD`), and `hold_seconds` (effective `FALLBACK_TAU` for the simulated trade).
 
-```
-LAG_CLOSE_THRESHOLD ∈ {0.002, 0.003, 0.005, 0.008, 0.012, 0.020}
-STOP_THRESHOLD      ∈ {0.020, 0.030, 0.050, 0.080, 0.120}
-FALLBACK_TAU        ∈ {5, 10, 20, 30}
-RIDGE_ALPHA         ∈ {0.01, 0.1, 1.0, 10.0}     # determines via offline-refit replay
-```
+For each combination, replay the test fraction and report total P&L, ROI, win rate, mean hold time. Sort by total P&L; the top of that table is your candidate live configuration.
 
-The first three are exit-rule sweeps and use the live-fitted models in the logged data. The fourth requires re-fitting the regression offline at each ridge value and re-running the cashout simulator with the alternative coefficients. That's expensive but worth doing once.
+### 10.3 Decision criteria for advancing to Phase 2
 
-For each combination, replay the entire 24h dataset and report total P&L, ROI, win rate, and Sharpe.
+Advance to Phase 2 (small live-money trial) if **all** of:
 
-### 10.4 Model diagnostics
+1. **Total P&L positive** in the best parameter combination from `--sweep`.
+2. **Median CV-R² > 0.25** across all refits.
+3. **`estimated_lag_s` stable** (sd across hourly means < 25 s) and within 15-120 s.
+4. **`|q_predicted − yes_mid|` mean < 0.03** — the model tracks Kalshi's level reliably.
+5. **At least 50% of exits are `lag_closed`** — the thesis actually works.
+6. **Hit rate > 50% in the upper Kelly tiers** (tiers 1-3, edge ≥ 0.08).
+7. **No more than 5% of windows had no `floor_strike`** (rollover gap issues).
+8. **No persistent feed staleness warnings** in the log.
 
-Before any strategy P&L is meaningful, validate the model itself:
-
-```sql
--- Distribution of CV-R^2 across refits
-SELECT
-  asset,
-  approx_quantile(r2_cv_mean, 0.1) AS p10_r2,
-  approx_quantile(r2_cv_mean, 0.5) AS median_r2,
-  approx_quantile(r2_cv_mean, 0.9) AS p90_r2
-FROM model_versions
-GROUP BY asset;
-```
-
-Healthy: median R² > 0.3, p10 R² > 0.15. If R² is consistently below 0.1, the strategy thesis isn't supported and no sweep will rescue it.
-
-```sql
--- Stability of estimated_lag_seconds over the run
-SELECT
-  asset,
-  date_trunc('hour', to_timestamp(ts_ns/1e9)) AS hr,
-  AVG(estimated_lag_seconds) AS mean_lag,
-  STDDEV(estimated_lag_seconds) AS sd_lag
-FROM model_versions
-GROUP BY asset, hr
-ORDER BY asset, hr;
-```
-
-Healthy: mean lag in 15-90s range, sd_lag < 20s. Wild swings = the model is fitting noise.
-
-```sql
--- q_predicted vs q_actual sanity
-SELECT
-  asset,
-  AVG(ABS(q_predicted - q_up_ask)) AS mean_abs_residual,
-  AVG((q_predicted - q_up_ask) * (q_predicted - q_up_ask)) AS mse
-FROM decisions
-WHERE event != 'abstain' OR abstention_reason IS NULL
-GROUP BY asset;
-```
-
-Healthy: mean_abs_residual < 0.03. The model should be tracking Polymarket's level closely; the edge signal comes from `q_settled` (the forecast), not from `q_predicted` (the fit).
-
-### 10.5 The three headline metrics
-
-#### Metric 1 — Realized P&L
-
-```sql
-SELECT
-  asset,
-  date_trunc('day', to_timestamp(window_ts)) AS day,
-  COUNT(*) FILTER (WHERE entry_tier > 0) AS n_entries,
-  SUM(realized_pnl_usd) AS pnl_usd,
-  SUM(entry_size_usd) AS gross_wagered,
-  SUM(realized_pnl_usd) / NULLIF(SUM(entry_size_usd), 0) AS roi,
-  SUM(realized_pnl_usd) / 1000.0 AS bankroll_return_pct,  -- $1000 starting wallet
-  COUNT(*) FILTER (WHERE exit_reason = 'lag_closed') AS n_lag_closed,
-  COUNT(*) FILTER (WHERE exit_reason = 'stopped_out') AS n_stopped,
-  COUNT(*) FILTER (WHERE exit_reason = 'resolution') AS n_resolved,
-  AVG(exit_holding_seconds) FILTER (WHERE entry_tier > 0) AS mean_hold_s,
-  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'lag_closed') AS roi_lag_closed,
-  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'stopped_out') AS roi_stopped,
-  AVG(realized_pnl_per_dollar) FILTER (WHERE exit_reason = 'resolution') AS roi_resolved
-FROM window_outcomes_with_pnl
-WHERE params_id = :chosen_params
-GROUP BY 1, 2;
-```
-
-A healthy strategy has 50%+ of exits as `lag_closed` (the thesis is actually working). Lots of `stopped_out` or `resolution` exits suggest the lag isn't real or our exit thresholds are mis-tuned.
-
-#### Metric 2 — Engagement rate
-
-```sql
-SELECT
-  asset,
-  CASE
-    WHEN tau_s > 240 THEN 'T-300..T-241'
-    WHEN tau_s > 60  THEN 'T-240..T-61'
-    WHEN tau_s > 10  THEN 'T-60..T-11'
-    ELSE 'T-10..T-0'
-  END AS tau_bucket,
-  COUNT(*) AS n_decisions,
-  COUNT(*) FILTER (WHERE event = 'entry') AS n_entries,
-  COUNT(*) FILTER (WHERE event = 'abstain') AS n_abstains,
-  AVG(CASE WHEN event = 'entry' THEN 1.0 ELSE 0.0 END) AS entry_rate,
-  AVG(edge_magnitude) FILTER (WHERE edge_magnitude > -50) AS mean_edge_observed,
-  COUNT(*) FILTER (WHERE abstention_reason = 'edge_below_floor') * 1.0
-    / NULLIF(COUNT(*) FILTER (WHERE event='abstain'), 0) AS pct_below_floor,
-  COUNT(*) FILTER (WHERE abstention_reason = 'model_warmup') * 1.0 / COUNT(*) AS pct_warmup,
-  COUNT(*) FILTER (WHERE abstention_reason = 'model_low_r2') * 1.0 / COUNT(*) AS pct_low_r2
-FROM decisions
-WHERE asset = 'btc'
-GROUP BY 1, 2
-ORDER BY 1, 2;
-```
-
-Healthy: 1-10% per-cycle entry rate (excluding warmup). The warmup hours should show 100% abstentions with reason `model_warmup`.
-
-#### Metric 3 — Average observed edge across all polls
-
-```sql
-SELECT
-  asset,
-  COUNT(*) AS n_decisions,
-  AVG(edge_magnitude) AS mean_abs_edge,
-  AVG(edge_signed) AS mean_signed_edge,                  -- ≈0 if unbiased
-  STDDEV(edge_signed) AS sd_signed_edge,
-  approx_quantile(edge_magnitude, 0.5) AS p50,
-  approx_quantile(edge_magnitude, 0.9) AS p90,
-  approx_quantile(edge_magnitude, 0.99) AS p99,
-  AVG(edge_up_net) AS mean_edge_up,
-  AVG(edge_down_net) AS mean_edge_down
-FROM decisions
-WHERE asset = 'btc'
-  AND coinbase_stale_ms < 5000
-  AND polymarket_stale_ms < 60000
-  AND edge_magnitude > -50
-GROUP BY asset;
-```
-
-Healthy values:
-- `mean_abs_edge` between 0.005 and 0.025.
-- `|mean_signed_edge|` < 0.005 (no systematic directional bias).
-- `p99 / mean_abs_edge` ratio of 5-15 (heavy right tail is the strategy's natural shape).
-
-### 10.6 The decisive diagnostic — edge realization slope
-
-```sql
-WITH bets AS (
-  SELECT
-    entry_edge_signed AS edge_at_entry,
-    realized_pnl_per_dollar AS realized
-  FROM window_outcomes_with_pnl
-  WHERE entry_tier > 0
-    AND params_id = :chosen_params
-)
-SELECT
-  width_bucket(edge_at_entry, 0.0, 0.30, 12) AS bucket,
-  COUNT(*) AS n,
-  AVG(edge_at_entry) AS mean_edge,
-  AVG(realized) AS mean_realized,
-  STDDEV(realized) AS sd_realized
-FROM bets
-GROUP BY 1
-ORDER BY 1;
-```
-
-Plot `mean_edge` (x) vs `mean_realized` (y). Linear positive slope is the strategy's signature. Slope of 1.0 means we capture all reported edge as profit (impossible after costs); slope of 0.5 means costs eat half of the raw signal but the strategy is profitable. Slope ≤ 0 means the model has zero predictive value — do not trade.
-
-### 10.7 Decision criteria for advancing to Phase 2
-
-Advance to Phase 2 (small live-money trial) if and only if all of the following hold:
-
-1. **Total P&L positive** with the best parameter combination from §10.3.
-2. **Median CV-R²** for the regression > 0.25 across all refits.
-3. **`estimated_lag_seconds`** is stable (sd across hourly means < 25s) and sits in the 15-120s range.
-4. **`q_predicted` mean absolute residual** < 0.03 — the model tracks Polymarket's level reliably.
-5. **Edge realization slope** statistically distinguishable from zero with p < 0.10.
-6. **`|mean_signed_edge| < 0.008`** — no systematic directional bias.
-7. **At least 50% of exits are `lag_closed`** — the thesis actually works.
-8. **Hit rate > 50% in tiers 3-5**.
-9. **No more than 5% of windows had `K_uncertain=true`**.
-10. **WS reconnect events < 10** over the run.
-
-Do not advance if:
-- Best parameters lose money on 24h.
-- Median R² < 0.10 (the strategy thesis is wrong; no parameter sweep can rescue it).
-- Edge realization slope ≤ 0.
-- Lag-close exit rate < 30%.
-- σ-realized estimates clustered at unreasonable values (median annualized > 200%) — feed quality problem.
-- Polymarket WS silent-freeze recurred more than 3× despite watchdog.
-
-If results are mixed — slope is positive but small, P&L is near zero after costs — that's diagnostic information. Iterate on the same logged data: try richer features, different lookback grids, smarter slippage estimation. Do not advance to live trading until criteria 1-10 are satisfied.
+Do not advance if median R² < 0.10, lag-close exit rate < 30%, or P&L is negative on the best parameter combination.
 
 ---
 
-## 11. Operations on a headless Ubuntu VM
+## 11. Phase 2 — live trading on Kalshi (not yet active)
 
-### 11.1 systemd unit
+When the gates above pass, the live-trading path replaces the dry-run gating in `Scheduler._tick()` with real REST orders against Kalshi.
 
-`/etc/systemd/system/polybot.service`:
+- **Order endpoint:** `POST /trade-api/v2/portfolio/orders` with the same RSA-PSS auth used by the REST feed.
+- **Order shape:** `{ticker, action: "buy"|"sell", side: "yes"|"no", count, type: "limit", yes_price|no_price, time_in_force: "IOC"|"GTC", client_order_id}`.
+- **Round-trip verification:** `scripts/test_trade.py` already does buy ($1 worth of YES IOC at top of book) → wait 10 s → sell. Use it to confirm the auth path, fee math, and fill semantics on day one of live trading.
+- **Risk limits before going live:**
+  - Wallet starts at ≤ $50 USDT.
+  - Top Kelly tier is capped at 5% of wallet (tier 1's 10% is too aggressive for first contact).
+  - Daily realized loss > 5% of starting wallet → hard stop.
+  - One open position max across the bot.
+  - All circuit breakers from §7 are still active.
 
-```ini
-[Unit]
-Description=Polymarket Crypto Lag-Arb Bot (dry-run)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=polybot
-WorkingDirectory=/opt/polybot
-EnvironmentFile=/etc/polybot/secrets.env
-ExecStart=/opt/polybot/.venv/bin/python -m polybot.main
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=polybot
-MemoryMax=2G
-TasksMax=256
-KillSignal=SIGTERM
-TimeoutStopSec=30
-Environment=POLYBOT_KILL_SWITCH=/run/polybot/STOP
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 11.2 Logging
-
-structlog → stdout → journald. JSON renderer when not a tty. journald rotation:
-
-```
-SystemMaxUse=2G
-SystemMaxFileSize=200M
-MaxRetentionSec=14day
-```
-
-Parquet rotation by filename (one file per hour per asset).
-
-### 11.3 SSH-friendly tooling
-
-- **`journalctl -u polybot -f --output=cat`** — live tail
-- **`journalctl -u polybot -f --output=json | jq 'select(.level=="error")'`** — errors only
-- **`duckdb -c "SELECT * FROM 'logs/decisions/dt=*/asset=btc/h=*.parquet' LIMIT 10"`** — quick inspect
-- **`pq head /path/to/file.parquet`** — Rust pqrs CLI
-- **`polybot-metrics summary --asset btc --since=2026-05-04`** — wraps §10.5 queries
-- **`polybot-metrics model --latest`** — current model coefficients, R², estimated_lag_seconds
-- **`polybot-metrics model --since=runstart`** — model stability over time
-- **`polybot-metrics sweep --top=10`** — best parameter combinations from `parameter_sweep.py`
-- **`polybot-metrics edge-slope --params=:chosen`** — §10.6 diagnostic
-- **`polybot-ctl status | pause | resume`** — Unix domain socket control
-
-### 11.4 Kill switches
-
-- `touch /run/polybot/STOP` — graceful exit on next decision cycle
-- `systemctl stop polybot` — SIGTERM, 30s grace
-- Never `kill -9` — corrupts in-flight Parquet writes
-
-### 11.5 Secrets
-
-`/etc/polybot/secrets.env`, mode 0600, owned by polybot user. structlog processors must redact any key matching `KEY|SECRET|PASSPHRASE|PRIVATE`.
+Phase 2 is its own pull request. Do not edit `_tick()` to actually call the orders endpoint until `Phase 1 → Phase 2` decision criteria are met.
 
 ---
 
-## 12. Risk and circuit breakers
+## 12. Algorithm soundness review
 
-| Trigger                                       | Action                                  |
-|-----------------------------------------------|-----------------------------------------|
-| Coinbase WS no message in 5s                  | abstain new entries; reconnect; (Phase 2) force-exit any open position |
-| Polymarket WS no event in 60s                 | abstain; force reconnect; if reconnect fails twice, force-exit via REST |
-| Chainlink RTDS no tick in 90s                 | abstain                                 |
-| Coinbase sequence_num gap                     | drop book, fresh snapshot, abstain 30s  |
-| Polymarket spread > 0.10                      | abstain (round-trip too costly)         |
-| Tick-size change                              | log + revalidate active orders          |
-| **Model warmup not complete**                 | abstain                                 |
-| **Model CV-R² < 0.10 on most recent fit**     | abstain                                 |
-| **\|q_predicted − q_actual\| > 0.15**         | abstain (model disagrees with market)   |
-| **Last refit > 15 min ago**                   | abstain (model stale)                   |
-| Daily realized loss > 5% of starting wallet   | HARD STOP, page operator (Phase 2)      |
-| ≥ 1 open position in this window already      | refuse new entry                        |
-| ≥ 2 open positions across assets              | refuse new entry                        |
-| Wall clock vs Coinbase server time > 2s       | abstain                                 |
-| `/run/polybot/STOP` exists                    | graceful shutdown                       |
-| K_uncertain on current window                 | abstain entire window                   |
+The user requested an honest assessment of whether the algorithm in this CLAUDE.md is sound. Here it is.
 
-A lag-arb position whose data feed has gone stale is the worst case — we don't know if the lag has closed or widened. In Phase 2, always force-exit on persistent feed staleness rather than wait.
+### 12.1 What is conceptually sound
+
+- **Lag arbitrage as the edge.** The thesis is concrete and empirically grounded — the user's `lag_plot_btc.png` and the dry-run regression's `estimated_lag_s` both quantify it. If lag exists at 15-90 s and exceeds round-trip fees (~3.5%), the strategy makes money. If it doesn't, the bot abstains via `model_low_r2` and we don't lose money.
+- **Regression-based forecasting is the right framing.** Predicting where Kalshi's *quote* will be in N seconds is a regression problem on lagged spot features. We don't need Black-Scholes; we don't need a volatility estimate; we don't need any forecasting of BTC itself. The model has one job: learn the lag profile from data.
+- **Cash-out exit decouples P&L from resolution outcome.** We exit before the window closes, so whether BTC ends above or below `floor_strike` doesn't matter — we already collected the lag-close as profit.
+- **`q_settled` via slot-substitution is a clean construction.** `q_predicted` (full lagged history) is the sanity check; `q_settled` (current spot in every slot) is the forecast. Both come from the same fitted coefficients, so there's no separate model to keep in sync.
+- **One position per window** prevents stacking and racing yourself.
+- **Self-falsifying via `r2_cv` and `model_disagrees_market` gates.** If the model is bad, the bot abstains. The strategy can't "fail silently" by losing money on bogus signals.
+- **Adaptive refitting.** As Kalshi's market makers get faster, the lag distribution shifts; the 5-minute refit captures it.
+- **Bootstrap from `logs/ticks.csv`** removes the warmup penalty for iterative development.
+- **Training filter `yes_mid ∈ [0.05, 0.95]`** is a smart restriction — extreme tails carry no lag-arb signal and would dominate the loss function via huge logit values.
+
+### 12.2 Concerns and things to watch
+
+These don't break the algorithm but are worth knowing about.
+
+#### Configuration / code drift
+
+- **Threshold inconsistencies.** `config.py` defines `MODEL_MIN_CV_R2 = 0.05`, `MODEL_MAX_DISAGREEMENT = 0.20`, and `WIDE_SPREAD_THRESHOLD = 0.12`, but `scheduler.py` hardcodes `0.10`, `0.15`, and `0.10` respectively (lines 478, 492, 529). The hardcoded values win at runtime; the config values are dead. Fix is straightforward — wire the config constants in. Until then, the runtime behavior is stricter than the config implies, and there are two places to tune the same thresholds.
+
+#### Cost model
+
+- **`THETA_FEE = 0.07` is a guess.** Kalshi's actual taker fee schedule has rounding rules (`ceil(0.07 × C × P × (1−P))`) that the smooth `THETA × p × (1−p)` approximation papers over. At small bet sizes (a few contracts) the rounding can dominate the modeled fee. Calibrate against real fills from `scripts/test_trade.py` before trusting any backtest P&L number to within 50%.
+- **Slippage model is crude** (capped at 2 cents, linear in size/depth). On thin Kalshi books it will *understate* real slippage when tier 1 (10% of wallet) tries to lift more depth than exists at the inside price. Phase 1 doesn't trade so this only contaminates the simulated edge; Phase 2 needs a proper VWAP-against-the-ladder estimator.
+
+#### Sample rate
+
+- **1 Hz Kalshi polling is plenty for 15-90 s lags but tight for shorter ones.** If Kalshi reprices in ≤ 1 s the polling will alias the signal. Acceptable today; flag if `estimated_lag_s` ever drops below ~5 s.
+- **Coinbase ticker fires on every trade**, so the 1 Hz sampler effectively downsamples it. Microprice is averaged at 1 Hz into the ring buffer — fine for lag features at 15+ second horizons.
+
+#### Strike interpretation
+
+- **`floor_strike` (Kalshi) and the strike `K` (Polymarket) are different concepts.** On Polymarket's now-deprecated 5-min markets, `K` was the spot price at window-open (Chainlink oracle snapshot). On Kalshi `floor_strike` is a fixed dollar threshold per strike bin. The regression's `log(microprice / K)` feature on Kalshi is therefore a **moneyness** measure (how far above/below the strike are we, in log dollars), not a "spot has moved this much from open" measure. This works but means the feature has a different interpretation. Make sure this is reflected in any reasoning about why the regression's coefficients look the way they look.
+
+#### Stop-loss math at small entry edges
+
+- **The stop trigger is `edge_now < entry_edge − STOP_THRESHOLD`.** With `STOP_THRESHOLD = 0.03`, a tier-5 entry (entry_edge = 0.02) wants to stop when edge < -0.01. If `edge_signed` can't go that negative in the time before `FALLBACK_TAU_S`, the stop never fires and the position drifts to resolution. Not catastrophic, but tier-5 positions carry more "go to resolution" risk than the tier table implies. Consider a tier-aware stop (e.g. `STOP = max(0.02, entry_edge × 1.5)`).
+
+#### Feed staleness gating
+
+- **`_tick()` checks `cb.ready` and `kb.ready` but not staleness within the tick.** A book that received one update ten minutes ago and then went silent will still report `ready=True`. The display side (`_print_tick`) has staleness counters, but the decision logic doesn't gate on them. Add explicit `cb.stale_ms() > COINBASE_STALE_MS_MAX` and `kb.stale_ms() > KALSHI_STALE_MS_MAX` gates (the constants are already in `config.py`, just unused in the decision path).
+
+#### Adverse selection at the lag close
+
+- **When the lag closes, every other lag-arb bot is also exiting.** Real Phase 2 fills will be worse than the bid we model — the simulator assumes we hit the bid we see, but in practice the bid moves before our IOC arrives. The dry-run simulator can't capture this; only Phase 2 small-money trials can. Plan for actual P&L to come in 25-50% below backtest expectations.
+
+#### "Lag exists" empirically vs persistently
+
+- The user's `lag_plot_btc.png` shows lag exists *now*. The strategy assumes it persists at 15-90 s for many windows. If it doesn't (e.g. during a quiet weekend), the bot abstains rather than loses money — but it also doesn't make money. Plan for variable engagement rates.
+
+### 12.3 Verdict
+
+The algorithm is **conceptually sound and implementation-ready for Phase 1**. The main risks are *empirical* (does the lag persist? is it big enough net of real fees?) rather than *structural* (is the math right?). The dry run plus `scripts/backtest.py` is the correct vehicle for answering those empirical questions before any real money is committed.
+
+Pre-Phase-2 fixes (in priority order):
+
+1. Calibrate `THETA_FEE` from a real round-trip (`scripts/test_trade.py`). Currently 0.07 is borrowed from Kalshi's published 2025 schedule and **not verified against actual fills**. Could be off by enough to flip backtest P&L sign.
+2. Wire `MODEL_MIN_CV_R2`, `MODEL_MAX_DISAGREEMENT`, and `WIDE_SPREAD_THRESHOLD` from config into `scheduler.py`. Currently hardcoded at stricter values; one place to tune is better than two.
+3. Add explicit `stale_ms()` gates in `_tick()`. Constants already exist in `config.py`; just need to be referenced.
+4. Replace the slippage model with a true VWAP-against-the-ladder estimator using Kalshi's full order-book endpoint. The current `min(0.02, size/depth × 0.01)` model will understate slippage on thin books at tier-1 sizing.
+5. Make the stop threshold tier-aware so tier-5 entries actually have a meaningful stop. Currently with `STOP = 0.03` and tier-5 `entry_edge = 0.02`, the stop fires only at `edge < −0.01`, which may never be reached before fallback resolution.
 
 ---
 
-## 13. Phase 2 preview (not in scope yet)
+## 13. Caveats and open questions
 
-After dry-run analysis identifies best parameters:
-
-1. Authenticate Polymarket (L2 HMAC + proxy wallet sig type 1).
-2. Fund wallet with $50-100 USDC; one-time approvals via `approvals.py`.
-3. Run with the best parameter combination, *only* at the most conservative tier (delta ≥ 0.30, 10% wallet) for 1 week.
-4. Bootstrap the regression from the dry-run final coefficients rather than cold-starting.
-5. Compare realized fills against backtest expectations.
-6. Implement maker-exit mode (post limit order at target exit price for fee rebate) and A/B test against taker-exit.
-7. Scale bankroll only if realized P&L is within ±25% of backtest expectations.
-
-Phase 2 is its own document and its own pull request.
+- **Kalshi WebSocket is intentionally unused.** Early experiments showed silent freezes on the Kalshi WS feed, and the REST polling at 1 Hz proved more reliable. If Kalshi improves their WS path, switching could give us sub-second Kalshi observation, which would tighten the model — but there's no urgency.
+- **`pyproject.toml` still says `name = "polybot"` and lists CLI scripts that no longer exist.** Vestigial; will be cleaned up. `requirements.txt` similarly carries `py-clob-client` which is unused. Don't trust either as a source of truth — `betbot/kalshi/` is.
+- **`betbot/main.py` is broken** (imports from a non-existent `polybot.*` package). Do not try to run it. The actual entrypoint is `scripts/run_kalshi_bot.py`.
+- **No `cli/polybot_metrics` or `polybot-ctl` equivalents on the kalshi branch.** Operations is just stdout + JSONL inspection. SystemD / journald wiring described in older docs is from the Polymarket era; if needed, the dry run is small enough to run under `tmux` or `nohup` and tail the JSONL.
+- **One-asset only.** ETH support is removed; the original CLAUDE.md's `assets: [btc, eth]` plumbing is gone. Restoring it requires duplicating `KALSHI_SERIES = "KXBTC15M"` to `KXETH15M`, running two `KalshiBook` instances, and adding `cross_asset_momentum_60s` features that look at the other asset. Out of scope for this branch.
+- **The `RUNBOOK.md` and `DRYRUN.md` documents partially predate the Kalshi rewrite.** `DRYRUN.md` is reasonably current. `RUNBOOK.md` still references Binance and Polymarket env vars; treat its first sections as stale and the file-reference at the end as broadly correct.
+- **24h sample is small.** ~96 windows × N strikes × ~150 ticks/window is overfitting territory for parameter selection. Mitigations: prefer parameters in stable plateaus rather than sharp peaks of the P&L surface; treat any Phase 2 first week as the real out-of-sample test; extend the dry run to 7 days if 24h results are ambiguous.
 
 ---
 
-## 14. Caveats and open questions
+## 14. Prior art and references
 
-- **CLOB v2 / pUSD migration** is recent (early 2026). py-clob-client-v2 has the new EIP-712 v2 signature scheme. Phase 1 read-only is unaffected; Phase 2 must use v2.
-- **Geographic restriction:** Polymarket's global CLOB restricts US persons. Phase 1 read-only is fine; Phase 2 from US must use Polymarket US (separate API at `api.polymarket.us`). Confirm jurisdictional compliance before live trading.
-- **5-minute markets are newer than 15-minute markets.** Fee coefficient Θ=0.05 is borrowed by analogy from 15m docs and confirmed only after first live trades.
-- **Polymarket WS silent-freeze (#292)** is real and unresolved; watchdog is mandatory.
-- **The "Polymarket lags Coinbase by 30-90s" assumption** is anecdotal. The dry-run regression validates or invalidates this directly. If the fitted lag is consistently small (< 5s), the strategy is unprofitable and we don't advance.
-- **Microprice as a forward predictor** has well-known half-life of ~1-10 seconds in equity markets. Crypto half-life on Coinbase is unconfirmed in literature for our purposes; the fitted regression's coefficient on `x_now` vs lagged x's effectively measures it.
-- **Adverse selection at lag-close** — when the lag closes, every other lag-arb bot is also trying to exit. Exit fills can be materially worse than mid-bid. The dry run's VWAP-against-logged-book simulation captures part of this but not the *competitive* dynamic; real Phase 2 fills may be worse.
-- **The 24h sample is small for parameter selection.** ~290 entries × 120+ parameter combinations is overfitting territory. Mitigations: (a) prefer parameters in stable plateaus rather than sharp peaks of the P&L surface, (b) treat Phase 2's first week as the real out-of-sample test, (c) extend the dry run to 7 days if 24h results are ambiguous.
-- **Regression refit cost.** Ridge regression on ~14k samples × ~15 features fits in well under a second; refit every 5 minutes is trivially cheap. If the feature set grows substantially (e.g., adding tree-based models or many polynomial features), revisit the refit cadence.
-- **Look-ahead bias in the offline ridge_alpha sweep.** Re-fitting the regression with different α at replay time and applying it retroactively is technically anachronistic — it uses information unavailable at the live decision tick. Mitigation: when sweeping α, use only data strictly prior to each replayed tick (rolling-origin cross-validation), not the full-run dataset. This is more expensive but honest.
-
----
-
-## 15. Prior art to learn from
-
-- **Archetapp gist `7680adabc48f812a561ca79d73cbac69`** — confirms slug format, RTDS Chainlink as strike source. Their bot is hold-to-resolution late-window entry, not lag arbitrage; we're doing something different.
-- **KaustubhPatange / `polymarket-trade-engine`** — TS reference for lifecycle state machine, market discovery, fill tracking. Architecturally useful even though strategy differs.
-- **NautilusTrader Polymarket integration** — production-grade Rust+Python framework with clean instrument loading and signature handling.
-- **Polymarket/agent-skills (`websocket.md`)** — authoritative WS protocol reference.
-- **Polymarket/real-time-data-client** — TS reference SDK for RTDS.
-- **Cont-Kukanov-Stoikov 2014** — foundational paper on Order Flow Imbalance. Required reading for the OFI feature in §6.2.
 - **Stoikov 2018 "The Micro-Price"** — foundational paper on microprice as a forward predictor of midpoint. Required reading for understanding why microprice is the right input to the regression.
-- **Hayashi-Yoshida 2005** — non-synchronous covariance estimator for tick data from two venues. Useful for offline lag analysis as a sanity check on what the regression's β coefficients are telling us.
+- **Cont-Kukanov-Stoikov 2014** — Order Flow Imbalance. Currently unused but the natural next feature if `r2_cv` proves underwhelming.
+- **Hayashi-Yoshida 2005** — non-synchronous covariance estimator for tick data from two venues. Useful for offline lag analysis as a sanity check on what the regression's β coefficients are saying.
+- **Kalshi API docs** — `https://trading-api.readme.io/reference/getmarket` etc. The auth scheme (RSA-PSS over `timestamp + method + path`) is implemented in `betbot/kalshi/auth.py`.
+- **Coinbase Advanced Trade WebSocket docs** — the `ticker` channel is unauthenticated and exposes `best_bid`, `best_ask`, `best_bid_quantity`, `best_ask_quantity`, which is everything we need for microprice.
 
-Read these before reinventing anything. The OFI math, microprice theory, and WS protocols are all solved problems; what we're building on top is a *lead-lag regression with adaptive refitting and cash-out exit logic* that none of the published Polymarket bots implement.
+The lag-arbitrage strategy itself isn't novel (every prediction-market shop has tried it), but the specific implementation — ridge regression on lagged log-microprice features with adaptive refit and cash-out exit — is uncommon in the published Kalshi/Polymarket bots and is the central contribution of this codebase.
