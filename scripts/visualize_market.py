@@ -41,9 +41,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 COINBASE_WS  = "wss://advanced-trade-ws.coinbase.com"
 BINANCE_WS   = "wss://stream.binance.com:9443"
 KALSHI_REST  = "https://api.elections.kalshi.com"
-KALSHI_WS    = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 API_PREFIX   = "/trade-api/v2"
-WS_PATH      = "/trade-api/ws/v2"
 SPRINT_SERIES = {"btc": "KXBTC15M", "eth": "KXETH15M"}
 
 # ---------------------------------------------------------------------------
@@ -224,131 +222,76 @@ async def collect_binance(symbol: str, data: dict, stop: asyncio.Event):
 
 
 # ---------------------------------------------------------------------------
-# Kalshi collector
+# Kalshi collector — REST polling at 1 Hz (no WebSocket).
+# Same endpoint and auth as test_trade.py, which is the proven-working path.
 # ---------------------------------------------------------------------------
 
 async def collect_kalshi(ticker: str, data: dict, stop: asyncio.Event,
                          key_id: str, pk):
     """
-    Mirror the demo_kalshi_ws.py stream() architecture exactly:
-    - inline ping (no subtask)
-    - asyncio.wait_for(ws.recv(), 1s) so we never block and can check stop
-    - heartbeat emit inline so plot has continuous data even during quiet markets
-    - fresh auth headers on every connection attempt
+    Poll GET /trade-api/v2/markets/{ticker} every second and append the
+    yes_bid_dollars / yes_ask_dollars to the data dict.
+
+    No WebSocket, no orderbook reconstruction, no heartbeat. Each poll is
+    an independent authenticated REST request — if one fails, the next one
+    starts fresh.
     """
-    yes_book: dict[float, float] = {}
-    no_book:  dict[float, float] = {}
-    ping_id   = 100
-    last_ping = 0.0
-    last_emit = 0.0
-    last_update = 0.0   # last real orderbook_snapshot or orderbook_delta received
-    STALE_TIMEOUT = 10.0  # force reconnect if no real update in this many seconds
+    import aiohttp
+    POLL_S = 1.0
+    path   = f"{API_PREFIX}/markets/{ticker}"
+    url    = KALSHI_REST + path
 
+    fails = 0
     while not stop.is_set():
-        headers = _auth_headers(pk, key_id, "GET", WS_PATH)
-        yes_book.clear()
-        no_book.clear()
-
-        try:
-            async with websockets.connect(
-                KALSHI_WS,
-                additional_headers=list(headers.items()),
-                ping_interval=None,
-                open_timeout=15,
-            ) as ws:
-                # Subscribe to orderbook_delta (book) + ticker (last trade) —
-                # same channels the demo uses; more traffic keeps connection alive.
-                for sub_id, ch in [(1, "orderbook_delta"), (2, "ticker")]:
-                    await ws.send(json.dumps({
-                        "id": sub_id, "cmd": "subscribe",
-                        "params": {"channels": [ch], "market_tickers": [ticker]},
-                    }))
-
-                last_ping   = time.time()
-                last_emit   = time.time()
-                last_update = time.time()  # reset on each fresh connection
-
+        async with aiohttp.ClientSession() as session:
+            try:
                 while not stop.is_set():
-                    now = time.time()
-
-                    # Watchdog: if no real update has arrived in STALE_TIMEOUT seconds,
-                    # break out of the inner loop to force a full reconnect.
-                    if now - last_update >= STALE_TIMEOUT:
-                        print(f"\n  [Kalshi WS] no update for {STALE_TIMEOUT:.0f}s — reconnecting…",
-                              flush=True)
-                        break
-
-                    # Send ping every 8s — server drops connection after ~15s silence
-                    if now - last_ping >= 8.0:
-                        await ws.send(json.dumps({"id": ping_id, "cmd": "ping"}))
-                        ping_id  += 1
-                        last_ping = now
-
-                    # Heartbeat: emit last-known book every 2s so plot has
-                    # continuous data even when the market isn't moving
-                    if now - last_emit >= 2.0 and yes_book and no_book:
-                        yb = max(yes_book);  ya = 1.0 - max(no_book)
-                        if ya > yb:
-                            data["k_t"].append(now)
-                            data["k_bid"].append(yb)
-                            data["k_ask"].append(ya)
-                            data["k_mid"].append((yb + ya) / 2.0)
-                        last_emit = now
-
-                    # 1-second timeout so we loop back to check stop + ping + hb
+                    t0      = time.monotonic()
+                    headers = _auth_headers(pk, key_id, "GET", path)
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                        async with session.get(url, headers=headers,
+                                               timeout=aiohttp.ClientTimeout(total=5)) as r:
+                            if r.status == 429:
+                                await asyncio.sleep(2.0)
+                                continue
+                            if r.status != 200:
+                                fails += 1
+                                if fails >= 5:
+                                    print(f"  [Kalshi REST] {fails} failures, resetting session",
+                                          flush=True)
+                                    fails = 0
+                                    break
+                                await asyncio.sleep(1.0)
+                                continue
+                            payload = await r.json()
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        fails += 1
+                        print(f"  [Kalshi REST] {type(e).__name__}: {e}", flush=True)
+                        await asyncio.sleep(1.0)
                         continue
 
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
+                    fails = 0
+                    mkt   = payload.get("market") or payload
+                    bid_s = mkt.get("yes_bid_dollars")
+                    ask_s = mkt.get("yes_ask_dollars")
+                    if bid_s is not None and ask_s is not None:
+                        try:
+                            yb = float(bid_s)
+                            ya = float(ask_s)
+                            if yb > 0 and ya > 0 and ya >= yb:
+                                now = time.time()
+                                data["k_t"].append(now)
+                                data["k_bid"].append(yb)
+                                data["k_ask"].append(ya)
+                                data["k_mid"].append((yb + ya) / 2.0)
+                        except (TypeError, ValueError):
+                            pass
 
-                    t = msg.get("type")
-                    p = msg.get("msg") or {}
-                    if t in ("subscribed", "pong"):
-                        continue
-                    if (p.get("market_ticker") or p.get("ticker")) != ticker:
-                        continue
-
-                    changed = False
-                    if t == "orderbook_snapshot":
-                        yes_book = {float(a): float(b) for a, b in p.get("yes_dollars_fp", [])}
-                        no_book  = {float(a): float(b) for a, b in p.get("no_dollars_fp",  [])}
-                        changed     = True
-                        last_update = now
-                    elif t == "orderbook_delta":
-                        side = p.get("side")
-                        pr   = p.get("price_dollars")
-                        dl   = p.get("delta_fp")
-                        if side in ("yes", "no") and pr and dl:
-                            book  = yes_book if side == "yes" else no_book
-                            price = float(pr); delta = float(dl)
-                            book[price] = book.get(price, 0.0) + delta
-                            if book[price] <= 0:
-                                book.pop(price, None)
-                            changed     = True
-                            last_update = now
-
-                    if changed and yes_book and no_book:
-                        yb = max(yes_book);  ya = 1.0 - max(no_book)
-                        if ya > yb:
-                            now2 = time.time()
-                            data["k_t"].append(now2)
-                            data["k_bid"].append(yb)
-                            data["k_ask"].append(ya)
-                            data["k_mid"].append((yb + ya) / 2.0)
-                            last_emit = now2
-
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            if stop.is_set():
+                    elapsed = time.monotonic() - t0
+                    await asyncio.sleep(max(0.0, POLL_S - elapsed))
+            except asyncio.CancelledError:
                 return
-            print(f"\n  [Kalshi WS] {type(e).__name__}: {e} — reconnecting…", flush=True)
-            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -539,8 +482,8 @@ def parse_args():
     p.add_argument("--asset", choices=["btc", "eth"], default="btc")
     p.add_argument("--ticker", default=None,
                    help="Kalshi ticker; skip auto-discovery.")
-    p.add_argument("--spot", choices=["binance", "coinbase"], default="binance",
-                   help="Spot feed: binance (VPN, higher freq) or coinbase (US, no VPN). Default: binance.")
+    p.add_argument("--spot", choices=["binance", "coinbase"], default="coinbase",
+                   help="Spot feed: binance (VPN, higher freq) or coinbase (US, no VPN). Default: coinbase.")
     return p.parse_args()
 
 

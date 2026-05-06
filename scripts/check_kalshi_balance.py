@@ -165,7 +165,7 @@ def main() -> None:
 
     print("\n" + "=" * 60)
     print("If balance > 0 you're ready to scan markets and stream odds.")
-    print("Next: python scripts/demo_kalshi_ws.py")
+    print("Next: python scripts/run_kalshi_bot.py --fresh")
     print("=" * 60)
 
 
