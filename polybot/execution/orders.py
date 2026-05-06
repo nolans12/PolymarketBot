@@ -1,9 +1,9 @@
 """
-orders.py — Polymarket CLOB order placement and account management.
+orders.py — Polymarket CLOB order placement (EOA-mode only).
 
-Phase 1 keeps this dormant — the scheduler never imports OrderClient until
-Phase 2. Logic ported verbatim from the prior repo's executor.py with the
-on-chain balance reader extracted to polybot.state.wallet.
+The bot uses an EOA-mode Polymarket account: the EOA derived from PRIVATE_KEY
+both signs orders AND holds the USDC collateral. No proxy wallet is involved
+(`signature_type=0`).
 """
 
 import logging
@@ -16,6 +16,8 @@ from py_clob_client.clob_types import (
     OrderArgs,
 )
 from py_clob_client.constants import POLYGON
+
+from polybot.state.wallet import signer_address
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +34,17 @@ class OrderClient:
         clob_host: str,
         chain_id: int = POLYGON,
         dry_run: bool = False,
-        funder: Optional[str] = None,
     ):
         self.dry_run = dry_run
-        self._funder = funder or None
+        self._signer = signer_address(private_key)
+
+        # EOA mode: signature_type=0, funder is the signer's own address.
         self.client = ClobClient(
             host=clob_host,
             key=private_key,
             chain_id=chain_id,
-            signature_type=2,
-            funder=self._funder,
+            signature_type=0,
+            funder=self._signer,
         )
 
         if api_key:
@@ -54,14 +57,13 @@ class OrderClient:
             )
 
         logger.info(
-            f"OrderClient initialised | dry_run={dry_run} | "
-            f"funder={self._funder or 'signer'}"
+            f"OrderClient initialised | dry_run={dry_run} | signer={self._signer}"
         )
 
     def get_clob_balance(self) -> float:
         """
-        CLOB layer USDC balance for the SIGNER (not the funder).
-        Use polybot.state.wallet.usdc_balance_onchain for the funder's balance.
+        CLOB-layer USDC balance the exchange sees for the signer EOA.
+        Compare against on-chain USDC via polybot.state.wallet.usdc_balance_onchain.
         """
         if self.dry_run:
             return 1000.0

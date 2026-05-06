@@ -26,9 +26,8 @@ API_PASSPHRASE = os.getenv("API_PASSPHRASE", "")
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
 
-# Funder address: the wallet that actually holds USDC. Required when using a
-# relayer signing key (PRIVATE_KEY signs orders; FUNDER holds the collateral).
-FUNDER         = os.getenv("FUNDER", "")
+# EOA-mode only: PRIVATE_KEY's derived address both signs orders and holds
+# the USDC collateral. No separate funder address.
 
 # ---------------------------------------------------------------------------
 # Venue endpoints

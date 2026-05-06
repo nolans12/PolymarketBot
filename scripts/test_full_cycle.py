@@ -44,7 +44,6 @@ API_SECRET     = os.getenv("API_SECRET", "")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE", "")
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
-FUNDER         = os.getenv("FUNDER", "")
 
 CYCLE_FILE = Path(".last_full_cycle.json")
 
@@ -165,7 +164,6 @@ async def main() -> None:
         clob_host=CLOB_HOST,
         chain_id=CHAIN_ID,
         dry_run=args.dry_run,
-        funder=FUNDER or None,
     )
 
     # --- BUY ---

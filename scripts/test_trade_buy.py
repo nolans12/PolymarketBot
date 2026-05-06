@@ -45,7 +45,6 @@ API_SECRET     = os.getenv("API_SECRET", "")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE", "")
 CLOB_HOST      = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 CHAIN_ID       = int(os.getenv("CHAIN_ID", "137"))
-FUNDER         = os.getenv("FUNDER", "")
 
 LAST_ORDER_FILE = Path(".last_test_order.json")
 
@@ -122,8 +121,6 @@ async def main() -> None:
                           ("API_SECRET", API_SECRET), ("API_PASSPHRASE", API_PASSPHRASE)]:
             if not val:
                 fail(f"{name} is not set in .env")
-        if not FUNDER:
-            print("WARNING: FUNDER not set — orders will sign with PRIVATE_KEY's own address")
 
     # --- Resolve market ---
     win_ts = current_window_ts()
@@ -164,7 +161,6 @@ async def main() -> None:
         clob_host=CLOB_HOST,
         chain_id=CHAIN_ID,
         dry_run=args.dry_run,
-        funder=FUNDER or None,
     )
 
     order_id = client.place_order(

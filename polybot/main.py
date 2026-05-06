@@ -26,7 +26,7 @@ from polybot.infra.config import (
     ASSETS, DRY_RUN, PARQUET_DIR,
     ENABLE_BINANCE, ENABLE_COINBASE,
     PRIVATE_KEY, API_KEY, API_SECRET, API_PASSPHRASE,
-    CLOB_HOST, CHAIN_ID, FUNDER, POLYGON_RPC,
+    CLOB_HOST, CHAIN_ID, POLYGON_RPC,
 )
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.infra.scheduler import Scheduler
@@ -87,9 +87,10 @@ async def _run() -> None:
     if not DRY_RUN:
         from polybot.execution.orders import OrderClient
         from polybot.execution.fills import FillTracker
-        from polybot.state.wallet import usdc_balance_onchain
+        from polybot.state.wallet import signer_address, usdc_balance_onchain
 
-        log.info("Phase 2: initialising OrderClient funder=%s", FUNDER or "signer")
+        signer = signer_address(PRIVATE_KEY)
+        log.info("Phase 2: initialising OrderClient signer=%s", signer)
         order_client = OrderClient(
             private_key=PRIVATE_KEY,
             api_key=API_KEY,
@@ -98,11 +99,10 @@ async def _run() -> None:
             clob_host=CLOB_HOST,
             chain_id=CHAIN_ID,
             dry_run=False,
-            funder=FUNDER or None,
         )
 
         # Read live wallet balance — used for Kelly sizing
-        balance = usdc_balance_onchain(FUNDER, POLYGON_RPC) if FUNDER else None
+        balance = usdc_balance_onchain(signer, POLYGON_RPC)
         if balance is None:
             balance = order_client.get_clob_balance()
         if balance and balance > 0:
