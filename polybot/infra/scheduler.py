@@ -27,6 +27,8 @@ from polybot.infra.config import (
 from polybot.infra.parquet_writer import ParquetWriter
 from polybot.models.features import build_features
 from polybot.models.edge import compute_edge
+from polybot.strategy.decision import apply_decision
+from polybot.strategy.position import PositionTracker
 from polybot.state.spot_book import SpotBook
 from polybot.state.coinbase_book import CoinbaseBook
 from polybot.state.poly_book import PolyBook
@@ -58,6 +60,7 @@ class Scheduler:
         self.writer         = writer
         self.coinbase_books = coinbase_books or {}
         self.models         = model or {}   # asset -> RegressionModel
+        self.trackers       = {a: PositionTracker(a) for a in ASSETS}
         self._running       = False
 
     async def run(self) -> None:
@@ -294,12 +297,13 @@ class Scheduler:
                 self.writer.write_decision(asset, row)
                 return
 
-        # --- Edge calculation (Stage 2C) ---
+        # --- Edge calculation ---
+        er = None
         if q_settled is not None and poly.ready:
             er = compute_edge(
                 q_settled=q_settled,
                 poly=poly,
-                wallet_usd=1000.0,   # Stage 2D will inject real wallet
+                wallet_usd=1000.0,   # Phase 2 will inject real wallet balance
             )
             if er is not None:
                 row.update(er.as_dict())
@@ -307,9 +311,25 @@ class Scheduler:
                 row["edge_magnitude"] = er.edge_magnitude
                 row["favored_side"]   = er.favored_side
 
-        # Stage 2D will add entry/exit logic here.
-        row["event"] = "abstain"
-        row["abstention_reason"] = "edge_below_floor"
+        # --- Entry / exit decision ---
+        decision = apply_decision(
+            asset=asset,
+            tau_s=tau_s,
+            window_ts=window_ts,
+            edge=er,
+            tracker=self.trackers[asset],
+            q_up_bid=row.get("q_up_bid"),
+            q_down_bid=row.get("q_down_bid"),
+            q_settled=q_settled,
+        )
+        row.update(decision)
+
+        logger.debug(
+            "tick asset=%s tau=%.0f event=%s edge=%.4f",
+            asset, tau_s,
+            row.get("event", "?"),
+            row.get("edge_magnitude", -99),
+        )
         self.writer.write_decision(asset, row)
 
     # ------------------------------------------------------------------
