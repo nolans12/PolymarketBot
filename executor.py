@@ -6,11 +6,17 @@ No on-chain transfers needed — POLYGON_RPC not required.
 """
 
 import logging
+import requests
 from typing import Optional
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.constants import POLYGON
+
+# USDC contract on Polygon (bridged USDC / USDC.e)
+_USDC_CONTRACT  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_POLYGON_RPC    = "https://polygon-rpc.com"
+_BALANCE_OF_SIG = "0x70a08231"  # balanceOf(address) selector
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +34,13 @@ class Executor:
         funder: str = None,
     ):
         self.dry_run = dry_run
+        self._funder = funder or None  # actual account address holding USDC
         self.client = ClobClient(
             host=clob_host,
             key=private_key,
             chain_id=chain_id,
             signature_type=2,
-            funder=funder or None,
+            funder=self._funder,
         )
 
         if api_key:
@@ -45,16 +52,19 @@ class Executor:
                 })()
             )
 
-        logger.info(f"Executor initialised | dry_run={dry_run}")
+        logger.info(f"Executor initialised | dry_run={dry_run} | funder={self._funder or 'signer'}")
 
     def get_wallet_balance(self) -> float:
         """
-        Return the current USDC balance available in the Polymarket account.
-        Used by the bot to size positions dynamically as a % of wallet.
-        Returns 0.0 on failure (bot will use SIZE_MIN as fallback).
+        Return USDC balance for the account address.
+        Queries on-chain via Polygon RPC when a funder address is set
+        (relayer key setup), otherwise falls back to CLOB balance-allowance.
         """
         if self.dry_run:
-            return 1000.0  # dummy balance for dry runs
+            return 1000.0
+
+        if self._funder:
+            return self._usdc_balance_onchain(self._funder)
 
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -62,6 +72,28 @@ class Executor:
             return float(data.get("balance", 0.0))
         except Exception as e:
             logger.warning(f"Could not fetch wallet balance: {e} — using 0")
+            return 0.0
+
+    def _usdc_balance_onchain(self, address: str) -> float:
+        """Read USDC balance directly from Polygon via public RPC."""
+        try:
+            # ERC-20 balanceOf call: pad address to 32 bytes
+            padded = address.lower().replace("0x", "").zfill(64)
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [
+                    {"to": _USDC_CONTRACT, "data": _BALANCE_OF_SIG + padded},
+                    "latest",
+                ],
+                "id": 1,
+            }
+            resp = requests.post(_POLYGON_RPC, json=payload, timeout=10)
+            resp.raise_for_status()
+            raw = resp.json().get("result", "0x0")
+            return int(raw, 16) / 1e6  # USDC has 6 decimals
+        except Exception as e:
+            logger.warning(f"On-chain USDC balance fetch failed: {e} — using 0")
             return 0.0
 
     def place_order(
