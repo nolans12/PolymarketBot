@@ -125,17 +125,22 @@ class OrderClient:
             )
 
             neg_risk = self._is_neg_risk(token_id)
-            logger.debug(f"placing order neg_risk={neg_risk} token={token_id[:12]}…")
+            logger.info(f"placing order neg_risk={neg_risk} token={token_id[:12]}…")
 
             if PartialCreateOrderOptions is not None:
                 options = PartialCreateOrderOptions(neg_risk=neg_risk)
-                signed = self.client.create_order(order_args, options)
+                signed_order = self.client.create_order(order_args, options)
             else:
-                # Older SDK without options arg — only path is the simple call,
-                # which will fail on neg-risk markets.
-                signed = self.client.create_order(order_args)
+                signed_order = self.client.create_order(order_args)
 
-            resp = self.client.post_order(signed, OrderType.GTC)
+            # Diagnostic dump of the order body the CLOB will receive
+            try:
+                body = signed_order.dict() if hasattr(signed_order, "dict") else dict(signed_order.__dict__)
+            except Exception:
+                body = repr(signed_order)
+            logger.info(f"SIGNED ORDER BODY: {body}")
+
+            resp = self.client.post_order(signed_order, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("id")
             if not order_id:
                 logger.error(f"post_order returned no id; full response: {resp}")
