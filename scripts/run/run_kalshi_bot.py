@@ -1,18 +1,18 @@
 """
-run_kalshi_bot.py — Entry point for the Kalshi lead-lag arbitrage bot.
+run_kalshi_bot.py - Entry point for the Kalshi lead-lag arbitrage bot.
 
 Single-asset mode (default, BTC only):
-  python scripts/run_kalshi_bot.py
+  python scripts/run/run_kalshi_bot.py
 
 Multi-asset mode (BTC + ETH + SOL + XRP, one independent model each):
-  python scripts/run_kalshi_bot.py --assets BTC ETH SOL XRP
+  python scripts/run/run_kalshi_bot.py --assets BTC ETH SOL XRP
 
-Each asset gets its own:
-  - SpotBook         (fed by a shared multi-product CoinbaseFeed)
-  - KalshiBook       (fed by its own KalshiRestFeed at 10Hz)
-  - Scheduler        (independent model, training buffer, decision loop)
-  - logs/ticks_<ASSET>.csv
-  - logs/decisions_<ASSET>.jsonl
+Each run creates a timestamped folder under data/, e.g.:
+  data/2026-05-07_00-15-00_BTC_ETH/
+    ticks_BTC.csv
+    decisions_BTC.jsonl
+    ticks_ETH.csv
+    decisions_ETH.jsonl
 """
 
 import argparse
@@ -22,7 +22,7 @@ import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from betbot.kalshi.auth import load_private_key
 from betbot.kalshi.book import SpotBook, KalshiBook
@@ -46,6 +46,8 @@ log = logging.getLogger("kalshi_bot")
 
 ALL_ASSETS = list(KALSHI_ASSETS.keys())   # ["BTC", "ETH", "SOL", "XRP"]
 
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Kalshi lag-arbitrage bot")
@@ -55,8 +57,6 @@ def parse_args():
                         "Example: --assets BTC ETH SOL XRP")
     p.add_argument("--wallet", type=float, default=1000.0,
                    help="Simulated wallet USD (split equally across assets)")
-    p.add_argument("--log-dir", type=str, default="logs",
-                   help="Directory for per-asset log files (default: logs/)")
     p.add_argument("--fresh", action="store_true",
                    help="Delete existing decisions logs before starting. "
                         "Ticks files are KEPT so models can bootstrap.")
@@ -71,7 +71,7 @@ def parse_args():
 
 
 async def setup_asset(asset: str, pk, wallet_per_asset: float,
-                      log_dir: Path, fresh: bool,
+                      run_dir: Path, fresh: bool,
                       live_orders: bool, max_bet_pct: float,
                       daily_loss_pct: float,
                       spot_book: SpotBook):
@@ -89,7 +89,7 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
         if mkt:
             break
         attempt += 1
-        print(f"  [{asset}] No active market (attempt {attempt}, {attempt*5}s elapsed) — waiting 5s...",
+        print(f"  [{asset}] No active market (attempt {attempt}, {attempt*5}s elapsed) - waiting 5s...",
               flush=True)
         await asyncio.sleep(5)
 
@@ -108,8 +108,11 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
     kb_book.set_window(ticker, floor_strike, close_time)
     kalshi_feed = KalshiRestFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
 
-    log_path  = log_dir / f"decisions_{asset}.jsonl"
-    tick_path = log_dir / f"ticks_{asset}.csv"
+    log_path  = run_dir / f"decisions_{asset}.jsonl"
+    tick_path = run_dir / f"ticks_{asset}.csv"
+
+    # Bootstrap from last run's ticks if available
+    seed_tick_path = _find_latest_ticks(asset, run_dir)
 
     if fresh and log_path.exists():
         log_path.unlink()
@@ -120,7 +123,7 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
         wallet_usd=wallet_per_asset,
         log_path=log_path,
         tick_path=tick_path,
-        seed_tick_path=tick_path,
+        seed_tick_path=seed_tick_path,
         pk=pk,
         live_orders=live_orders,
         max_bet_pct=max_bet_pct,
@@ -131,15 +134,36 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
     return kalshi_feed, scheduler, asset
 
 
+def _find_latest_ticks(asset: str, current_run_dir: Path) -> Path | None:
+    """Return the ticks CSV from the most recent prior run, for bootstrap seeding."""
+    if not DATA_DIR.exists():
+        return None
+    prior_runs = sorted(
+        [p for p in DATA_DIR.iterdir()
+         if p.is_dir() and p != current_run_dir],
+        reverse=True,
+    )
+    for run in prior_runs:
+        candidate = run / f"ticks_{asset}.csv"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 async def main():
     args = parse_args()
-    assets   = [a.upper() for a in args.assets]
-    log_dir  = Path(args.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    assets = [a.upper() for a in args.assets]
+
+    # Create timestamped run folder: data/YYYY-MM-DD_HH-MM-SS_BTC_ETH/
+    ts_str  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"{ts_str}_{'_'.join(assets)}"
+    run_dir  = DATA_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     print("=== Kalshi Lead-Lag Arbitrage Bot ===", flush=True)
     print(f"  Assets:     {', '.join(assets)}", flush=True)
     print(f"  Spot feed:  {SPOT_SOURCE}", flush=True)
+    print(f"  Run folder: {run_dir}", flush=True)
 
     pk = load_private_key()
 
@@ -176,11 +200,11 @@ async def main():
     else:
         raise RuntimeError(f"Unknown SPOT_SOURCE: {SPOT_SOURCE!r}")
 
-    # ---- Per-asset setup — all assets discover markets in parallel ----
+    # ---- Per-asset setup - all assets discover markets in parallel ----
     results = await asyncio.gather(*[
         setup_asset(
             asset, pk, wallet_per_asset,
-            log_dir, args.fresh,
+            run_dir, args.fresh,
             args.live_orders, args.max_bet_pct, args.daily_loss_pct,
             spot_books[asset],
         )
@@ -215,6 +239,7 @@ async def main():
             kalshi_feed.stop()
             scheduler.stop()
         print("\nBot stopped.", flush=True)
+        print(f"Data saved to: {run_dir}", flush=True)
 
 
 if __name__ == "__main__":

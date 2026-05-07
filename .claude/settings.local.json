@@ -50,7 +50,15 @@
       "Bash(python scripts/test_maker_trade.py --dry-run --ttl 3 --hold-s 1)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/compare_models.py'\\).read\\(\\)\\); print\\('parse ok'\\)\")",
       "Bash(python scripts/compare_models.py --mode filters --theta-fee 0.07)",
-      "Bash(python -c \"from betbot.kalshi.scheduler import Scheduler; print\\('OK'\\)\")"
+      "Bash(python -c \"from betbot.kalshi.scheduler import Scheduler; print\\('OK'\\)\")",
+      "Bash(python -m py_compile scripts/analysis/analyze_run.py)",
+      "Bash(python -m py_compile scripts/analysis/backtest.py)",
+      "Bash(python -m py_compile scripts/analysis/compare_models.py)",
+      "Bash(python -m py_compile scripts/analysis/replay_window.py)",
+      "Bash(python -m py_compile scripts/run/run_kalshi_bot.py)",
+      "Bash(python -m py_compile scripts/analysis/pick_run.py)",
+      "Skill(office-hours)",
+      "Skill(office-hours:*)"
     ]
   }
 }

@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-07T05:27:49.884Z",
+  "timestamp": "2026-05-07T06:42:50.391Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -22,25 +22,85 @@
     },
     {
       "status": "M",
+      "path": ".gitignore"
+    },
+    {
+      "status": "M",
       "path": ".planning/HANDOFF.json"
     },
     {
       "status": "M",
-      "path": "betbot/kalshi/scheduler.py"
+      "path": "CLAUDE.md"
+    },
+    {
+      "status": "D",
+      "path": "DRYRUN.md"
     },
     {
       "status": "M",
-      "path": "betbot/kalshi/tick_logger.py"
+      "path": "betbot/kalshi/model.py"
     },
     {
-      "status": "M",
+      "status": "D",
+      "path": "scripts/analyze_run.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/backtest.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/check_kalshi_balance.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/compare_models.py"
+    },
+    {
+      "status": "D",
       "path": "scripts/live_plot.py"
     },
     {
-      "status": "M",
+      "status": "D",
       "path": "scripts/run_kalshi_bot.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/test_maker_trade.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/test_trade.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/visualize_market.py"
+    },
+    {
+      "status": "??",
+      "path": "README.md"
+    },
+    {
+      "status": "??",
+      "path": "RUN.md"
+    },
+    {
+      "status": "??",
+      "path": "data/"
+    },
+    {
+      "status": "??",
+      "path": "scripts/analysis/"
+    },
+    {
+      "status": "??",
+      "path": "scripts/run/"
+    },
+    {
+      "status": "??",
+      "path": "scripts/test/"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)\na2d5e0c Remove Polymarket-era dead code and tidy project metadata\n4495407 before everything\ne65170e update for enter as maker, exit as taker"
+  "context_notes": "Recent commits:\n285a6c7 multi assets\n5dd7470 only coinbase\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)\na2d5e0c Remove Polymarket-era dead code and tidy project metadata"
 }

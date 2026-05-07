@@ -1,19 +1,20 @@
 """
 analyze_run.py -- Visualize a completed (or in-progress) dry-run decision log.
 
-Reads logs/decisions.jsonl and produces:
+Prompts for a data/ run folder (Tkinter popup), then reads decisions_<ASSET>.jsonl
+from that folder and produces:
   1. Kalshi YES price over time (bid / ask / model q_settled / q_predicted)
   2. Edge magnitude over time with Kelly tier floor lines
   3. Model R2 and estimated lag over time
   4. Hypothetical cumulative P&L (simulated from logged entry/exit events)
   5. Abstention reason breakdown
-  6. Training buffer growth
 
 Usage:
-  python scripts/analyze_run.py
-  python scripts/analyze_run.py --log logs/decisions.jsonl --save results.png
-  python scripts/analyze_run.py --live               # refresh every 10s while bot runs
-  python scripts/analyze_run.py --live --interval 5  # refresh every 5s
+  python scripts/analysis/analyze_run.py
+  python scripts/analysis/analyze_run.py --run data/2026-05-07_00-15-00_BTC
+  python scripts/analysis/analyze_run.py --asset ETH
+  python scripts/analysis/analyze_run.py --save results.png
+  python scripts/analysis/analyze_run.py --live --interval 5
 """
 
 import argparse
@@ -26,22 +27,25 @@ import numpy as np
 
 try:
     import matplotlib
-    matplotlib.use("TkAgg")          # works on Windows without a display server
+    matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from betbot.kalshi.config import KELLY_TIERS, THETA_FEE_TAKER as THETA_FEE
+from pick_run import pick_run_folder
 
 
 # ---------------------------------------------------------------------------
 # Load JSONL
 # ---------------------------------------------------------------------------
 
-def load_log(path: Path) -> list[dict]:
+def load_log(path: Path) -> list:
     rows = []
     with open(path) as f:
         for line in f:
@@ -58,7 +62,7 @@ def load_log(path: Path) -> list[dict]:
 # Summary stats (printed to terminal)
 # ---------------------------------------------------------------------------
 
-def print_summary(rows: list[dict]) -> None:
+def print_summary(rows: list) -> None:
     if not rows:
         print("No rows found.")
         return
@@ -75,31 +79,27 @@ def print_summary(rows: list[dict]) -> None:
         if r.get("abstention_reason"):
             abstentions[r["abstention_reason"]] += 1
 
-    # Model quality
-    r2s = [r["model_r2_hld"] for r in rows if r["model_r2_hld"] > 0]
-    lags = [r["model_lag_s"] for r in rows if r["model_lag_s"] > 0]
-
-    # Edges
+    r2s  = [r["model_r2_hld"] for r in rows if r.get("model_r2_hld", 0) > 0]
+    lags = [r["model_lag_s"]  for r in rows if r.get("model_lag_s",  0) > 0]
     edges = [r["edge_magnitude"] for r in rows
              if r.get("edge_magnitude") and r["edge_magnitude"] > -50]
 
-    # P&L
     entries = [r for r in rows if r["event"] == "entry"]
     exits   = [r for r in rows if r["event"] in
                ("exit_lag_closed", "exit_stopped", "fallback_resolution")]
 
     print("=" * 60)
-    print(f"  DRY-RUN SUMMARY")
+    print("  DRY-RUN SUMMARY")
     print("=" * 60)
     print(f"  Span:          {span_min:.1f} minutes  ({len(rows)} ticks)")
     print(f"  Windows:       {len(set(r['window_ticker'] for r in rows))}")
     print()
-    print(f"  Events:")
+    print("  Events:")
     for ev, n in sorted(events.items(), key=lambda x: -x[1]):
         print(f"    {ev:30s} {n:5d}")
     print()
     if abstentions:
-        print(f"  Abstention reasons:")
+        print("  Abstention reasons:")
         for reason, n in sorted(abstentions.items(), key=lambda x: -x[1]):
             print(f"    {reason:30s} {n:5d}")
         print()
@@ -116,11 +116,10 @@ def print_summary(rows: list[dict]) -> None:
     print(f"  Exits:         {len(exits)}")
     print()
 
-    # Simulated P&L from matched entry/exit pairs
     pnl_rows = compute_pnl(rows)
     if pnl_rows:
-        total_pnl  = sum(p["pnl"] for p in pnl_rows)
-        total_bet  = sum(p["size_usd"] for p in pnl_rows)
+        total_pnl = sum(p["pnl"] for p in pnl_rows)
+        total_bet = sum(p["size_usd"] for p in pnl_rows)
         n_win = sum(1 for p in pnl_rows if p["pnl"] > 0)
         print(f"  Simulated P&L: ${total_pnl:+.2f}  "
               f"(ROI {total_pnl/total_bet*100:.1f}%  "
@@ -140,8 +139,7 @@ def print_summary(rows: list[dict]) -> None:
 # P&L simulation from entry/exit pairs
 # ---------------------------------------------------------------------------
 
-def compute_pnl(rows: list[dict]) -> list[dict]:
-    """Match entry rows to subsequent exit rows and compute P&L."""
+def compute_pnl(rows: list) -> list:
     results = []
     open_entry = None
 
@@ -151,27 +149,24 @@ def compute_pnl(rows: list[dict]) -> list[dict]:
         elif r["event"] in ("exit_lag_closed", "exit_stopped", "fallback_resolution"):
             if open_entry is None:
                 continue
-            side       = open_entry.get("favored_side", "yes")
-            entry_p    = open_entry.get("yes_ask", 0)
-            size_usd   = open_entry.get("would_bet_usd", 0)
-            contracts  = size_usd / max(entry_p, 1e-6)
+            side      = open_entry.get("favored_side", "yes")
+            entry_p   = open_entry.get("yes_ask", 0)
+            size_usd  = open_entry.get("would_bet_usd", 0)
+            contracts = size_usd / max(entry_p, 1e-6)
 
-            # Exit price: if we're selling YES, exit at bid
             if side == "yes":
                 exit_p = r.get("yes_bid", entry_p)
             else:
-                # Selling NO = re-buying YES: exit at 1 - yes_ask
                 exit_p = 1.0 - r.get("yes_ask", 1.0 - entry_p)
 
             if r["event"] == "fallback_resolution":
-                # Approximate: we don't know resolution here, use last q_settled as proxy
                 exit_p = r.get("q_settled") or exit_p
 
-            gross_in   = contracts * entry_p
-            gross_out  = contracts * exit_p
-            fee_in     = THETA_FEE * entry_p * (1 - entry_p) * gross_in
-            fee_out    = THETA_FEE * exit_p  * (1 - exit_p)  * gross_out
-            pnl        = gross_out - gross_in - fee_in - fee_out
+            gross_in  = contracts * entry_p
+            gross_out = contracts * exit_p
+            fee_in    = THETA_FEE * entry_p * (1 - entry_p) * gross_in
+            fee_out   = THETA_FEE * exit_p  * (1 - exit_p)  * gross_out
+            pnl       = gross_out - gross_in - fee_in - fee_out
 
             results.append({
                 "entry_ts":   open_entry["ts_ns"] / 1e9,
@@ -192,8 +187,7 @@ def compute_pnl(rows: list[dict]) -> list[dict]:
 # Plotting
 # ---------------------------------------------------------------------------
 
-def _draw(axes, ax3b, rows: list[dict]) -> None:
-    """Clear and redraw all four panels into pre-created axes."""
+def _draw(axes, ax3b, rows: list) -> None:
     import datetime
 
     for ax in axes:
@@ -211,19 +205,16 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
     q_set    = np.array([r["q_settled"]   if r.get("q_settled")   is not None else np.nan for r in rows])
     q_pred   = np.array([r["q_predicted"] if r.get("q_predicted") is not None else np.nan for r in rows])
     edge_mag = np.array([r["edge_magnitude"] if r.get("edge_magnitude", -99) > -50 else np.nan for r in rows])
-    r2       = np.array([r["model_r2_hld"] for r in rows])
-    lag_s    = np.array([r["model_lag_s"] for r in rows])
+    r2       = np.array([r.get("model_r2_hld", 0) for r in rows])
+    lag_s    = np.array([r.get("model_lag_s", 0)  for r in rows])
 
-    # Entry / exit markers
     entry_rows = [r for r in rows if r["event"] == "entry"]
     entry_ts   = [datetime.datetime.fromtimestamp(r["ts_ns"]/1e9) for r in entry_rows]
     entry_p    = [r["yes_ask"] for r in entry_rows]
 
     exit_lag_rows  = [r for r in rows if r["event"] == "exit_lag_closed"]
     exit_stop_rows = [r for r in rows if r["event"] == "exit_stopped"]
-    exit_hold_rows = [r for r in rows if r["event"] == "exit_max_hold"]
 
-    ts_set = set(ts)
     def _mid_at(t):
         try:
             return float(yes_mid[ts.index(t)])
@@ -234,20 +225,16 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
     exit_lag_p   = [_mid_at(datetime.datetime.fromtimestamp(r["ts_ns"]/1e9)) for r in exit_lag_rows]
     exit_stop_ts = [datetime.datetime.fromtimestamp(r["ts_ns"]/1e9) for r in exit_stop_rows]
     exit_stop_p  = [_mid_at(datetime.datetime.fromtimestamp(r["ts_ns"]/1e9)) for r in exit_stop_rows]
-    exit_hold_ts = [datetime.datetime.fromtimestamp(r["ts_ns"]/1e9) for r in exit_hold_rows]
-    exit_hold_p  = [_mid_at(datetime.datetime.fromtimestamp(r["ts_ns"]/1e9)) for r in exit_hold_rows]
 
-    # Cumulative P&L
     pnl_rows  = compute_pnl(rows)
     cum_pnl_x = [datetime.datetime.fromtimestamp(p["exit_ts"]) for p in pnl_rows]
     cum_pnl_y = np.cumsum([p["pnl"] for p in pnl_rows]) if pnl_rows else []
 
-    # Abstention breakdown
     abstentions = defaultdict(int)
     for r in rows:
         abstentions[r.get("abstention_reason") or r["event"]] += 1
 
-    # ── Panel 1: YES price + model ──────────────────────────────────────────
+    # -- Panel 1: YES price + model --
     ax = axes[0]
     ax.fill_between(ts, yes_bid, yes_ask, alpha=0.15, color="steelblue", label="bid/ask spread")
     ax.plot(ts, yes_mid, color="steelblue", lw=1.2, label="YES mid")
@@ -259,15 +246,13 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
         ax.scatter(exit_lag_ts, exit_lag_p, marker="v", color="lime", s=80, zorder=5, label="exit_lag_closed")
     if exit_stop_ts:
         ax.scatter(exit_stop_ts, exit_stop_p, marker="x", color="red", s=80, zorder=5, label="exit_stopped")
-    if exit_hold_ts:
-        ax.scatter(exit_hold_ts, exit_hold_p, marker="D", color="orange", s=60, zorder=5, label="exit_max_hold")
     ax.set_ylabel("Probability")
     ax.set_title("Kalshi YES Price vs Model Predictions")
     ax.legend(fontsize=8, loc="upper left")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.grid(alpha=0.3)
 
-    # ── Panel 2: Edge magnitude ─────────────────────────────────────────────
+    # -- Panel 2: Edge magnitude --
     ax = axes[1]
     ax.plot(ts, edge_mag, color="purple", lw=1.0, label="edge_magnitude")
     colors = ["#e74c3c","#e67e22","#f1c40f","#2ecc71","#3498db"]
@@ -281,7 +266,7 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
     ax.grid(alpha=0.3)
     ax.set_ylim(bottom=0)
 
-    # ── Panel 3: Model quality ──────────────────────────────────────────────
+    # -- Panel 3: Model quality --
     ax = axes[2]
     ax.plot(ts, r2,    color="dodgerblue", lw=1.5, label="R2 hld")
     ax.axhline(0.20, color="red",   lw=0.8, linestyle="--", label="R2=0.20 abstain floor")
@@ -296,7 +281,7 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.grid(alpha=0.3)
 
-    # ── Panel 4: Cumulative P&L + abstention pie ────────────────────────────
+    # -- Panel 4: Cumulative P&L + abstention pie --
     ax = axes[3]
     if len(cum_pnl_y):
         ax.plot(cum_pnl_x, cum_pnl_y, color="green", lw=2, label="cumulative P&L")
@@ -315,12 +300,12 @@ def _draw(axes, ax3b, rows: list[dict]) -> None:
             labels_pie = list(abstentions.keys())
             sizes_pie  = [abstentions[k] for k in labels_pie]
             ax.pie(sizes_pie, labels=labels_pie, autopct="%1.0f%%", startangle=90)
-            ax.set_title("Tick Breakdown (no trades yet — model still warming up)")
+            ax.set_title("Tick Breakdown (no trades yet - model still warming up)")
 
 
-def plot(rows: list[dict], save_path: str | None = None) -> None:
+def plot(rows: list, save_path=None) -> None:
     if not HAS_MPL:
-        print("matplotlib not installed — skipping charts. pip install matplotlib")
+        print("matplotlib not installed -- skipping charts. pip install matplotlib")
         return
     if not rows:
         return
@@ -340,9 +325,8 @@ def plot(rows: list[dict], save_path: str | None = None) -> None:
 
 
 def live_plot(log_path: Path, interval_s: int = 10) -> None:
-    """Open a live-updating plot window. Refreshes every interval_s seconds."""
     if not HAS_MPL:
-        print("matplotlib not installed — pip install matplotlib")
+        print("matplotlib not installed -- pip install matplotlib")
         return
 
     import matplotlib.animation as animation
@@ -358,21 +342,22 @@ def live_plot(log_path: Path, interval_s: int = 10) -> None:
         if not rows:
             return
         _draw(axes, ax3b, rows)
+        import datetime
         fig.suptitle(
-            f"Kalshi BTC Lag-Arb  [LIVE]  —  {len(rows)} ticks  "
-            f"last {__import__('datetime').datetime.now().strftime('%H:%M:%S')}",
+            f"Kalshi BTC Lag-Arb  [LIVE]  --  {len(rows)} ticks  "
+            f"last {datetime.datetime.now().strftime('%H:%M:%S')}",
             fontsize=13, fontweight="bold",
         )
         fig.tight_layout()
 
-    _update(0)  # draw immediately on open
+    _update(0)
     ani = animation.FuncAnimation(
         fig, _update,
-        interval=interval_s * 1000,  # ms
+        interval=interval_s * 1000,
         cache_frame_data=False,
     )
     plt.show()
-    _ = ani  # keep reference so GC doesn't kill it
+    _ = ani
 
 
 # ---------------------------------------------------------------------------
@@ -381,16 +366,26 @@ def live_plot(log_path: Path, interval_s: int = 10) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze a Kalshi dry-run JSONL log")
-    parser.add_argument("--log",      default="logs/decisions.jsonl")
+    parser.add_argument("--run",      default=None,
+                        help="Path to a data/<run> folder (popup if omitted)")
+    parser.add_argument("--asset",    default="BTC",
+                        help="Which asset's decisions file to load (default: BTC)")
     parser.add_argument("--save",     default=None, help="Save chart to this PNG path")
     parser.add_argument("--no-plot",  action="store_true")
     parser.add_argument("--live",     action="store_true",
-                        help="Live-updating plot — refreshes while the bot runs")
+                        help="Live-updating plot - refreshes while the bot runs")
     parser.add_argument("--interval", type=int, default=10,
                         help="Refresh interval in seconds for --live (default 10)")
     args = parser.parse_args()
 
-    log_path = Path(args.log)
+    run_dir  = pick_run_folder(cli_arg=args.run, title="Select run to analyze")
+    log_path = run_dir / f"decisions_{args.asset.upper()}.jsonl"
+
+    # Fallback: legacy single-asset files without asset suffix
+    if not log_path.exists():
+        legacy = run_dir / "decisions.jsonl"
+        if legacy.exists():
+            log_path = legacy
 
     if args.live:
         if not log_path.exists():
@@ -400,11 +395,11 @@ def main():
 
     if not log_path.exists():
         sys.exit(f"ERROR: log file not found: {log_path}\n"
-                 "Start the bot first: python scripts/run_kalshi_bot.py")
+                 "Start the bot first: python scripts/run/run_kalshi_bot.py")
 
     rows = load_log(log_path)
     if not rows:
-        sys.exit("Log file is empty — bot may not have started yet.")
+        sys.exit("Log file is empty - bot may not have started yet.")
 
     print_summary(rows)
     if not args.no_plot:

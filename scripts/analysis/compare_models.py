@@ -40,8 +40,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pick_run import pick_run_folder
 
 from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
@@ -834,7 +836,10 @@ def run_maker_comparison(df: pd.DataFrame, train_frac: float, theta_fee: float):
 
 def main():
     p = argparse.ArgumentParser(description="Side-by-side model comparisons")
-    p.add_argument("--ticks",      default=str(REPO_ROOT / "logs" / "ticks.csv"))
+    p.add_argument("--run",        default=None,
+                   help="Path to a data/<run> folder (popup if omitted)")
+    p.add_argument("--asset",      default="BTC",
+                   help="Which asset's ticks file to use (default: BTC)")
     p.add_argument("--train-frac", type=float, default=0.6)
     p.add_argument("--no-filter",  action="store_true",
                    help="(projection mode) Disable training+entry filters")
@@ -855,7 +860,13 @@ def main():
     use_entry_gate   = not args.no_filter
     theta_fee        = args.theta_fee
 
-    tick_path = Path(args.ticks)
+    run_dir   = pick_run_folder(cli_arg=args.run, title="Select run to compare")
+    asset     = args.asset.upper()
+    tick_path = run_dir / f"ticks_{asset}.csv"
+    if not tick_path.exists():
+        legacy = run_dir / "ticks.csv"
+        if legacy.exists():
+            tick_path = legacy
     if not tick_path.exists():
         sys.exit(f"ERROR: {tick_path} not found.")
 

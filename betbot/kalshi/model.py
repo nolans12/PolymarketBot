@@ -238,6 +238,13 @@ class KalshiRegressionModel:
         logit = self._predict_raw(fv.settled_array())
         return _sigmoid(logit) if logit is not None else None
 
+    def q_settled_from_array(self, vec: np.ndarray) -> Optional[float]:
+        """q_settled from a raw pre-built numpy feature array (used by replay_window.py)."""
+        if not self.is_fit:
+            return None
+        logit = self._predict_raw(vec)
+        return _sigmoid(logit) if logit is not None else None
+
     @property
     def version_id(self) -> str:
         return self._version_id

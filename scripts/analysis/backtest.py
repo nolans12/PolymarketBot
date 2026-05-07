@@ -1,18 +1,20 @@
 """
 backtest.py -- Walk-forward backtest on collected tick data.
 
-Loads logs/ticks.csv, builds lag features matching the live model schema,
-fits ridge regression, simulates trading on the held-out period, and reports P&L.
+Prompts for a data/ run folder (Tkinter popup), then loads ticks_<ASSET>.csv
+from that folder. Builds lag features matching the live model schema, fits ridge
+regression, simulates trading on the held-out period, and reports P&L.
 
 Fees are included: THETA * p * (1 - p) per leg (taker on both legs by default).
 
 Usage:
-  python scripts/backtest.py                      # defaults
-  python scripts/backtest.py --entry 0.025        # entry threshold
-  python scripts/backtest.py --hold-s 45          # max hold seconds
-  python scripts/backtest.py --train-frac 0.65    # 65% train / 35% test
-  python scripts/backtest.py --no-plot            # text only
-  python scripts/backtest.py --sweep              # grid sweep of params
+  python scripts/analysis/backtest.py
+  python scripts/analysis/backtest.py --run data/2026-05-07_00-15-00_BTC --asset BTC
+  python scripts/analysis/backtest.py --entry 0.025
+  python scripts/analysis/backtest.py --hold-s 45
+  python scripts/analysis/backtest.py --train-frac 0.65
+  python scripts/analysis/backtest.py --no-plot
+  python scripts/analysis/backtest.py --sweep
 """
 
 import argparse
@@ -22,7 +24,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pick_run import pick_run_folder
 
 try:
     import matplotlib
@@ -45,7 +49,7 @@ from betbot.kalshi.config import (
 )
 
 # ---------------------------------------------------------------------------
-# Feature engineering — matches live model schema (short-lag set)
+# Feature engineering -- matches live model schema (short-lag set)
 # ---------------------------------------------------------------------------
 
 # Must match LOOKBACK_S in config.py (excluding 0, which is x_0)
@@ -84,7 +88,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         g["kalshi_momentum_30s"] = ym - ym.shift(30).fillna(ym)
         g["kalshi_spread"]       = g["yes_ask"] - g["yes_bid"]
 
-        # Target: logit(yes_mid) — apply same training filter as live model
+        # Target: logit(yes_mid) -- apply same training filter as live model
         ym_filt = ym.where(
             (ym >= TRAIN_YES_MID_MIN) & (ym <= TRAIN_YES_MID_MAX), other=np.nan
         )
@@ -156,7 +160,7 @@ def simulate(df_test: pd.DataFrame, scaler: StandardScaler,
             ticker_changed = (cur_ticker != pos["window_ticker"])
             gap_s = (cur_ts_ns - (prev_ts_ns or cur_ts_ns)) / 1e9
             if ticker_changed or gap_s > 5.0:
-                # Close at last known bid (use entry_ask as proxy — worst case)
+                # Close at last known bid (use entry_ask as proxy -- worst case)
                 trades.append({
                     "entry_ts":    pos["entry_ts_ns"] / 1e9,
                     "exit_ts":     (prev_ts_ns or cur_ts_ns) / 1e9,
@@ -392,7 +396,7 @@ def plot_results(df: pd.DataFrame, result: dict, save_path: str | None = None) -
         fontsize=12, fontweight="bold"
     )
 
-    # ── Panel 1: YES price + entries/exits ──────────────────────────────────
+    # -- Panel 1: YES price + entries/exits --
     ax = axes[0]
     ts = [datetime.datetime.fromtimestamp(r / 1e9) for r in df["ts_ns"]]
     ax.fill_between(ts, df["yes_bid"], df["yes_ask"], alpha=0.2, color="steelblue")
@@ -416,12 +420,12 @@ def plot_results(df: pd.DataFrame, result: dict, save_path: str | None = None) -
     ax.axvline(datetime.datetime.fromtimestamp(df.iloc[int(len(df) * result.get("train_frac_used", 0.6))]["ts_ns"] / 1e9),
                color="gray", lw=1.5, linestyle="--", label="train/test split")
     ax.set_ylabel("YES price")
-    ax.set_title("YES Market Price — Entry/Exit Points")
+    ax.set_title("YES Market Price -- Entry/Exit Points")
     ax.legend(fontsize=8)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.grid(alpha=0.3)
 
-    # ── Panel 2: Cumulative P&L ─────────────────────────────────────────────
+    # -- Panel 2: Cumulative P&L --
     ax = axes[1]
     if trades:
         exit_times = [datetime.datetime.fromtimestamp(t["exit_ts"]) for t in trades]
@@ -434,11 +438,11 @@ def plot_results(df: pd.DataFrame, result: dict, save_path: str | None = None) -
                         where=[p < 0 for p in cum_pnl], alpha=0.2, color="red")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.set_ylabel("Cumulative P&L ($)")
-    ax.set_title(f"Cumulative P&L — {len(trades)} trades, "
+    ax.set_title(f"Cumulative P&L -- {len(trades)} trades, "
                  f"win rate {result['win_rate']*100:.0f}%")
     ax.grid(alpha=0.3)
 
-    # ── Panel 3: Edge at entry vs P&L scatter ───────────────────────────────
+    # -- Panel 3: Edge at entry vs P&L scatter --
     ax = axes[2]
     if trades:
         edges = [t["exit_edge"] for t in trades]
@@ -466,7 +470,10 @@ def plot_results(df: pd.DataFrame, result: dict, save_path: str | None = None) -
 
 def main():
     parser = argparse.ArgumentParser(description="Walk-forward backtest on tick data")
-    parser.add_argument("--ticks",       default="logs/ticks.csv")
+    parser.add_argument("--run",         default=None,
+                        help="Path to a data/<run> folder (popup if omitted)")
+    parser.add_argument("--asset",       default="BTC",
+                        help="Which asset's ticks file to use (default: BTC)")
     parser.add_argument("--train-frac",  type=float, default=0.6,
                         help="Fraction of ticks used for training (default 0.60)")
     min_entry = KELLY_TIERS[-1][0]   # lowest tier floor from config
@@ -484,10 +491,16 @@ def main():
     parser.add_argument("--save",        default=None, help="Save chart PNG to this path")
     args = parser.parse_args()
 
-    tick_path = Path(args.ticks)
+    run_dir   = pick_run_folder(cli_arg=args.run, title="Select run to backtest")
+    asset     = args.asset.upper()
+    tick_path = run_dir / f"ticks_{asset}.csv"
+    if not tick_path.exists():
+        legacy = run_dir / "ticks.csv"
+        if legacy.exists():
+            tick_path = legacy
     if not tick_path.exists():
         sys.exit(f"ERROR: {tick_path} not found. Run the bot first:\n"
-                 "  python scripts/run_kalshi_bot.py")
+                 "  python scripts/run/run_kalshi_bot.py")
 
     print(f"Loading {tick_path}...")
     raw = pd.read_csv(tick_path)

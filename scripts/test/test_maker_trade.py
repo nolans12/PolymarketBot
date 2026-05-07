@@ -1,4 +1,4 @@
-"""
+﻿"""
 test_maker_trade.py -- Maker-entry / taker-exit round-trip on Kalshi.
 
 Sister to scripts/test_trade.py (which goes taker-on-both). This one:
@@ -43,7 +43,7 @@ from pathlib import Path
 
 import aiohttp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from betbot.kalshi.auth import load_private_key
 from betbot.kalshi.config import (

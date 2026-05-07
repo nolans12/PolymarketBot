@@ -1,5 +1,5 @@
-"""
-test_trade.py — Buy ~$1 of YES on BTC 15-min, wait 10 seconds, then sell it back.
+﻿"""
+test_trade.py â€” Buy ~$1 of YES on BTC 15-min, wait 10 seconds, then sell it back.
 
 Verifies the full round-trip: buy fill -> hold -> sell fill.
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import aiohttp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from betbot.kalshi.auth import load_private_key
 from betbot.kalshi.config import KALSHI_REST, KALSHI_KEY_ID, KALSHI_SERIES
@@ -154,7 +154,7 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
 
-        # ── 1. Discover market ──────────────────────────────────────────────
+        # â”€â”€ 1. Discover market â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print("Discovering active BTC 15-min market...")
         mkt = await discover_market(session)
         if not mkt:
@@ -196,12 +196,12 @@ async def main():
                 print("Aborted.")
                 return
 
-        # ── 2. BUY ─────────────────────────────────────────────────────────
+        # â”€â”€ 2. BUY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print(f"\n[1/3] Placing BUY {count}x YES @ {yes_ask_cents}c...")
         buy_resp = await place_order(session, pk, ticker,
                                      "buy", yes_ask_cents, count, args.dry_run)
         if not buy_resp:
-            sys.exit("Buy failed — aborting before any sell.")
+            sys.exit("Buy failed â€” aborting before any sell.")
 
         buy_order = buy_resp.get("order", buy_resp)
         buy_id     = buy_order.get("order_id", buy_order.get("id", "?"))
@@ -210,14 +210,14 @@ async def main():
         print(f"    Status:   {buy_order.get('status', '?')}")
         print(f"    Filled:   {buy_filled} / {count}")
 
-        # ── 3. WAIT ─────────────────────────────────────────────────────────
+        # â”€â”€ 3. WAIT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print(f"\n[2/3] Holding for {HOLD_SECONDS}s...")
         for remaining in range(HOLD_SECONDS, 0, -1):
             print(f"    {remaining}s...", end="\r", flush=True)
             await asyncio.sleep(1)
         print()
 
-        # ── 4. Get current bid for sell price ───────────────────────────────
+        # â”€â”€ 4. Get current bid for sell price â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print("[3/3] Fetching current market price for sell...")
         fresh = await refresh_market(session, pk, ticker)
         if fresh and not args.dry_run:
@@ -230,12 +230,12 @@ async def main():
             yes_bid_cents = max(1, yes_ask_cents - 1)
             print(f"    [DRY RUN] Using simulated bid: {yes_bid_cents}c")
 
-        # ── 5. SELL ─────────────────────────────────────────────────────────
+        # â”€â”€ 5. SELL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print(f"    Placing SELL {count}x YES @ {yes_bid_cents}c...")
         sell_resp = await place_order(session, pk, ticker,
                                       "sell", yes_bid_cents, count, args.dry_run)
         if not sell_resp:
-            print("  SELL FAILED — position may still be open, check Kalshi UI")
+            print("  SELL FAILED â€” position may still be open, check Kalshi UI")
             sys.exit(1)
 
         sell_order  = sell_resp.get("order", sell_resp)
@@ -245,7 +245,7 @@ async def main():
         print(f"    Status:   {sell_order.get('status', '?')}")
         print(f"    Filled:   {sell_filled} / {count}")
 
-        # ── 6. P&L summary ──────────────────────────────────────────────────
+        # â”€â”€ 6. P&L summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         gross_in  = count * yes_ask_usd
         gross_out = count * (yes_bid_cents / 100.0)
         pnl       = gross_out - gross_in
@@ -254,7 +254,7 @@ async def main():
         print(f"    Sold   {count}x @ {yes_bid_cents}c  = ${gross_out:.2f}")
         print(f"    P&L:   ${pnl:+.2f}  (before fees)")
         if args.dry_run:
-            print("  [DRY RUN — no real orders placed]")
+            print("  [DRY RUN â€” no real orders placed]")
 
 
 if __name__ == "__main__":
