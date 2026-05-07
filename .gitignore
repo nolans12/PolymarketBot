@@ -5,7 +5,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Live data + post-run artifacts
+# Run data and trained models — too large / sensitive for git
+data/
+model_fits/
+
+# Logs
 logs/
 *.log
 *.parquet
@@ -22,5 +26,5 @@ build/
 dist/
 *.egg-info/
 
-.planning
-.claude
+.planning/
+.claude/

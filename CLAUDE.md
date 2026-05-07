@@ -24,29 +24,31 @@ betbot/kalshi/          <- the entire live bot
   scheduler.py          sampler (CSV only) / decision / window manager
 
 scripts/run/
-  run_kalshi_bot.py     main entrypoint
+  run_kalshi_bot.py     main entrypoint (single or multi-asset)
 
 scripts/
   train_model.py        fit LightGBM on dry-run ticks, save to model_fits/
   tune_trading_knobs.py grid-sweep Kelly tiers + exit thresholds to maximise P&L
   test_all.py           full simulation with loaded model + tuned config
+  replay_window.py      animated replay of one 15-min window with model projections
 
 scripts/analysis/
   analyze_run.py        visualize decisions.jsonl
-  replay_window.py      animated replay of one 15-min window
   live_plot.py          live rolling spot/Kalshi/model-prediction chart
   pick_run.py           shared run-folder picker (Tkinter popup)
 
 scripts/test/
   test_trade.py         real $1 round-trip sanity check
   test_maker_trade.py   maker-entry round-trip test
-  check_kalshi_balance.py   auth + balance smoke test
+  check_kalshi_balance.py   auth + balance smoke check
 
-data/<timestamp>_<ASSETS>/   output from each bot run
+data/<YYYY-MM-DD_HH-MM-SS>_<ASSETS>/   output from each bot run (gitignored)
   ticks_BTC.csv         1Hz raw ticks (spot + Kalshi book)
   decisions_BTC.jsonl   decision log
 
-model_fits/             saved trained models (.pkl + .json metadata)
+model_fits/<run>_<ASSET>_<date>/        saved trained models (gitignored)
+  model.pkl             LightGBM model weights
+  model.json            metadata: R2 scores, feature names, horizons
 ```
 
 ---
@@ -55,25 +57,26 @@ model_fits/             saved trained models (.pkl + .json metadata)
 
 ```
 Step 1 — Dry run (collect training data):
-  python scripts/run/run_kalshi_bot.py
-  Runs with no model loaded, collects ticks to data/<run>/ticks_BTC.csv.
-  Let it run for 24+ hours.
+  python scripts/run/run_kalshi_bot.py --assets BTC ETH SOL XRP
+  No model needed. Collects ticks to data/<run>/ticks_{ASSET}.csv.
+  Let it run for 24+ hours per asset.
 
-Step 2 — Train model:
-  python scripts/train_model.py
-  Fits LightGBM on the collected ticks. Saves to model_fits/<name>.pkl.
+Step 2 — Train model (one per asset):
+  python scripts/train_model.py --run data/<run>
+  Fits LightGBM on the collected ticks.
+  Saves to model_fits/<run>_<ASSET>_<date>/model.pkl
 
 Step 3 — Tune trading knobs:
-  python scripts/tune_trading_knobs.py --model-file model_fits/<name>.pkl
-  Sweeps Kelly tier configs + exit thresholds to find the best combination.
-  Prints a config.py snippet. Apply to config.py manually.
+  python scripts/tune_trading_knobs.py --model-file model_fits/<dir>/model.pkl
+  Sweeps Kelly tier configs + exit thresholds on the held-out data.
+  Prints a config.py snippet. Apply to betbot/kalshi/config.py manually.
 
 Step 4 — Full simulation:
-  python scripts/test_all.py --model-file model_fits/<name>.pkl
+  python scripts/test_all.py --model-file model_fits/<dir>/model.pkl
   Replays ticks with the model + tuned config. Verify P&L and exit breakdown.
 
 Step 5 — Go live:
-  python scripts/run/run_kalshi_bot.py --model-file model_fits/<name>.pkl --live-orders
+  python scripts/run/run_kalshi_bot.py --model-file model_fits/<dir>/model.pkl --live-orders
   Static model, no warmup, trades from tick 1.
 ```
 
