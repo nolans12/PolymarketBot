@@ -26,6 +26,7 @@ from betbot.kalshi.binance_feed import BinanceFeed
 from betbot.kalshi.kalshi_rest_feed import KalshiRestFeed
 from betbot.kalshi.scheduler import Scheduler, _discover_market, _list_active_markets
 from betbot.kalshi.config import KALSHI_KEY_ID, SPOT_SOURCE
+from betbot.kalshi.orders import get_balance_usd
 
 
 async def _fetch_btc_spot() -> float:
@@ -59,7 +60,21 @@ def parse_args():
     p.add_argument("--ticker", type=str,   default=None,
                    help="Override market ticker (else auto-discover)")
     p.add_argument("--fresh",  action="store_true",
-                   help="Delete existing log/tick files before starting (clean run)")
+                   help="Delete existing decisions log before starting. "
+                        "Ticks file is KEPT so the model can bootstrap from it.")
+    p.add_argument("--seed-ticks", type=str, default=None,
+                   help="Bootstrap the model from this ticks CSV instead of --ticks. "
+                        "Use when you want to cold-start from a specific dataset.")
+    p.add_argument("--live-orders", action="store_true",
+                   help="REAL MONEY: place actual Kalshi orders on entry/exit. "
+                        "Reads your real balance from Kalshi as the wallet. "
+                        "Without this flag, the bot is decision-logger only.")
+    p.add_argument("--max-bet-pct", type=float, default=0.10,
+                   help="Hard cap on per-trade bet, fraction of starting wallet "
+                        "(default 0.10; only applies with --live-orders)")
+    p.add_argument("--daily-loss-pct", type=float, default=0.05,
+                   help="Halt when realized loss exceeds this fraction of starting "
+                        "wallet (default 0.05; only applies with --live-orders)")
     return p.parse_args()
 
 
@@ -67,17 +82,21 @@ async def main():
     args = parse_args()
 
     print("=== Kalshi BTC Lead-Lag Arbitrage Bot ===", flush=True)
-    print(f"  Wallet:     ${args.wallet:,.0f} (simulated)", flush=True)
+    if args.live_orders:
+        print("  *** !!! LIVE ORDERS MODE -- REAL MONEY AT RISK !!! ***", flush=True)
+        print(f"  Wallet:     (will query real Kalshi balance at startup)", flush=True)
+    else:
+        print(f"  Wallet:     ${args.wallet:,.0f} (simulated; bot logs decisions only)", flush=True)
     print(f"  Log:        {args.log}", flush=True)
     print(f"  Ticks:      {args.ticks}", flush=True)
     print(f"  Spot feed:  {SPOT_SOURCE}", flush=True)
 
     if args.fresh:
-        for p_str in [args.log, args.ticks]:
-            p = Path(p_str)
-            if p.exists():
-                p.unlink()
-                print(f"  Deleted old {p}", flush=True)
+        # Only wipe the decisions log — keep ticks so bootstrap has data to train on
+        p = Path(args.log)
+        if p.exists():
+            p.unlink()
+            print(f"  Deleted old {p}", flush=True)
 
     # ---- Discover active market ----
     if args.ticker:
@@ -127,13 +146,33 @@ async def main():
         raise RuntimeError(f"Unknown SPOT_SOURCE: {SPOT_SOURCE!r}")
     kalshi_feed = KalshiRestFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
 
+    # ---- Live orders: query real Kalshi wallet balance ----
+    wallet_usd = float(args.wallet)
+    if args.live_orders:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            real_balance = await get_balance_usd(s, pk)
+        if real_balance <= 0:
+            sys.exit("ERROR: --live-orders requires a positive Kalshi balance. "
+                     "Got $0.00 from /portfolio/balance -- check API auth and account funding.")
+        wallet_usd = real_balance
+        print(f"  Live wallet (Kalshi balance): ${wallet_usd:,.2f}", flush=True)
+
     # ---- Scheduler ----
-    log_path  = Path(args.log)
-    tick_path = Path(args.ticks)
+    log_path   = Path(args.log)
+    tick_path  = Path(args.ticks)
+    # --seed-ticks lets you bootstrap from a specific file (e.g. a known-good
+    # backtest dataset) while writing new live ticks to a separate file.
+    seed_path  = Path(args.seed_ticks) if args.seed_ticks else tick_path
     scheduler = Scheduler(spot_book, kb_book, kalshi_feed,
-                          wallet_usd=args.wallet,
+                          wallet_usd=wallet_usd,
                           log_path=log_path,
-                          tick_path=tick_path)
+                          tick_path=tick_path,
+                          seed_tick_path=seed_path,
+                          pk=pk,
+                          live_orders=args.live_orders,
+                          max_bet_pct=args.max_bet_pct,
+                          daily_loss_limit_pct=args.daily_loss_pct)
 
     print(f"  Starting feeds ({SPOT_SOURCE} WS + Kalshi REST 1Hz polling)...\n", flush=True)
 

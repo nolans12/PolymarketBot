@@ -21,7 +21,7 @@ from betbot.kalshi.auth import auth_headers, load_private_key
 from betbot.kalshi.book import KalshiBook
 from betbot.kalshi.config import KALSHI_REST, KALSHI_KEY_ID
 
-POLL_INTERVAL_S = 1.0    # poll every 1s — Kalshi limit is 20 reads/sec
+POLL_INTERVAL_S = 0.1    # poll every 100ms — Kalshi limit is 20 reads/sec (10Hz is safe)
 MAX_FAILURES    = 5      # consecutive failures before forcing a session reset
 
 

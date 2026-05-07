@@ -127,8 +127,8 @@ class KalshiRegressionModel:
         new_coefs = mdl.coef_.copy()
 
         # beta-weighted average lag - which historical slot explains Kalshi best
-        lag_names = ["x_15", "x_30", "x_60", "x_90", "x_120"]
-        lag_secs  = [15,      30,     60,     90,     120]
+        lag_names = ["x_5", "x_10", "x_15", "x_20", "x_25", "x_30"]
+        lag_secs  = [5,      10,     15,     20,     25,     30]
         lag_idx   = [FEATURE_NAMES.index(n) for n in lag_names]
         lag_betas = [abs(float(new_coefs[i])) for i in lag_idx]
         total_beta = sum(lag_betas)
@@ -168,6 +168,43 @@ class KalshiRegressionModel:
             self.last_diag      = diag
 
         return diag
+
+    def fit_if_better(self, X: np.ndarray, y: np.ndarray,
+                      ts_ns: np.ndarray) -> tuple["ModelDiagnostics", bool]:
+        """
+        Fit a candidate model. Only keep the new coefficients if R2_hld
+        strictly improves (or the model was never fit — first fit always accepted).
+        Returns (diag, was_accepted).
+        """
+        # Snapshot current live state before we touch anything
+        with self._lock:
+            snap_coefs       = self._coefs.copy() if self._coefs is not None else None
+            snap_intercept   = self._intercept
+            snap_scaler      = self._scaler
+            snap_r2_hld      = self.r2_held_out
+            snap_r2_cv       = self.r2_cv
+            snap_lag         = self.estimated_lag_s
+            snap_diag        = self.last_diag
+            snap_refit_ns    = self.last_refit_ns
+            first_fit        = not self.is_fit
+
+        diag = self.fit(X, y, ts_ns)   # always computes + swaps inside
+
+        if first_fit or diag.r2_held_out > snap_r2_hld:
+            return diag, True
+
+        # New fit is worse — restore prior state
+        with self._lock:
+            self._coefs          = snap_coefs
+            self._intercept      = snap_intercept
+            self._scaler         = snap_scaler
+            self.r2_held_out     = snap_r2_hld
+            self.r2_cv           = snap_r2_cv
+            self.estimated_lag_s = snap_lag
+            self.last_diag       = snap_diag
+            self.last_refit_ns   = snap_refit_ns
+            # keep is_fit=True, version_id stays updated (harmless)
+        return diag, False
 
     # ------------------------------------------------------------------
     # Prediction - called by scheduler tick (must be fast)

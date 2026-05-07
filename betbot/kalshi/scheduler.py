@@ -27,11 +27,13 @@ from betbot.kalshi.config import (
     KALSHI_REST, KALSHI_SERIES, KELLY_TIERS,
     LAG_CLOSE_THRESHOLD, MIN_TRAIN_SAMPLES,
     REFIT_INTERVAL_S, SAMPLE_INTERVAL_S,
-    STOP_THRESHOLD, THETA_FEE, TRAINING_WINDOW_S,
+    STOP_THRESHOLD, THETA_FEE_TAKER, TRAINING_WINDOW_S,
     TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX,
     DECISION_YES_MID_MIN, DECISION_YES_MID_MAX,
+    ENTRY_MODE, MAX_HOLD_S, MIN_ENTRY_INTERVAL_S,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
+from betbot.kalshi.orders import place_order as kalshi_place_order
 from betbot.kalshi.model import KalshiRegressionModel, ModelDiagnostics
 from betbot.kalshi.tick_logger import TickLogger
 from betbot.kalshi.training_buffer import TrainingBuffer
@@ -44,7 +46,17 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _fee(p: float) -> float:
-    return THETA_FEE * p * (1.0 - p)
+    """Taker fee per dollar bet at price p. Always applied to the exit leg."""
+    return THETA_FEE_TAKER * p * (1.0 - p)
+
+
+def _entry_fee(p: float) -> float:
+    """Entry-leg fee per dollar bet. Zero in maker mode (we post passively
+    at the existing best bid and pay no fee when filled). When ENTRY_MODE
+    is taker, the entry leg pays the same taker fee as the exit."""
+    if ENTRY_MODE == "maker":
+        return 0.0
+    return _fee(p)
 
 
 def _slippage(book_depth: float, size_usd: float) -> float:
@@ -83,7 +95,7 @@ class DecisionRow:
     tier:           int
     would_bet_usd:  float
     has_open:       bool
-    model_r2_cv:    float
+    model_r2_hld:   float
     model_lag_s:    float
     window_ticker:  str
 
@@ -191,17 +203,37 @@ class Scheduler:
                  kalshi_feed,          # KalshiRestFeed — must expose update_ticker()
                  wallet_usd: float = 1000.0,
                  log_path: Optional[Path] = None,
-                 tick_path: Optional[Path] = None):
+                 tick_path: Optional[Path] = None,
+                 seed_tick_path: Optional[Path] = None,  # bootstrap from this file (defaults to tick_path)
+                 pk=None,                       # RSA private key for order signing
+                 live_orders: bool = False,     # if True: place real Kalshi orders
+                 max_bet_pct: float = 0.10,     # hard cap: never bet > this % of starting wallet
+                 daily_loss_limit_pct: float = 0.05):  # halt if realized loss > this % of starting wallet
         self._cb        = cb
         self._kb        = kb
         self._ws        = kalshi_feed
         self._wallet    = wallet_usd
         self._log_path  = log_path
 
+        self._pk             = pk
+        self._live_orders    = bool(live_orders) and pk is not None
+        self._session: Optional["aiohttp.ClientSession"] = None
+        self._starting_wallet = float(wallet_usd)
+        self._max_bet_usd     = float(wallet_usd) * max_bet_pct
+        self._daily_loss_cap  = -float(wallet_usd) * daily_loss_limit_pct
+        self._realized_pnl    = 0.0
+        self._halted          = False
+
         self._model   = KalshiRegressionModel()
         self._buf     = TrainingBuffer(window_s=TRAINING_WINDOW_S)
         self._pos:    Optional[Position] = None
         self._running = False
+        self._last_entry_t: float = 0.0  # monotonic time of last entry
+
+        # Track window transitions in sampler — skip first 30s of samples after
+        # a window change so lagged spot features don't bleed from prior window.
+        self._sampler_ticker: str   = ""
+        self._sampler_window_start: float = 0.0  # monotonic time of last window switch
 
         self._log_fh = None
         if log_path:
@@ -209,6 +241,8 @@ class Scheduler:
             self._log_fh = open(log_path, "a")
 
         self._tick_path: Optional[Path] = tick_path
+        # Bootstrap reads from seed_tick_path (may differ from tick_path when --seed-ticks is used)
+        self._seed_tick_path: Optional[Path] = seed_tick_path if seed_tick_path else tick_path
         self._tick_logger: Optional[TickLogger] = None
         if tick_path:
             self._tick_logger = TickLogger(tick_path)
@@ -220,6 +254,14 @@ class Scheduler:
     async def run(self) -> None:
         self._running = True
 
+        # Live-orders mode needs an aiohttp session for order placement.
+        if self._live_orders:
+            self._session = aiohttp.ClientSession()
+            print(f"  *** LIVE ORDERS ENABLED ***", flush=True)
+            print(f"  Wallet (real Kalshi balance): ${self._starting_wallet:,.2f}", flush=True)
+            print(f"  Max bet per trade:            ${self._max_bet_usd:,.2f}", flush=True)
+            print(f"  Daily loss circuit breaker:   ${-self._daily_loss_cap:,.2f}", flush=True)
+
         # Warm-start: replay logs/ticks.csv so the model is fit immediately
         # instead of waiting 6+ minutes of live data accumulation.
         n_loaded = self._bootstrap_from_history()
@@ -227,9 +269,9 @@ class Scheduler:
             try:
                 X, y, ts_ns = self._buf.get_arrays()
                 diag = self._model.fit(X, y, ts_ns)
-                print(f"  [Bootstrap] {n_loaded} samples loaded -> initial fit "
-                      f"R2_cv={diag.r2_cv:.3f}  R2_hld={diag.r2_held_out:.3f}  "
-                      f"lag={diag.estimated_lag_s:.0f}s", flush=True)
+                self._on_refit(diag)
+                print(f"  [Bootstrap] {n_loaded} samples loaded (see [Refit] above)",
+                      flush=True)
             except Exception as e:
                 print(f"  [Bootstrap] initial fit failed: {e}", flush=True)
         elif n_loaded > 0:
@@ -240,11 +282,16 @@ class Scheduler:
             print(f"  [Bootstrap] no historical ticks found; cold-starting "
                   f"(first fit in ~{MIN_TRAIN_SAMPLES} seconds)", flush=True)
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._sampler_loop())
-            tg.create_task(self._refitter_loop())
-            tg.create_task(self._decision_loop())
-            tg.create_task(self._window_manager_loop())
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._sampler_loop())
+                tg.create_task(self._refitter_loop())
+                tg.create_task(self._decision_loop())
+                tg.create_task(self._window_manager_loop())
+        finally:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
 
     def stop(self) -> None:
         self._running = False
@@ -258,29 +305,32 @@ class Scheduler:
 
     def _bootstrap_from_history(self) -> int:
         """
-        Read self._tick_path, filter to the last TRAINING_WINDOW_S seconds,
-        rebuild feature vectors using the historical lagged microprices, and
-        append them into the training buffer.
-
-        Returns number of samples loaded. Returns 0 if the tick file does
-        not exist, is empty, or is malformed.
+        Read self._tick_path and rebuild feature vectors using the EXACT same
+        logic as scripts/backtest.py: group rows by window_ticker, compute lags
+        only within each window (no cross-window bleed), skip the first 30 rows
+        of each window.  This guarantees the initial live R² matches the backtest.
         """
-        if not self._tick_path or not self._tick_path.exists():
+        if not self._seed_tick_path or not self._seed_tick_path.exists():
             return 0
 
         import csv as _csv
+        import numpy as _np
+        from collections import defaultdict
+
         cutoff_ns = time.time_ns() - TRAINING_WINDOW_S * 1_000_000_000
 
-        rows: list[dict] = []
+        # --- 1. Load all rows from the last TRAINING_WINDOW_S, keyed by window ---
+        windows: dict[str, list[dict]] = defaultdict(list)
         try:
-            with open(self._tick_path, newline="") as f:
+            with open(self._seed_tick_path, newline="") as f:
                 reader = _csv.DictReader(f)
                 for r in reader:
                     try:
                         ts = int(r["ts_ns"])
                         if ts < cutoff_ns:
                             continue
-                        rows.append({
+                        ticker = r.get("window_ticker", "")
+                        windows[ticker].append({
                             "ts_ns":     ts,
                             "btc_micro": float(r["btc_microprice"]),
                             "yes_mid":   float(r["yes_mid"]),
@@ -292,70 +342,74 @@ class Scheduler:
                     except (KeyError, ValueError, TypeError):
                         continue
         except Exception as e:
-            print(f"  [Bootstrap] error reading {self._tick_path}: {e}", flush=True)
+            print(f"  [Bootstrap] error reading {self._seed_tick_path}: {e}", flush=True)
             return 0
 
-        if not rows:
+        if not windows:
             return 0
-        rows.sort(key=lambda r: r["ts_ns"])
 
-        def lagged(field: str, target_ts: int, idx: int) -> float:
-            """Walk backwards from idx to find the row at-or-before target_ts."""
-            for j in range(idx - 1, -1, -1):
-                if rows[j]["ts_ns"] <= target_ts:
-                    return rows[j][field]
-            return rows[0][field]
-
+        # --- 2. For each window, sort by ts and compute features within-window only ---
         n_loaded = 0
-        for i, r in enumerate(rows):
-            # Need at least ~30s of preceding history for lag features
-            if i < 30:
-                continue
-            K        = r["K"]
-            mp_now   = r["btc_micro"]
-            yes_mid  = r["yes_mid"]
-            if K <= 0 or mp_now <= 0 or yes_mid <= 0 or yes_mid >= 1:
-                continue
-            # Same training filter as the live sampler: skip extreme tails
-            if not (TRAIN_YES_MID_MIN <= yes_mid <= TRAIN_YES_MID_MAX):
-                continue
+        for ticker, rows in windows.items():
+            rows.sort(key=lambda r: r["ts_ns"])
 
-            ts = r["ts_ns"]
-            mp15  = lagged("btc_micro", ts -  15 * 1_000_000_000, i)
-            mp30  = lagged("btc_micro", ts -  30 * 1_000_000_000, i)
-            mp60  = lagged("btc_micro", ts -  60 * 1_000_000_000, i)
-            mp90  = lagged("btc_micro", ts -  90 * 1_000_000_000, i)
-            mp120 = lagged("btc_micro", ts - 120 * 1_000_000_000, i)
-            ym30  = lagged("yes_mid",   ts -  30 * 1_000_000_000, i)
+            def lagged_in_window(field: str, target_ts: int, idx: int) -> float:
+                """Walk backwards within this window only."""
+                for j in range(idx - 1, -1, -1):
+                    if rows[j]["ts_ns"] <= target_ts:
+                        return rows[j][field]
+                return rows[0][field]
 
-            try:
-                x_0   = math.log(mp_now / K)
-                x_15  = math.log(mp15   / K) if mp15  > 0 else x_0
-                x_30  = math.log(mp30   / K) if mp30  > 0 else x_0
-                x_60  = math.log(mp60   / K) if mp60  > 0 else x_0
-                x_90  = math.log(mp90   / K) if mp90  > 0 else x_0
-                x_120 = math.log(mp120  / K) if mp120 > 0 else x_0
-            except (ValueError, ZeroDivisionError):
-                continue
+            for i, r in enumerate(rows):
+                # Skip first 30 rows of each window — lag features aren't valid yet
+                if i < 30:
+                    continue
+                K       = r["K"]
+                mp_now  = r["btc_micro"]
+                yes_mid = r["yes_mid"]
+                if K <= 0 or mp_now <= 0:
+                    continue
+                if not (TRAIN_YES_MID_MIN <= yes_mid <= TRAIN_YES_MID_MAX):
+                    continue
 
-            tau          = max(1.0, r["tau_s"])
-            inv_sqrt_tau = 1.0 / math.sqrt(tau + 1.0)
-            spot_mom_30  = math.log(mp_now / mp30) if mp30 > 0 else 0.0
-            spot_mom_60  = math.log(mp_now / mp60) if mp60 > 0 else 0.0
-            kalshi_spr   = max(0.0, r["yes_ask"] - r["yes_bid"])
-            kalshi_mom   = yes_mid - ym30
+                ts    = r["ts_ns"]
+                mp5   = lagged_in_window("btc_micro", ts -  5 * 1_000_000_000, i)
+                mp10  = lagged_in_window("btc_micro", ts - 10 * 1_000_000_000, i)
+                mp15  = lagged_in_window("btc_micro", ts - 15 * 1_000_000_000, i)
+                mp20  = lagged_in_window("btc_micro", ts - 20 * 1_000_000_000, i)
+                mp25  = lagged_in_window("btc_micro", ts - 25 * 1_000_000_000, i)
+                mp30  = lagged_in_window("btc_micro", ts - 30 * 1_000_000_000, i)
+                ym5   = lagged_in_window("yes_mid",   ts -  5 * 1_000_000_000, i)
+                ym10  = lagged_in_window("yes_mid",   ts - 10 * 1_000_000_000, i)
+                ym30  = lagged_in_window("yes_mid",   ts - 30 * 1_000_000_000, i)
 
-            import numpy as _np
-            X = _np.array([
-                x_0, x_15, x_30, x_60, x_90, x_120,
-                tau, inv_sqrt_tau,
-                spot_mom_30, spot_mom_60,
-                kalshi_spr, kalshi_mom,
-            ], dtype=_np.float64)
-            y = _logit(yes_mid)
+                try:
+                    x_0  = math.log(mp_now / K)
+                    x_5  = math.log(mp5  / K) if mp5  > 0 else x_0
+                    x_10 = math.log(mp10 / K) if mp10 > 0 else x_0
+                    x_15 = math.log(mp15 / K) if mp15 > 0 else x_0
+                    x_20 = math.log(mp20 / K) if mp20 > 0 else x_0
+                    x_25 = math.log(mp25 / K) if mp25 > 0 else x_0
+                    x_30 = math.log(mp30 / K) if mp30 > 0 else x_0
+                except (ValueError, ZeroDivisionError):
+                    continue
 
-            self._buf.append_with_ts(X, y, ts)
-            n_loaded += 1
+                tau          = max(1.0, r["tau_s"])
+                inv_sqrt_tau = 1.0 / math.sqrt(tau + 1.0)
+                kalshi_spr   = max(0.0, r["yes_ask"] - r["yes_bid"])
+                kalshi_mom_5  = yes_mid - ym5
+                kalshi_mom_10 = yes_mid - ym10
+                kalshi_mom_30 = yes_mid - ym30
+
+                X = _np.array([
+                    x_0, x_5, x_10, x_15, x_20, x_25, x_30,
+                    tau, inv_sqrt_tau,
+                    kalshi_spr, kalshi_mom_5, kalshi_mom_10, kalshi_mom_30,
+                ], dtype=_np.float64)
+                y = _logit(yes_mid)
+
+                self._buf.append_with_ts(X, y, ts)
+                n_loaded += 1
 
         return n_loaded
 
@@ -369,10 +423,20 @@ class Scheduler:
             try:
                 cb, kb = self._cb, self._kb
                 fv = build_features(cb, kb)
-                # Only train on the uncertain-middle regime; extreme tails
-                # (p>0.95 or p<0.05) are dominated by end-of-window resolution
-                # noise rather than the lag-arb signal we want to learn.
-                if (fv is not None and fv.complete
+
+                # Detect window change and reset warmup timer
+                cur_ticker = kb.ticker
+                if cur_ticker != self._sampler_ticker:
+                    self._sampler_ticker = cur_ticker
+                    self._sampler_window_start = t0
+
+                # Skip first 30s of samples after window switch — lag features
+                # (x_5..x_30) still contain microprice from the prior window,
+                # which poisons the regression the same way it does in the backtest.
+                secs_since_window_start = t0 - self._sampler_window_start
+                window_warmed = secs_since_window_start >= 30.0
+
+                if (fv is not None and fv.complete and window_warmed
                         and TRAIN_YES_MID_MIN <= kb.yes_mid <= TRAIN_YES_MID_MAX):
                     y = _logit(kb.yes_mid)
                     self._buf.append(fv.as_array(), y)
@@ -410,20 +474,26 @@ class Scheduler:
             try:
                 X, y, ts_ns = self._buf.get_arrays()
                 if len(y) >= MIN_TRAIN_SAMPLES:
-                    diag = await asyncio.get_event_loop().run_in_executor(
-                        None, self._model.fit, X, y, ts_ns
+                    diag, accepted = await asyncio.get_event_loop().run_in_executor(
+                        None, self._model.fit_if_better, X, y, ts_ns
                     )
-                    self._on_refit(diag)
+                    self._on_refit(diag, accepted)
             except Exception as e:
                 log.warning("refit error: %s", e)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, REFIT_INTERVAL_S - elapsed))
 
-    def _on_refit(self, diag: ModelDiagnostics) -> None:
+    def _on_refit(self, diag: ModelDiagnostics, accepted: bool = True) -> None:
+        coef_str = "  ".join(
+            f"{name}={diag.coefs[name]:+.3f}" for name in diag.coefs
+        )
+        status = "ACCEPTED" if accepted else "REJECTED (kept prior model)"
         print(
-            f"\n[Refit] n={diag.n_train} alpha={diag.ridge_alpha:.3f} "
-            f"R2_cv={diag.r2_cv:.3f} R2_hld={diag.r2_held_out:.3f} "
-            f"lag={diag.estimated_lag_s:.0f}s dCoef={diag.coef_delta_l2:.3f}",
+            f"\n[Refit]  n={diag.n_train}  alpha={diag.ridge_alpha:.4f}  "
+            f"R2_in={diag.r2_in_sample:.3f}  R2_cv={diag.r2_cv:.3f}  "
+            f"R2_hld={diag.r2_held_out:.3f}  lag={diag.estimated_lag_s:.0f}s  "
+            f"[{status}]"
+            f"\n         {coef_str}",
             flush=True,
         )
 
@@ -435,13 +505,13 @@ class Scheduler:
         while self._running:
             t0 = time.monotonic()
             try:
-                self._tick()
+                await self._tick()
             except Exception as e:
                 log.warning("decision tick error: %s", e)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, DECISION_INTERVAL_S - elapsed))
 
-    def _tick(self) -> None:
+    async def _tick(self) -> None:
         now_ns   = time.time_ns()
         kb       = self._kb
         cb       = self._cb
@@ -455,7 +525,7 @@ class Scheduler:
                 edge_magnitude=-99.0, favored_side=None,
                 event="abstain", abstention_reason="data_not_ready",
                 tier=0, would_bet_usd=0.0, has_open=self._pos is not None,
-                model_r2_cv=model.r2_cv, model_lag_s=model.estimated_lag_s,
+                model_r2_hld=model.r2_held_out, model_lag_s=model.estimated_lag_s,
                 window_ticker=kb.ticker,
             ))
             return
@@ -474,7 +544,12 @@ class Scheduler:
         if model.stale_s() > 900:
             self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "model_stale")
             return
-        if model.r2_cv < 0.10:
+        # Gate on held-out R² only. R2_cv from TimeSeriesSplit is unreliable
+        # when training data spans multiple windows — CV fold boundaries land
+        # on window transitions where lag features are stale, pushing CV score
+        # to -0.5 even when the model is excellent (R2_hld > 0.85).
+        # R2_hld is the clean signal: last 20% of training data, no bleed.
+        if model.r2_held_out < 0.20:
             self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "model_low_r2")
             return
         if fv is None or not fv.complete:
@@ -496,8 +571,10 @@ class Scheduler:
         edge_up_raw  = q_set - yes_ask
         edge_no_raw  = (1.0 - q_set) - (1.0 - yes_bid)  # buying No = selling Yes at bid
 
-        fee_up   = _fee(yes_ask)
-        fee_no   = _fee(1.0 - yes_bid)
+        # Entry-leg fee depends on ENTRY_MODE (0 for maker, taker fee for taker).
+        # Exit leg is always taker -- not in this calc, applied at exit time.
+        fee_up   = _entry_fee(yes_ask)
+        fee_no   = _entry_fee(1.0 - yes_bid)
 
         # Use a rough intended size for slippage estimate
         rough_size = self._wallet * KELLY_TIERS[-1][1]
@@ -516,10 +593,16 @@ class Scheduler:
 
         edge_mag = abs(edge_signed)
 
+        # ---- Daily loss circuit breaker ----
+        if self._halted:
+            self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "halted_daily_loss")
+            return
+
         # ---- Open position: run exit logic ----
         if self._pos is not None:
-            self._evaluate_exit(now_ns, tau, yes_bid, yes_ask, yes_mid,
-                                q_pred, q_set, edge_up_raw, edge_up_net, edge_mag, favored)
+            await self._evaluate_exit(now_ns, tau, yes_bid, yes_ask, yes_mid,
+                                       q_pred, q_set, edge_up_raw, edge_up_net,
+                                       edge_mag, favored)
             return
 
         # ---- No position: run entry logic ----
@@ -539,6 +622,12 @@ class Scheduler:
             self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "wide_spread")
             return
 
+        # Rate-limit entries: never place more than one entry per MIN_ENTRY_INTERVAL_S
+        secs_since_entry = time.monotonic() - self._last_entry_t
+        if secs_since_entry < MIN_ENTRY_INTERVAL_S:
+            self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_rate_limited")
+            return
+
         bet_usd, tier = _kelly_size(edge_mag, self._wallet)
         if tier == 0:
             row = DecisionRow(
@@ -548,20 +637,65 @@ class Scheduler:
                 edge_magnitude=edge_mag, favored_side=favored,
                 event="abstain", abstention_reason="edge_below_floor",
                 tier=0, would_bet_usd=0.0, has_open=False,
-                model_r2_cv=model.r2_cv, model_lag_s=model.estimated_lag_s,
+                model_r2_hld=model.r2_held_out, model_lag_s=model.estimated_lag_s,
                 window_ticker=kb.ticker,
             )
             self._log_decision(row)
             self._print_tick(row)
             return
 
-        # Entry
-        entry_price = yes_ask if favored == "yes" else (1.0 - yes_bid)
-        contracts   = bet_usd / max(entry_price, 1e-6)
-        self._pos = Position(
-            side=favored, entry_price=entry_price, entry_tau_s=tau,
-            entry_edge=edge_signed, size_usd=bet_usd, contracts=contracts,
-        )
+        # Entry. Maker fills at the bid (we post a resting limit there);
+        # taker crosses to the ask. For NO positions, the equivalent flip:
+        # maker NO posts at (1 - yes_ask), taker NO crosses at (1 - yes_bid).
+        if ENTRY_MODE == "maker":
+            entry_price = yes_bid if favored == "yes" else (1.0 - yes_ask)
+        else:  # taker
+            entry_price = yes_ask if favored == "yes" else (1.0 - yes_bid)
+
+        # Hard cap: never deploy more than max_bet_usd on a single trade.
+        bet_usd = min(bet_usd, self._max_bet_usd)
+        contracts = bet_usd / max(entry_price, 1e-6)
+
+        # ---- Live order placement (if enabled) ----
+        if self._live_orders:
+            # On Kalshi, "buy YES" crosses to yes_ask; "buy NO" crosses to no_ask=1-yes_bid.
+            if favored == "yes":
+                action, side, price_cents = "buy", "yes", round(yes_ask * 100)
+            else:
+                action, side, price_cents = "buy", "no",  round((1.0 - yes_bid) * 100)
+            count_int = max(1, int(contracts))
+            if count_int < 1:
+                self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "size_too_small")
+                return
+            order = await kalshi_place_order(
+                self._session, self._pk, kb.ticker, action, side, price_cents, count_int,
+            )
+            if not order:
+                log.error(f"ENTRY ORDER REJECTED side={favored} -- staying flat")
+                self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_order_rejected")
+                return
+            filled = int(order.get("filled_count") or 0)
+            if filled <= 0:
+                log.warning(f"Entry order accepted but unfilled (resting): {order}")
+                self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_unfilled")
+                return
+            actual_entry_price = price_cents / 100.0
+            actual_size_usd    = filled * actual_entry_price
+            self._pos = Position(
+                side=favored, entry_price=actual_entry_price, entry_tau_s=tau,
+                entry_edge=edge_signed, size_usd=actual_size_usd, contracts=float(filled),
+            )
+            self._last_entry_t = time.monotonic()
+            print(f"\n  [LIVE ENTRY] side={favored} filled={filled}@{price_cents}c "
+                  f"=${actual_size_usd:.2f} edge={edge_mag:.3f} tier={tier}", flush=True)
+        else:
+            # Dry-run: track an idealised position for P&L bookkeeping.
+            self._pos = Position(
+                side=favored, entry_price=entry_price, entry_tau_s=tau,
+                entry_edge=edge_signed, size_usd=bet_usd, contracts=contracts,
+            )
+            self._last_entry_t = time.monotonic()
+
         row = DecisionRow(
             ts_ns=now_ns, tau_s=tau, yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=yes_mid,
             q_predicted=q_pred, q_settled=q_set,
@@ -569,14 +703,15 @@ class Scheduler:
             edge_magnitude=edge_mag, favored_side=favored,
             event="entry", abstention_reason=None,
             tier=tier, would_bet_usd=bet_usd, has_open=True,
-            model_r2_cv=model.r2_cv, model_lag_s=model.estimated_lag_s,
+            model_r2_hld=model.r2_held_out, model_lag_s=model.estimated_lag_s,
             window_ticker=kb.ticker,
         )
         self._log_decision(row)
         self._print_tick(row)
 
-    def _evaluate_exit(self, now_ns, tau, yes_bid, yes_ask, yes_mid,
-                       q_pred, q_set, edge_up_raw, edge_up_net, edge_mag, favored) -> None:
+    async def _evaluate_exit(self, now_ns, tau, yes_bid, yes_ask, yes_mid,
+                              q_pred, q_set, edge_up_raw, edge_up_net,
+                              edge_mag, favored) -> None:
         pos = self._pos
         if pos is None:
             return
@@ -589,24 +724,71 @@ class Scheduler:
             exit_price = 1.0 - yes_ask
 
         reason = None
+        hold_s = pos.entry_tau_s - tau
         if edge_now < LAG_CLOSE_THRESHOLD:
             reason = "exit_lag_closed"
         elif edge_now < pos.entry_edge - STOP_THRESHOLD:
             reason = "exit_stopped"
+        elif hold_s >= MAX_HOLD_S:
+            reason = "exit_max_hold"
         elif tau < FALLBACK_TAU_S:
             reason = "fallback_resolution"
 
         if reason:
-            gross = pos.contracts * exit_price
-            entry_fee = _fee(pos.entry_price) * pos.size_usd
-            exit_fee  = _fee(exit_price) * gross if "resolution" not in reason else 0.0
-            pnl = gross - pos.size_usd - entry_fee - exit_fee
+            # ---- Live exit order placement ----
+            # On "fallback_resolution" we let the contract settle (no taker
+            # exit, no fees). For lag_closed / stopped / max_hold we hit
+            # the bid as a taker.
+            actual_exit_price = exit_price
+            actual_gross      = pos.contracts * exit_price
+            if self._live_orders and "resolution" not in reason:
+                if pos.side == "yes":
+                    action, side, price_cents = "sell", "yes", round(yes_bid * 100)
+                else:
+                    action, side, price_cents = "sell", "no",  round((1.0 - yes_ask) * 100)
+                count_int = max(1, int(pos.contracts))
+                order = await kalshi_place_order(
+                    self._session, self._pk, self._kb.ticker,
+                    action, side, price_cents, count_int,
+                )
+                if not order:
+                    log.error(f"EXIT ORDER REJECTED reason={reason} -- KEEPING position open, "
+                              f"will retry next tick")
+                    return
+                filled = int(order.get("filled_count") or 0)
+                if filled <= 0:
+                    log.warning(f"Exit order accepted but unfilled (resting); will retry: {order}")
+                    return
+                actual_exit_price = price_cents / 100.0
+                actual_gross      = filled * actual_exit_price
+                if filled < count_int:
+                    log.warning(f"Partial exit fill: {filled}/{count_int} contracts")
+
+            entry_fee = _entry_fee(pos.entry_price) * pos.size_usd
+            exit_fee  = _fee(actual_exit_price) * actual_gross if "resolution" not in reason else 0.0
+            pnl = actual_gross - pos.size_usd - entry_fee - exit_fee
+
+            tag = "LIVE EXIT" if self._live_orders and "resolution" not in reason else "EXIT"
             print(
-                f"\n  [EXIT:{reason}] side={pos.side} entry={pos.entry_price:.3f} "
-                f"exit={exit_price:.3f} pnl={pnl:+.2f} USD hold={pos.entry_tau_s - tau:.0f}s",
+                f"\n  [{tag}:{reason}] side={pos.side} entry={pos.entry_price:.3f} "
+                f"exit={actual_exit_price:.3f} pnl={pnl:+.2f} USD hold={hold_s:.0f}s",
                 flush=True,
             )
             self._pos = None
+
+            # Track realized P&L; halt on daily-loss breach.
+            if self._live_orders:
+                self._realized_pnl += pnl
+                if self._realized_pnl < self._daily_loss_cap and not self._halted:
+                    self._halted = True
+                    log.error(
+                        f"DAILY LOSS LIMIT TRIPPED: realized=${self._realized_pnl:.2f} "
+                        f"<= cap ${self._daily_loss_cap:.2f}. Bot halted."
+                    )
+                    print(
+                        f"\n  *** DAILY LOSS LIMIT TRIPPED: realized=${self._realized_pnl:.2f} "
+                        f"-- HALTING (no new entries) ***", flush=True,
+                    )
 
         row = DecisionRow(
             ts_ns=now_ns, tau_s=tau, yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=yes_mid,
@@ -617,7 +799,7 @@ class Scheduler:
             abstention_reason=None,
             tier=0, would_bet_usd=0.0,
             has_open=self._pos is not None,
-            model_r2_cv=self._model.r2_cv,
+            model_r2_hld=self._model.r2_held_out,
             model_lag_s=self._model.estimated_lag_s,
             window_ticker=self._kb.ticker,
         )
@@ -633,7 +815,7 @@ class Scheduler:
             event="abstain", abstention_reason=reason,
             tier=0, would_bet_usd=0.0,
             has_open=self._pos is not None,
-            model_r2_cv=self._model.r2_cv,
+            model_r2_hld=self._model.r2_held_out,
             model_lag_s=self._model.estimated_lag_s,
             window_ticker=self._kb.ticker,
         )
@@ -723,7 +905,7 @@ class Scheduler:
             "tier":            row.tier,
             "would_bet_usd":   row.would_bet_usd,
             "has_open":        row.has_open,
-            "model_r2_cv":     row.model_r2_cv,
+            "model_r2_hld":    row.model_r2_hld,
             "model_lag_s":     row.model_lag_s,
             "window_ticker":   row.window_ticker,
         }) + "\n")
@@ -745,12 +927,12 @@ class Scheduler:
         print(
             f"[{row.event:22s}] "
             f"tau={row.tau_s:5.0f}s  "
-            f"BTC=${self._cb.microprice:,.0f}  "
+            f"BTC=${self._cb.microprice:,.2f}  "
             f"bid={row.yes_bid:.3f} ask={row.yes_ask:.3f}  "
             f"q_set={q_s} q_pred={q_p}  "
             f"edge={edge_s}  "
             f"buf={buf_n}({buf_min:.1f}m)  "
-            f"R2={row.model_r2_cv:.2f}  "
+            f"R2hld={self._model.r2_held_out:.2f}  "
             f"{cb_ok} {kb_ok}  "
             f"{row.abstention_reason or ''}",
             flush=True,
