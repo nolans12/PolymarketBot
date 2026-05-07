@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-07T08:15:03.788Z",
+  "source": "auto-postool",
+  "partial": false,
+  "phase": null,
+  "phase_name": null,
+  "phase_dir": null,
+  "plan": null,
+  "task": null,
+  "total_tasks": null,
+  "status": "auto-checkpoint",
+  "completed_tasks": [],
+  "remaining_tasks": [],
+  "blockers": [],
+  "human_actions_pending": [],
+  "decisions": [],
+  "uncommitted_files": [
+    {
+      "status": "M",
+      "path": ".claude/settings.local.json"
+    },
+    {
+      "status": "M",
+      "path": ".planning/HANDOFF.json"
+    },
+    {
+      "status": "M",
+      "path": "CLAUDE.md"
+    },
+    {
+      "status": "M",
+      "path": "README.md"
+    },
+    {
+      "status": "M",
+      "path": "RUN.md"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/config.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/features.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/model.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/scheduler.py"
+    },
+    {
+      "status": "D",
+      "path": "betbot/kalshi/training_buffer.py"
+    },
+    {
+      "status": "D",
+      "path": "data/first_run/ticks.csv"
+    },
+    {
+      "status": "D",
+      "path": "data/second_run/ticks.csv"
+    },
+    {
+      "status": "D",
+      "path": "lag_plot_btc.png"
+    },
+    {
+      "status": "M",
+      "path": "requirements.txt"
+    },
+    {
+      "status": "D",
+      "path": "scripts/analysis/backtest.py"
+    },
+    {
+      "status": "D",
+      "path": "scripts/analysis/compare_models.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/analysis/live_plot.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/analysis/replay_window.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/run/run_kalshi_bot.py"
+    },
+    {
+      "status": "??",
+      "path": "data/first_run/ticks_BTC.csv"
+    },
+    {
+      "status": "??",
+      "path": "data/second_run/ticks_BTC.csv"
+    },
+    {
+      "status": "??",
+      "path": "model_fits/"
+    },
+    {
+      "status": "??",
+      "path": "scripts/replay_window.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/test_all.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/train_model.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/tune_trading_knobs.py"
+    }
+  ],
+  "next_action": null,
+  "context_notes": "Recent commits:\n0ca5ba0 before changing model\n285a6c7 multi assets\n5dd7470 only coinbase\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)"
+}

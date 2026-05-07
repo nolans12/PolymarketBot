@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(git check-ignore *)",
+      "Bash(grep -iE \"0x[0-9a-f]{40,}|api.?key|api.?secret|passphrase|private.?key|alchemy|infura\")"
+    ]
+  }
+}
