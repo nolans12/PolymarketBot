@@ -204,11 +204,11 @@ class Scheduler:
                  wallet_usd: float = 1000.0,
                  log_path: Optional[Path] = None,
                  tick_path: Optional[Path] = None,
-                 seed_tick_path: Optional[Path] = None,  # bootstrap from this file (defaults to tick_path)
-                 pk=None,                       # RSA private key for order signing
-                 live_orders: bool = False,     # if True: place real Kalshi orders
-                 max_bet_pct: float = 0.10,     # hard cap: never bet > this % of starting wallet
-                 daily_loss_limit_pct: float = 0.05):  # halt if realized loss > this % of starting wallet
+                 seed_tick_path: Optional[Path] = None,
+                 pk=None,
+                 live_orders: bool = False,
+                 max_bet_pct: float = 0.10,
+                 daily_loss_limit_pct: float = 0.05):
         self._cb        = cb
         self._kb        = kb
         self._ws        = kalshi_feed
@@ -449,6 +449,8 @@ class Scheduler:
                         btc_microprice=cb.microprice,
                         btc_bid=cb.best_bid,
                         btc_ask=cb.best_ask,
+                        cb_microprice=cb.microprice,
+                        bn_microprice=cb.microprice,
                         yes_bid=kb.yes_bid,
                         yes_ask=kb.yes_ask,
                         yes_mid=kb.yes_mid,

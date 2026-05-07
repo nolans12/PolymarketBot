@@ -52,9 +52,11 @@ def read_ticks_tail(path: Path, window_s: float) -> list[dict]:
                     if ts >= cutoff:
                         K = float(r["floor_strike"])
                         rows.append({
-                            "ts":      datetime.datetime.fromtimestamp(ts),
-                            "delta":   float(r["btc_microprice"]) - K,
-                            "yes_mid": (float(r["yes_bid"]) + float(r["yes_ask"])) / 2.0,
+                            "ts":       datetime.datetime.fromtimestamp(ts),
+                            "delta":    float(r["btc_microprice"]) - K,
+                            "cb_delta": float(r.get("cb_microprice") or r["btc_microprice"]) - K,
+                            "bn_delta": float(r.get("bn_microprice") or r["btc_microprice"]) - K,
+                            "yes_mid":  (float(r["yes_bid"]) + float(r["yes_ask"])) / 2.0,
                         })
                 except (KeyError, ValueError):
                     pass
@@ -102,14 +104,16 @@ def redraw(ax_btc, ax_yes, window_s: float) -> None:
         ax_btc.set_title("Waiting for data from bot...")
         return
 
-    ts      = [r["ts"]      for r in ticks]
-    delta   = [r["delta"]   for r in ticks]
-    yes_mid = [r["yes_mid"] for r in ticks]
+    ts       = [r["ts"]       for r in ticks]
+    cb_delta = [r["cb_delta"] for r in ticks]
+    bn_delta = [r["bn_delta"] for r in ticks]
+    yes_mid  = [r["yes_mid"]  for r in ticks]
 
-    # BTC delta-from-strike on left axis
-    ax_btc.plot(ts, delta, color="steelblue", lw=1.3, label="BTC − strike")
-    ax_btc.axhline(0, color="steelblue", lw=0.7, linestyle="--", alpha=0.5)
-    ax_btc.set_ylabel("BTC − strike (USD)", color="steelblue")
+    # Both feeds delta-from-strike on left axis
+    ax_btc.plot(ts, cb_delta, color="steelblue",  lw=1.2, label="Coinbase − strike")
+    ax_btc.plot(ts, bn_delta, color="darkorchid", lw=1.2, label="Binance − strike", alpha=0.8)
+    ax_btc.axhline(0, color="gray", lw=0.7, linestyle="--", alpha=0.5)
+    ax_btc.set_ylabel("BTC − strike (USD)", color="gray")
     ax_btc.tick_params(axis="y", labelcolor="steelblue")
 
     # Kalshi YES mid on right axis

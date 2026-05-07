@@ -49,7 +49,8 @@
       "Bash(python scripts/test_maker_trade.py --dry-run --ttl 4 --hold-s 2)",
       "Bash(python scripts/test_maker_trade.py --dry-run --ttl 3 --hold-s 1)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/compare_models.py'\\).read\\(\\)\\); print\\('parse ok'\\)\")",
-      "Bash(python scripts/compare_models.py --mode filters --theta-fee 0.07)"
+      "Bash(python scripts/compare_models.py --mode filters --theta-fee 0.07)",
+      "Bash(python -c \"from betbot.kalshi.scheduler import Scheduler; print\\('OK'\\)\")"
     ]
   }
 }

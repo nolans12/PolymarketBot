@@ -10,16 +10,18 @@ import threading
 from pathlib import Path
 
 COLUMNS = [
-    "ts_ns",          # wall-clock nanoseconds
-    "tau_s",          # seconds until window close
-    "btc_microprice", # Coinbase imbalance-weighted fair value
-    "btc_bid",        # Coinbase best bid
-    "btc_ask",        # Coinbase best ask
-    "yes_bid",        # Kalshi YES best bid (dollars)
-    "yes_ask",        # Kalshi YES best ask (dollars)
-    "yes_mid",        # (yes_bid + yes_ask) / 2
-    "floor_strike",   # K — BTC price at window open (Chainlink)
-    "window_ticker",  # e.g. KXBTC15M-26MAY061515-15
+    "ts_ns",              # wall-clock nanoseconds
+    "tau_s",              # seconds until window close
+    "btc_microprice",     # primary spot feed (SPOT_SOURCE) microprice
+    "btc_bid",            # primary spot feed best bid
+    "btc_ask",            # primary spot feed best ask
+    "cb_microprice",      # Coinbase microprice (always logged, even when SPOT_SOURCE=binance)
+    "bn_microprice",      # Binance microprice (always logged, even when SPOT_SOURCE=coinbase)
+    "yes_bid",            # Kalshi YES best bid (dollars)
+    "yes_ask",            # Kalshi YES best ask (dollars)
+    "yes_mid",            # (yes_bid + yes_ask) / 2
+    "floor_strike",       # K — BTC strike for this window
+    "window_ticker",      # e.g. KXBTC15M-26MAY061515-15
 ]
 
 
@@ -37,6 +39,7 @@ class TickLogger:
 
     def log(self, ts_ns: int, tau_s: float,
             btc_microprice: float, btc_bid: float, btc_ask: float,
+            cb_microprice: float, bn_microprice: float,
             yes_bid: float, yes_ask: float, yes_mid: float,
             floor_strike: float, window_ticker: str) -> None:
         with self._lock:
@@ -46,6 +49,8 @@ class TickLogger:
                 f"{btc_microprice:.2f}",
                 f"{btc_bid:.2f}",
                 f"{btc_ask:.2f}",
+                f"{cb_microprice:.2f}",
+                f"{bn_microprice:.2f}",
                 f"{yes_bid:.4f}",
                 f"{yes_ask:.4f}",
                 f"{yes_mid:.4f}",

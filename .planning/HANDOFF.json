@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-07T05:18:37.232Z",
+  "timestamp": "2026-05-07T05:27:49.884Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -26,57 +26,21 @@
     },
     {
       "status": "M",
-      "path": "betbot/kalshi/config.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/features.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/kalshi_rest_feed.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/model.py"
-    },
-    {
-      "status": "M",
       "path": "betbot/kalshi/scheduler.py"
     },
     {
       "status": "M",
-      "path": "lag_plot_btc.png"
+      "path": "betbot/kalshi/tick_logger.py"
     },
     {
       "status": "M",
-      "path": "scripts/analyze_run.py"
-    },
-    {
-      "status": "M",
-      "path": "scripts/backtest.py"
+      "path": "scripts/live_plot.py"
     },
     {
       "status": "M",
       "path": "scripts/run_kalshi_bot.py"
-    },
-    {
-      "status": "??",
-      "path": "betbot/kalshi/orders.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/compare_models.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/live_plot.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/test_maker_trade.py"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)\na2d5e0c Remove Polymarket-era dead code and tidy project metadata\n4495407 before everything\ne65170e update for enter as maker, exit as taker\nf43aa8d update .md with instructions"
+  "context_notes": "Recent commits:\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)\na2d5e0c Remove Polymarket-era dead code and tidy project metadata\n4495407 before everything\ne65170e update for enter as maker, exit as taker"
 }

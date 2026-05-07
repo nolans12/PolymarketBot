@@ -142,7 +142,6 @@ async def main():
     elif SPOT_SOURCE == "binance":
         spot_feed = BinanceFeed(spot_book)
     else:
-        # config.py validates this on import; this branch is unreachable.
         raise RuntimeError(f"Unknown SPOT_SOURCE: {SPOT_SOURCE!r}")
     kalshi_feed = KalshiRestFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
 
@@ -174,7 +173,7 @@ async def main():
                           max_bet_pct=args.max_bet_pct,
                           daily_loss_limit_pct=args.daily_loss_pct)
 
-    print(f"  Starting feeds ({SPOT_SOURCE} WS + Kalshi REST 1Hz polling)...\n", flush=True)
+    print(f"  Starting feeds ({SPOT_SOURCE} WS + Kalshi REST polling)...\n", flush=True)
 
     try:
         async with asyncio.TaskGroup() as tg:
