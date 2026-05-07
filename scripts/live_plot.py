@@ -1,23 +1,24 @@
 """
-live_plot.py — Live dual-axis rolling chart.
+live_plot.py — Live multi-asset rolling chart.
 
-Top axis : Coinbase BTC microprice (left y) + Kalshi YES mid (right y)
-Markers  : green ^ on entry, red v on exit
+One subplot per asset (BTC, ETH, SOL, XRP).
+Each subplot: left axis = spot microprice − floor_strike, right axis = Kalshi YES mid.
+Markers: green ^ on entry, red v on exit.
 
-Reads logs/ticks.csv (1Hz, written by the bot) for prices and
-logs/decisions.jsonl for trade events. Keeps a 15-minute rolling window.
+Reads logs/ticks_<ASSET>.csv and logs/decisions_<ASSET>.jsonl per asset.
+Falls back to logs/ticks.csv / logs/decisions.jsonl for single-asset (BTC-only) runs.
 
 Usage:
-  python scripts/live_plot.py
-  python scripts/live_plot.py --window 10   # 10-minute window
-  python scripts/live_plot.py --interval 2  # refresh every 2s
+  python scripts/live_plot.py                        # all 4 assets
+  python scripts/live_plot.py --assets BTC ETH       # subset
+  python scripts/live_plot.py --window 60            # 60-minute rolling window (default)
+  python scripts/live_plot.py --interval 2           # refresh every 2s
 """
 
 import argparse
 import csv
 import json
 import time
-from collections import deque
 from pathlib import Path
 
 import matplotlib
@@ -25,12 +26,34 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.animation as animation
-import numpy as np
 import datetime
 
+LOG_DIR = Path("logs")
 
-TICKS_PATH     = Path("logs/ticks.csv")
-DECISIONS_PATH = Path("logs/decisions.jsonl")
+ASSET_COLORS = {
+    "BTC": "steelblue",
+    "ETH": "mediumseagreen",
+    "SOL": "darkorchid",
+    "XRP": "darkorange",
+}
+
+
+# ---------------------------------------------------------------------------
+# Per-asset file paths (fall back to legacy single-asset names for BTC)
+# ---------------------------------------------------------------------------
+
+def ticks_path(asset: str) -> Path:
+    p = LOG_DIR / f"ticks_{asset}.csv"
+    if not p.exists() and asset == "BTC":
+        return LOG_DIR / "ticks.csv"
+    return p
+
+
+def decisions_path(asset: str) -> Path:
+    p = LOG_DIR / f"decisions_{asset}.jsonl"
+    if not p.exists() and asset == "BTC":
+        return LOG_DIR / "decisions.jsonl"
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +61,6 @@ DECISIONS_PATH = Path("logs/decisions.jsonl")
 # ---------------------------------------------------------------------------
 
 def read_ticks_tail(path: Path, window_s: float) -> list[dict]:
-    """Read ticks.csv rows from the last window_s seconds."""
     if not path.exists():
         return []
     cutoff = time.time() - window_s
@@ -52,11 +74,9 @@ def read_ticks_tail(path: Path, window_s: float) -> list[dict]:
                     if ts >= cutoff:
                         K = float(r["floor_strike"])
                         rows.append({
-                            "ts":       datetime.datetime.fromtimestamp(ts),
-                            "delta":    float(r["btc_microprice"]) - K,
-                            "cb_delta": float(r.get("cb_microprice") or r["btc_microprice"]) - K,
-                            "bn_delta": float(r.get("bn_microprice") or r["btc_microprice"]) - K,
-                            "yes_mid":  (float(r["yes_bid"]) + float(r["yes_ask"])) / 2.0,
+                            "ts":      datetime.datetime.fromtimestamp(ts),
+                            "delta":   float(r["btc_microprice"]) - K,
+                            "yes_mid": (float(r["yes_bid"]) + float(r["yes_ask"])) / 2.0,
                         })
                 except (KeyError, ValueError):
                     pass
@@ -66,7 +86,6 @@ def read_ticks_tail(path: Path, window_s: float) -> list[dict]:
 
 
 def read_decisions_tail(path: Path, window_s: float) -> list[dict]:
-    """Read decision rows from the last window_s seconds."""
     if not path.exists():
         return []
     cutoff = time.time() - window_s
@@ -79,8 +98,7 @@ def read_decisions_tail(path: Path, window_s: float) -> list[dict]:
                     continue
                 try:
                     r = json.loads(line)
-                    ts = r["ts_ns"] / 1e9
-                    if ts >= cutoff:
+                    if r["ts_ns"] / 1e9 >= cutoff:
                         rows.append(r)
                 except Exception:
                     pass
@@ -90,71 +108,65 @@ def read_decisions_tail(path: Path, window_s: float) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Draw
+# Per-asset subplot draw
 # ---------------------------------------------------------------------------
 
-def redraw(ax_btc, ax_yes, window_s: float) -> None:
-    ax_btc.cla()
+def redraw_asset(ax_spot, ax_yes, asset: str, window_s: float, color: str) -> None:
+    ax_spot.cla()
     ax_yes.cla()
 
-    ticks     = read_ticks_tail(TICKS_PATH, window_s)
-    decisions = read_decisions_tail(DECISIONS_PATH, window_s)
+    ticks     = read_ticks_tail(ticks_path(asset), window_s)
+    decisions = read_decisions_tail(decisions_path(asset), window_s)
 
     if not ticks:
-        ax_btc.set_title("Waiting for data from bot...")
+        ax_spot.set_title(f"{asset} — waiting for data...", fontsize=10)
+        ax_spot.set_ylabel("spot − strike (USD)", color="gray", fontsize=8)
         return
 
-    ts       = [r["ts"]       for r in ticks]
-    cb_delta = [r["cb_delta"] for r in ticks]
-    bn_delta = [r["bn_delta"] for r in ticks]
-    yes_mid  = [r["yes_mid"]  for r in ticks]
+    ts      = [r["ts"]      for r in ticks]
+    delta   = [r["delta"]   for r in ticks]
+    yes_mid = [r["yes_mid"] for r in ticks]
 
-    # Both feeds delta-from-strike on left axis
-    ax_btc.plot(ts, cb_delta, color="steelblue",  lw=1.2, label="Coinbase − strike")
-    ax_btc.plot(ts, bn_delta, color="darkorchid", lw=1.2, label="Binance − strike", alpha=0.8)
-    ax_btc.axhline(0, color="gray", lw=0.7, linestyle="--", alpha=0.5)
-    ax_btc.set_ylabel("BTC − strike (USD)", color="gray")
-    ax_btc.tick_params(axis="y", labelcolor="steelblue")
+    ax_spot.plot(ts, delta, color=color, lw=1.1, label=f"{asset} − strike")
+    ax_spot.axhline(0, color="gray", lw=0.7, linestyle="--", alpha=0.5)
+    ax_spot.set_ylabel("spot − strike (USD)", color=color, fontsize=8)
+    ax_spot.tick_params(axis="y", labelcolor=color, labelsize=7)
 
-    # Kalshi YES mid on right axis
-    ax_yes.plot(ts, yes_mid, color="darkorange", lw=1.3, label="Kalshi YES mid")
-    ax_yes.axhline(0.5, color="darkorange", lw=0.7, linestyle="--", alpha=0.4)
-    ax_yes.set_ylabel("Kalshi YES probability", color="darkorange")
-    ax_yes.tick_params(axis="y", labelcolor="darkorange")
+    ax_yes.plot(ts, yes_mid, color="darkorange", lw=1.1, label="YES mid")
+    ax_yes.axhline(0.5, color="darkorange", lw=0.6, linestyle="--", alpha=0.4)
+    ax_yes.set_ylabel("YES prob", color="darkorange", fontsize=8)
+    ax_yes.tick_params(axis="y", labelcolor="darkorange", labelsize=7)
     ax_yes.set_ylim(0, 1)
 
-    # Entry / exit markers — plotted on the YES axis
-    entry_rows = [r for r in decisions if r["event"] == "entry"]
-    exit_rows  = [r for r in decisions if r["event"] in
+    entry_rows = [r for r in decisions if r.get("event") == "entry"]
+    exit_rows  = [r for r in decisions if r.get("event") in
                   ("exit_lag_closed", "exit_stopped", "exit_max_hold", "fallback_resolution")]
 
     if entry_rows:
         ex = [datetime.datetime.fromtimestamp(r["ts_ns"] / 1e9) for r in entry_rows]
         ey = [r["yes_ask"] for r in entry_rows]
-        ax_yes.scatter(ex, ey, marker="^", color="green", s=120, zorder=6, label="entry")
+        ax_yes.scatter(ex, ey, marker="^", color="green", s=80, zorder=6, label="entry")
 
     if exit_rows:
         xx = [datetime.datetime.fromtimestamp(r["ts_ns"] / 1e9) for r in exit_rows]
         xy = [r["yes_bid"] for r in exit_rows]
-        ax_yes.scatter(xx, xy, marker="v", color="red", s=120, zorder=6, label="exit")
+        ax_yes.scatter(xx, xy, marker="v", color="red", s=80, zorder=6, label="exit")
 
-    # X axis formatting
-    ax_btc.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax_btc.grid(alpha=0.25)
+    ax_spot.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax_spot.grid(alpha=0.2)
+    ax_spot.tick_params(axis="x", labelsize=7)
 
-    # Combined legend
-    h1, l1 = ax_btc.get_legend_handles_labels()
-    h2, l2 = ax_yes.get_legend_handles_labels()
-    ax_yes.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
-
+    n_e = len(entry_rows)
+    n_x = len(exit_rows)
     now_str = datetime.datetime.now().strftime("%H:%M:%S")
-    n_entries = len(entry_rows)
-    n_exits   = len(exit_rows)
-    ax_btc.set_title(
-        f"Kalshi BTC  —  {n_entries} entries  {n_exits} exits  "
-        f"(last {window_s//60:.0f} min)  [{now_str}]",
-        fontsize=11,
+    ax_spot.set_title(
+        f"{asset}  —  {n_e} entries  {n_x} exits  [{now_str}]",
+        fontsize=10,
     )
+
+    h1, l1 = ax_spot.get_legend_handles_labels()
+    h2, l2 = ax_yes.get_legend_handles_labels()
+    ax_yes.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
 
 
 # ---------------------------------------------------------------------------
@@ -163,21 +175,35 @@ def redraw(ax_btc, ax_yes, window_s: float) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window",   type=int, default=15,
-                        help="Rolling window in minutes (default 15)")
+    parser.add_argument("--assets",   nargs="+", default=["BTC", "ETH", "SOL", "XRP"],
+                        help="Assets to show (default: BTC ETH SOL XRP)")
+    parser.add_argument("--window",   type=int, default=60,
+                        help="Rolling window in minutes (default 60)")
     parser.add_argument("--interval", type=int, default=2,
                         help="Refresh interval in seconds (default 2)")
     args = parser.parse_args()
 
+    assets   = [a.upper() for a in args.assets]
     window_s = args.window * 60
+    n        = len(assets)
 
-    fig, ax_btc = plt.subplots(figsize=(14, 5))
-    ax_yes = ax_btc.twinx()
-    fig.tight_layout(pad=2.5)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n), sharex=False)
+    if n == 1:
+        axes = [axes]
+
+    # Each row has a twinx; store (ax_spot, ax_yes) pairs
+    ax_pairs = []
+    for ax in axes:
+        ax_yes = ax.twinx()
+        ax_pairs.append((ax, ax_yes))
+
+    fig.tight_layout(pad=2.5, h_pad=3.0)
 
     def _update(_frame):
-        redraw(ax_btc, ax_yes, window_s)
-        fig.tight_layout(pad=2.5)
+        for (ax_spot, ax_yes), asset in zip(ax_pairs, assets):
+            color = ASSET_COLORS.get(asset, "steelblue")
+            redraw_asset(ax_spot, ax_yes, asset, window_s, color)
+        fig.tight_layout(pad=2.5, h_pad=3.0)
 
     _update(0)
     ani = animation.FuncAnimation(

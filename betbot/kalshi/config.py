@@ -21,8 +21,22 @@ KALSHI_KEY_ID   = os.getenv("KALSHI_API_KEY_ID", "").strip()
 KALSHI_PEM_FILE = os.getenv("KALSHI_PRIVATE_KEY_FILE", "")
 KALSHI_PEM_INLINE = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
 
-# 15-min BTC Up/Down series
-KALSHI_SERIES   = "KXBTC15M"
+# 15-min Up/Down series per asset
+KALSHI_SERIES_BTC = "KXBTC15M"
+KALSHI_SERIES_ETH = "KXETH15M"
+KALSHI_SERIES_SOL = "KXSOL15M"
+KALSHI_SERIES_XRP = "KXXRP15M"
+
+# Default series (used by single-asset mode)
+KALSHI_SERIES = KALSHI_SERIES_BTC
+
+# All assets the multi-asset bot trades
+KALSHI_ASSETS = {
+    "BTC": KALSHI_SERIES_BTC,
+    "ETH": KALSHI_SERIES_ETH,
+    "SOL": KALSHI_SERIES_SOL,
+    "XRP": KALSHI_SERIES_XRP,
+}
 
 # ---------------------------------------------------------------------------
 # Spot feed (Coinbase or Binance — picks via SPOT_SOURCE env var)
@@ -40,6 +54,14 @@ if SPOT_SOURCE not in ("coinbase", "binance"):
 
 COINBASE_WS      = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_PRODUCT = "BTC-USD"
+
+# Coinbase product IDs per asset (used by multi-asset mode)
+COINBASE_PRODUCTS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+}
 
 BINANCE_WS       = "wss://stream.binance.com:443/ws/btcusdt@bookTicker"
 BINANCE_PRODUCT  = "BTCUSDT"
@@ -67,7 +89,7 @@ LOOKBACK_S = [0, 5, 10, 15, 20, 25, 30]
 SAMPLE_INTERVAL_S      = 0.1          # add training sample every 100ms
 REFIT_INTERVAL_S       = 300          # refit model every 5 minutes
 TRAINING_WINDOW_S      = 4 * 3600     # rolling 4-hour training window
-MIN_TRAIN_SAMPLES      = 3600        # first fit after ~6 min at 10 samples/s
+MIN_TRAIN_SAMPLES      = 18000        # first fit after ~30 min at 10 samples/s
 RIDGE_ALPHAS           = [0.001, 0.01, 0.1, 1.0, 10.0]
 HELDOUT_FRACTION       = 0.20         # hold out last 20% for out-of-sample R²
 

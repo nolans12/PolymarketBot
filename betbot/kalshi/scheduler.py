@@ -31,6 +31,7 @@ from betbot.kalshi.config import (
     TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX,
     DECISION_YES_MID_MIN, DECISION_YES_MID_MAX,
     ENTRY_MODE, MAX_HOLD_S, MIN_ENTRY_INTERVAL_S,
+    COINBASE_STALE_MS_MAX, KALSHI_STALE_MS_MAX,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
 from betbot.kalshi.orders import place_order as kalshi_place_order
@@ -208,7 +209,8 @@ class Scheduler:
                  pk=None,
                  live_orders: bool = False,
                  max_bet_pct: float = 0.10,
-                 daily_loss_limit_pct: float = 0.05):
+                 daily_loss_limit_pct: float = 0.05,
+                 series: str = KALSHI_SERIES):
         self._cb        = cb
         self._kb        = kb
         self._ws        = kalshi_feed
@@ -224,6 +226,7 @@ class Scheduler:
         self._realized_pnl    = 0.0
         self._halted          = False
 
+        self._series  = series
         self._model   = KalshiRegressionModel()
         self._buf     = TrainingBuffer(window_s=TRAINING_WINDOW_S)
         self._pos:    Optional[Position] = None
@@ -436,7 +439,10 @@ class Scheduler:
                 secs_since_window_start = t0 - self._sampler_window_start
                 window_warmed = secs_since_window_start >= 30.0
 
+                cb_fresh = cb.stale_ms() < COINBASE_STALE_MS_MAX
+                kb_fresh = kb.stale_ms() < KALSHI_STALE_MS_MAX
                 if (fv is not None and fv.complete and window_warmed
+                        and cb_fresh and kb_fresh
                         and TRAIN_YES_MID_MIN <= kb.yes_mid <= TRAIN_YES_MID_MAX):
                     y = _logit(kb.yes_mid)
                     self._buf.append(fv.as_array(), y)
@@ -837,7 +843,7 @@ class Scheduler:
 
             # Pre-discover next window when < 2 min remaining
             if tau < 120 and next_mkt is None:
-                mkt = await _discover_market()
+                mkt = await _discover_market(self._series)
                 if mkt and mkt["ticker"] != self._kb.ticker:
                     next_mkt = mkt
                     log.info("pre-discovered next window: %s", mkt["ticker"])
@@ -848,21 +854,18 @@ class Scheduler:
                     self._do_rollover(next_mkt)
                     next_mkt = None
                 else:
-                    # Window boundary gap — the next market isn't open yet.
-                    # Retry every 5s until it appears (Kalshi takes a few seconds
-                    # between the old market closing and the new one going active).
-                    for attempt in range(1, 25):
+                    # Window boundary gap — poll indefinitely until the new market appears.
+                    attempt = 0
+                    while self._running:
                         await asyncio.sleep(5)
-                        mkt = await _discover_market()
+                        attempt += 1
+                        mkt = await _discover_market(self._series)
                         if mkt and mkt["ticker"] != self._kb.ticker:
                             self._do_rollover(mkt)
                             next_mkt = None
                             break
-                        log.info("window gap: waiting for next market (attempt %d/24)",
-                                 attempt)
-                    else:
-                        log.warning("window gap: no new market found after 2 min, "
-                                    "continuing with current ticker")
+                        log.info("window gap: waiting for next market (attempt %d, %.0fs elapsed)",
+                                 attempt, attempt * 5)
 
             await asyncio.sleep(10)
 

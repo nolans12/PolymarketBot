@@ -1,15 +1,17 @@
 """
 coinbase_feed.py — Coinbase Advanced Trade WebSocket ticker feed.
 
-Self-contained. Implements the SpotFeed Protocol; pushes ticks into a
-shared SpotBook at up to 20 Hz. The unauthenticated `ticker` channel is
-sufficient for microprice (best_bid, best_ask, best_bid_quantity,
-best_ask_quantity all arrive on every tick).
+Single-product mode: CoinbaseFeed(book, product="BTC-USD")
+Multi-product mode:  CoinbaseFeed(books={"BTC-USD": btc_book, "ETH-USD": eth_book, ...})
+
+One WebSocket connection handles all subscribed products; each tick is
+routed to the matching SpotBook. Reconnects automatically on disconnect.
 """
 
 import asyncio
 import json
 import time
+from typing import Optional
 
 import websockets
 
@@ -19,28 +21,35 @@ from betbot.kalshi.config import COINBASE_WS, COINBASE_PRODUCT
 
 class CoinbaseFeed:
     """
-    Subscribes to Coinbase Advanced Trade ticker channel for BTC-USD.
-    Applies every tick to the shared SpotBook.
-    Reconnects automatically on disconnect.
+    Subscribes to Coinbase Advanced Trade ticker channel.
+    Supports one or multiple products over a single WebSocket connection.
+
+    Single-asset:  CoinbaseFeed(book, product="BTC-USD")
+    Multi-asset:   CoinbaseFeed(books={"BTC-USD": btc_book, "ETH-USD": eth_book})
     """
 
-    MAX_HZ = 20.0   # cap ingest rate; Coinbase fires on every trade
+    MAX_HZ = 20.0   # per-product rate cap
 
-    def __init__(self, book: SpotBook,
-                 product: str = COINBASE_PRODUCT):
-        self._book    = book
-        self._product = product
+    def __init__(self, book: Optional[SpotBook] = None,
+                 product: str = COINBASE_PRODUCT,
+                 books: Optional[dict[str, SpotBook]] = None):
+        if books is not None:
+            self._books = books
+        else:
+            self._books = {product: book}
         self._running = False
+        # Per-product last-ingest timestamp for rate-limiting
+        self._last_t: dict[str, float] = {p: 0.0 for p in self._books}
 
     async def run(self) -> None:
         self._running = True
+        products = list(self._books.keys())
         sub = {
             "type":        "subscribe",
-            "product_ids": [self._product],
+            "product_ids": products,
             "channel":     "ticker",
         }
         min_interval = 1.0 / self.MAX_HZ
-        last_t = 0.0
 
         while self._running:
             try:
@@ -65,14 +74,16 @@ class CoinbaseFeed:
 
                         for ev in msg.get("events", []):
                             for tick in ev.get("tickers", []):
-                                if tick.get("product_id") != self._product:
+                                pid = tick.get("product_id", "")
+                                book = self._books.get(pid)
+                                if book is None:
                                     continue
 
-                                # Rate-limit
+                                # Per-product rate-limit
                                 now = time.time()
-                                if now - last_t < min_interval:
+                                if now - self._last_t.get(pid, 0.0) < min_interval:
                                     continue
-                                last_t = now
+                                self._last_t[pid] = now
 
                                 price_s = tick.get("price")
                                 bid_s   = tick.get("best_bid")
@@ -92,7 +103,7 @@ class CoinbaseFeed:
                                 except (ValueError, TypeError):
                                     continue
 
-                                self._book.apply_ticker(price, bid, ask, bsz, asz)
+                                book.apply_ticker(price, bid, ask, bsz, asz)
 
             except asyncio.CancelledError:
                 return
