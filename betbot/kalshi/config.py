@@ -25,11 +25,24 @@ KALSHI_PEM_INLINE = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
 KALSHI_SERIES   = "KXBTC15M"
 
 # ---------------------------------------------------------------------------
-# Coinbase (primary spot feed — no VPN needed)
+# Spot feed (Coinbase or Binance — picks via SPOT_SOURCE env var)
 # ---------------------------------------------------------------------------
+# Coinbase: US-legal, no VPN required, default.
+# Binance:  geo-blocked from US IPs, requires VPN if running from US.
+# Both feed the same SpotBook and produce identical features — swapping
+# is a config flag with no model retrain required.
+
+SPOT_SOURCE = os.getenv("SPOT_SOURCE", "coinbase").strip().lower()
+if SPOT_SOURCE not in ("coinbase", "binance"):
+    raise ValueError(
+        f"SPOT_SOURCE must be 'coinbase' or 'binance', got {SPOT_SOURCE!r}"
+    )
 
 COINBASE_WS      = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_PRODUCT = "BTC-USD"
+
+BINANCE_WS       = "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
+BINANCE_PRODUCT  = "BTCUSDT"
 
 # ---------------------------------------------------------------------------
 # Window
@@ -53,7 +66,7 @@ LOOKBACK_S = [0, 15, 30, 60, 90, 120]
 SAMPLE_INTERVAL_S      = 1.0          # add training sample every N seconds
 REFIT_INTERVAL_S       = 300          # refit model every 5 minutes
 TRAINING_WINDOW_S      = 4 * 3600     # rolling 4-hour training window
-MIN_TRAIN_SAMPLES      = 360          # first fit after ~6 min at 1 sample/s
+MIN_TRAIN_SAMPLES      = 1200         # first fit after ~20 min at 1 sample/s
 RIDGE_ALPHAS           = [0.001, 0.01, 0.1, 1.0, 10.0]
 HELDOUT_FRACTION       = 0.20         # hold out last 20% for out-of-sample R²
 

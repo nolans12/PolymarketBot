@@ -1,8 +1,9 @@
 """
-book.py — Live market state for Coinbase (spot) and Kalshi (betting market).
+book.py — Live market state for spot (Coinbase or Binance) and Kalshi.
 
-CoinbaseBook: L1 microprice from ticker channel + 5-min ring buffer of 1Hz samples.
-KalshiBook:   yes/no order book reconstructed from WS snapshots/deltas + ring buffer.
+SpotBook:   L1 microprice from any ticker source + 5-min ring buffer of 1Hz samples.
+            Fed by either CoinbaseFeed or BinanceFeed; both produce identical features.
+KalshiBook: yes/no order book reconstructed from REST polls + ring buffer.
 """
 
 import math
@@ -16,11 +17,11 @@ _RING = 300   # 5-minute ring buffer at 1 sample/s
 
 
 # ---------------------------------------------------------------------------
-# Coinbase
+# Spot (Coinbase or Binance)
 # ---------------------------------------------------------------------------
 
-class CoinbaseBook:
-    """Coinbase L1 state from the ticker channel. Computes microprice."""
+class SpotBook:
+    """L1 spot state from a ticker source. Computes microprice."""
 
     def __init__(self):
         self.best_bid:      float = 0.0

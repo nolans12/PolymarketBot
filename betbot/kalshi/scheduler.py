@@ -21,7 +21,7 @@ from typing import Optional
 
 import aiohttp
 
-from betbot.kalshi.book import CoinbaseBook, KalshiBook
+from betbot.kalshi.book import SpotBook, KalshiBook
 from betbot.kalshi.config import (
     DECISION_INTERVAL_S, FALLBACK_TAU_S,
     KALSHI_REST, KALSHI_SERIES, KELLY_TIERS,
@@ -179,15 +179,15 @@ async def _discover_ticker(series: str = KALSHI_SERIES) -> Optional[str]:
 
 class Scheduler:
     """
-    Wires CoinbaseBook + KalshiBook + KalshiRegressionModel + TrainingBuffer
+    Wires SpotBook + KalshiBook + KalshiRegressionModel + TrainingBuffer
     into three concurrent async loops.
 
     Usage:
-        sched = Scheduler(cb_book, kb_book, kalshi_feed)
+        sched = Scheduler(spot_book, kb_book, kalshi_feed)
         await sched.run()   # runs until cancelled
     """
 
-    def __init__(self, cb: CoinbaseBook, kb: KalshiBook,
+    def __init__(self, cb: SpotBook, kb: KalshiBook,
                  kalshi_feed,          # KalshiRestFeed — must expose update_ticker()
                  wallet_usd: float = 1000.0,
                  log_path: Optional[Path] = None,
@@ -340,8 +340,8 @@ class Scheduler:
 
             tau          = max(1.0, r["tau_s"])
             inv_sqrt_tau = 1.0 / math.sqrt(tau + 1.0)
-            cb_mom_30    = math.log(mp_now / mp30) if mp30 > 0 else 0.0
-            cb_mom_60    = math.log(mp_now / mp60) if mp60 > 0 else 0.0
+            spot_mom_30  = math.log(mp_now / mp30) if mp30 > 0 else 0.0
+            spot_mom_60  = math.log(mp_now / mp60) if mp60 > 0 else 0.0
             kalshi_spr   = max(0.0, r["yes_ask"] - r["yes_bid"])
             kalshi_mom   = yes_mid - ym30
 
@@ -349,7 +349,7 @@ class Scheduler:
             X = _np.array([
                 x_0, x_15, x_30, x_60, x_90, x_120,
                 tau, inv_sqrt_tau,
-                cb_mom_30, cb_mom_60,
+                spot_mom_30, spot_mom_60,
                 kalshi_spr, kalshi_mom,
             ], dtype=_np.float64)
             y = _logit(yes_mid)

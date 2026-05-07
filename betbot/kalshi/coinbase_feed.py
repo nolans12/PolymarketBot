@@ -1,7 +1,10 @@
 """
 coinbase_feed.py — Coinbase Advanced Trade WebSocket ticker feed.
 
-Feeds a CoinbaseBook at up to 20 Hz.
+Self-contained. Implements the SpotFeed Protocol; pushes ticks into a
+shared SpotBook at up to 20 Hz. The unauthenticated `ticker` channel is
+sufficient for microprice (best_bid, best_ask, best_bid_quantity,
+best_ask_quantity all arrive on every tick).
 """
 
 import asyncio
@@ -10,20 +13,20 @@ import time
 
 import websockets
 
-from betbot.kalshi.book import CoinbaseBook
+from betbot.kalshi.book import SpotBook
 from betbot.kalshi.config import COINBASE_WS, COINBASE_PRODUCT
 
 
 class CoinbaseFeed:
     """
     Subscribes to Coinbase Advanced Trade ticker channel for BTC-USD.
-    Applies every tick to the shared CoinbaseBook.
+    Applies every tick to the shared SpotBook.
     Reconnects automatically on disconnect.
     """
 
     MAX_HZ = 20.0   # cap ingest rate; Coinbase fires on every trade
 
-    def __init__(self, book: CoinbaseBook,
+    def __init__(self, book: SpotBook,
                  product: str = COINBASE_PRODUCT):
         self._book    = book
         self._product = product

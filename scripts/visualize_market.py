@@ -34,6 +34,8 @@ import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from betbot.kalshi.config import SPOT_SOURCE as _DEFAULT_SPOT_SOURCE
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -482,8 +484,9 @@ def parse_args():
     p.add_argument("--asset", choices=["btc", "eth"], default="btc")
     p.add_argument("--ticker", default=None,
                    help="Kalshi ticker; skip auto-discovery.")
-    p.add_argument("--spot", choices=["binance", "coinbase"], default="coinbase",
-                   help="Spot feed: binance (VPN, higher freq) or coinbase (US, no VPN). Default: coinbase.")
+    p.add_argument("--spot", choices=["binance", "coinbase"], default=_DEFAULT_SPOT_SOURCE,
+                   help="Spot feed: binance (VPN, higher freq) or coinbase (US, no VPN). "
+                        "Default: SPOT_SOURCE env var (currently %(default)s).")
     return p.parse_args()
 
 

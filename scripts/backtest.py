@@ -67,9 +67,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         g["tau_s"]        = g["tau_s"].clip(lower=0)
         g["inv_sqrt_tau"] = 1.0 / np.sqrt(g["tau_s"] + 1.0)
 
-        # Spot momentum
-        g["cb_mom_30"] = np.log(mp / mp.shift(30).fillna(mp))
-        g["cb_mom_60"] = np.log(mp / mp.shift(60).fillna(mp))
+        # Spot momentum (source-agnostic — same definition for Coinbase or Binance)
+        g["spot_mom_30"] = np.log(mp / mp.shift(30).fillna(mp))
+        g["spot_mom_60"] = np.log(mp / mp.shift(60).fillna(mp))
 
         # Kalshi momentum and spread
         ym = g["yes_mid"]
@@ -93,7 +93,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 FEATURE_COLS = (
     ["x_0"] + [f"x_{l}" for l in LAGS]
-    + ["tau_s", "inv_sqrt_tau", "cb_mom_30", "cb_mom_60",
+    + ["tau_s", "inv_sqrt_tau", "spot_mom_30", "spot_mom_60",
        "kalshi_spread", "kalshi_mom_30"]
 )
 
