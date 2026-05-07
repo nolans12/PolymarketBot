@@ -7,7 +7,9 @@
       "Read(//mnt/c/Users/steve/Repos/**)",
       "Bash(python -c \"from betbot.kalshi.scheduler import Scheduler, _discover_ticker; print\\('scheduler OK'\\)\")",
       "PowerShell(cd \"c:\\\\Users\\\\steve\\\\Repos\\\\PolymarketBot\"; $proc = Start-Process python -ArgumentList \"scripts/run_kalshi_bot.py\" -PassThru -NoNewWindow; Start-Sleep -Seconds 20; $proc | Stop-Process -Force; $proc.WaitForExit\\(\\) 2>&1)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\")"
     ]
   }
 }

@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-07T00:34:48.334Z",
+  "source": "auto-postool",
+  "partial": false,
+  "phase": null,
+  "phase_name": null,
+  "phase_dir": null,
+  "plan": null,
+  "task": null,
+  "total_tasks": null,
+  "status": "auto-checkpoint",
+  "completed_tasks": [],
+  "remaining_tasks": [],
+  "blockers": [],
+  "human_actions_pending": [],
+  "decisions": [],
+  "uncommitted_files": [
+    {
+      "status": "M",
+      "path": ".claude/settings.local.json"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/config.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/scheduler.py"
+    },
+    {
+      "status": "??",
+      "path": ".planning/"
+    },
+    {
+      "status": "??",
+      "path": "docs/"
+    }
+  ],
+  "next_action": null,
+  "context_notes": "Recent commits:\ne65170e update for enter as maker, exit as taker\nf43aa8d update .md with instructions\n57e242d update claude.md\n7062b2e only train b/w 0.1 to 0.9\n0a5f4f6 polymarket sucks"
+}

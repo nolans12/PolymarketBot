@@ -64,6 +64,13 @@ HELDOUT_FRACTION       = 0.20         # hold out last 20% for out-of-sample R²
 TRAIN_YES_MID_MIN      = 0.05
 TRAIN_YES_MID_MAX      = 0.95
 
+# Decision filter: only ENTER new positions when yes_mid is well inside the
+# trained regime. Slightly tighter than the training range so the model is
+# extrapolating less at the boundaries when we trade. Open positions still
+# run exit logic regardless of this filter.
+DECISION_YES_MID_MIN   = 0.10
+DECISION_YES_MID_MAX   = 0.90
+
 # Model sanity gates — abstain when these are violated
 MODEL_MIN_CV_R2        = 0.05         # permissive during early data collection
 MODEL_MAX_DISAGREEMENT = 0.20         # |q_predicted - q_actual| before we distrust model
@@ -79,7 +86,7 @@ DECISION_INTERVAL_S = 10              # scheduler tick every 10s
 # taker_fee(p) = THETA * p * (1 - p)
 # ---------------------------------------------------------------------------
 
-THETA_FEE = 0.07
+THETA_FEE = 0.03
 
 # ---------------------------------------------------------------------------
 # Kelly tier table — evaluated top-to-bottom, first match wins

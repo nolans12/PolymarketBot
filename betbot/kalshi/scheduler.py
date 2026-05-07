@@ -29,6 +29,7 @@ from betbot.kalshi.config import (
     REFIT_INTERVAL_S, SAMPLE_INTERVAL_S,
     STOP_THRESHOLD, THETA_FEE, TRAINING_WINDOW_S,
     TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX,
+    DECISION_YES_MID_MIN, DECISION_YES_MID_MAX,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
 from betbot.kalshi.model import KalshiRegressionModel, ModelDiagnostics
@@ -522,6 +523,14 @@ class Scheduler:
             return
 
         # ---- No position: run entry logic ----
+        # Only enter new positions inside the trained regime. The model is
+        # fit on yes_mid in [TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX]; we keep
+        # entries strictly inside that range so the model is interpolating,
+        # not extrapolating, when it produces q_settled.
+        if yes_mid < DECISION_YES_MID_MIN or yes_mid > DECISION_YES_MID_MAX:
+            self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "extreme_probability")
+            return
+
         if tau < FALLBACK_TAU_S:
             self._abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "tau_too_small")
             return
