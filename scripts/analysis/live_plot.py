@@ -1,23 +1,25 @@
 """
-live_plot.py — Live multi-asset rolling chart.
+live_plot.py — Live multi-asset rolling chart for an active bot run.
 
 One subplot per asset (BTC, ETH, SOL, XRP).
-Each subplot: left axis = spot microprice − floor_strike, right axis = Kalshi YES mid.
+Each subplot: left axis = spot microprice - floor_strike, right axis = Kalshi YES mid.
 Markers: green ^ on entry, red v on exit.
 
-Reads logs/ticks_<ASSET>.csv and logs/decisions_<ASSET>.jsonl per asset.
-Falls back to logs/ticks.csv / logs/decisions.jsonl for single-asset (BTC-only) runs.
+Reads ticks_<ASSET>.csv and decisions_<ASSET>.jsonl from the selected run folder.
+Refreshes every 2 seconds so you can watch a live run in real time.
 
 Usage:
-  python scripts/live_plot.py                        # all 4 assets
-  python scripts/live_plot.py --assets BTC ETH       # subset
-  python scripts/live_plot.py --window 60            # 60-minute rolling window (default)
-  python scripts/live_plot.py --interval 2           # refresh every 2s
+  python scripts/analysis/live_plot.py                    # popup to pick run folder
+  python scripts/analysis/live_plot.py --run data/<run>   # skip popup
+  python scripts/analysis/live_plot.py --assets BTC ETH   # subset of assets
+  python scripts/analysis/live_plot.py --window 60        # 60-minute rolling window
+  python scripts/analysis/live_plot.py --interval 2       # refresh every 2s
 """
 
 import argparse
 import csv
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -28,7 +30,9 @@ import matplotlib.dates as mdates
 import matplotlib.animation as animation
 import datetime
 
-LOG_DIR = Path("logs")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pick_run import pick_run_folder
 
 ASSET_COLORS = {
     "BTC": "steelblue",
@@ -36,24 +40,6 @@ ASSET_COLORS = {
     "SOL": "darkorchid",
     "XRP": "darkorange",
 }
-
-
-# ---------------------------------------------------------------------------
-# Per-asset file paths (fall back to legacy single-asset names for BTC)
-# ---------------------------------------------------------------------------
-
-def ticks_path(asset: str) -> Path:
-    p = LOG_DIR / f"ticks_{asset}.csv"
-    if not p.exists() and asset == "BTC":
-        return LOG_DIR / "ticks.csv"
-    return p
-
-
-def decisions_path(asset: str) -> Path:
-    p = LOG_DIR / f"decisions_{asset}.jsonl"
-    if not p.exists() and asset == "BTC":
-        return LOG_DIR / "decisions.jsonl"
-    return p
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +84,7 @@ def read_decisions_tail(path: Path, window_s: float) -> list[dict]:
                     continue
                 try:
                     r = json.loads(line)
-                    if r["ts_ns"] / 1e9 >= cutoff:
+                    if r["ts_ns"] / 1e9 >= cutoff and r.get("yes_mid") not in (None, 0):
                         rows.append(r)
                 except Exception:
                     pass
@@ -111,25 +97,29 @@ def read_decisions_tail(path: Path, window_s: float) -> list[dict]:
 # Per-asset subplot draw
 # ---------------------------------------------------------------------------
 
-def redraw_asset(ax_spot, ax_yes, asset: str, window_s: float, color: str) -> None:
+def redraw_asset(ax_spot, ax_yes, run_dir: Path, asset: str,
+                 window_s: float, color: str) -> None:
     ax_spot.cla()
     ax_yes.cla()
 
-    ticks     = read_ticks_tail(ticks_path(asset), window_s)
-    decisions = read_decisions_tail(decisions_path(asset), window_s)
+    ticks_file     = run_dir / f"ticks_{asset}.csv"
+    decisions_file = run_dir / f"decisions_{asset}.jsonl"
+
+    ticks     = read_ticks_tail(ticks_file, window_s)
+    decisions = read_decisions_tail(decisions_file, window_s)
 
     if not ticks:
         ax_spot.set_title(f"{asset} — waiting for data...", fontsize=10)
-        ax_spot.set_ylabel("spot − strike (USD)", color="gray", fontsize=8)
+        ax_spot.set_ylabel("spot - strike (USD)", color="gray", fontsize=8)
         return
 
     ts      = [r["ts"]      for r in ticks]
     delta   = [r["delta"]   for r in ticks]
     yes_mid = [r["yes_mid"] for r in ticks]
 
-    ax_spot.plot(ts, delta, color=color, lw=1.1, label=f"{asset} − strike")
+    ax_spot.plot(ts, delta, color=color, lw=1.1, label=f"{asset} - strike")
     ax_spot.axhline(0, color="gray", lw=0.7, linestyle="--", alpha=0.5)
-    ax_spot.set_ylabel("spot − strike (USD)", color=color, fontsize=8)
+    ax_spot.set_ylabel("spot - strike (USD)", color=color, fontsize=8)
     ax_spot.tick_params(axis="y", labelcolor=color, labelsize=7)
 
     ax_yes.plot(ts, yes_mid, color="darkorange", lw=1.1, label="YES mid")
@@ -137,6 +127,15 @@ def redraw_asset(ax_spot, ax_yes, asset: str, window_s: float, color: str) -> No
     ax_yes.set_ylabel("YES prob", color="darkorange", fontsize=8)
     ax_yes.tick_params(axis="y", labelcolor="darkorange", labelsize=7)
     ax_yes.set_ylim(0, 1)
+
+    # q_settled from the decisions log — model's predicted price
+    pred_rows = [(r["ts_ns"], r["q_settled"]) for r in decisions
+                 if r.get("q_settled") not in (None, "") and r.get("yes_mid", 0) > 0]
+    if pred_rows:
+        pred_ts  = [datetime.datetime.fromtimestamp(t / 1e9) for t, _ in pred_rows]
+        pred_qs  = [float(q) for _, q in pred_rows]
+        ax_yes.plot(pred_ts, pred_qs, color="mediumpurple", lw=1.2,
+                    linestyle="--", alpha=0.85, label="q_settled (model)")
 
     entry_rows = [r for r in decisions if r.get("event") == "entry"]
     exit_rows  = [r for r in decisions if r.get("event") in
@@ -156,8 +155,8 @@ def redraw_asset(ax_spot, ax_yes, asset: str, window_s: float, color: str) -> No
     ax_spot.grid(alpha=0.2)
     ax_spot.tick_params(axis="x", labelsize=7)
 
-    n_e = len(entry_rows)
-    n_x = len(exit_rows)
+    n_e     = len(entry_rows)
+    n_x     = len(exit_rows)
     now_str = datetime.datetime.now().strftime("%H:%M:%S")
     ax_spot.set_title(
         f"{asset}  —  {n_e} entries  {n_x} exits  [{now_str}]",
@@ -174,7 +173,9 @@ def redraw_asset(ax_spot, ax_yes, asset: str, window_s: float, color: str) -> No
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Live rolling chart for an active bot run")
+    parser.add_argument("--run",      type=str, default=None,
+                        help="Path to a data/<run> folder (popup if omitted)")
     parser.add_argument("--assets",   nargs="+", default=["BTC", "ETH", "SOL", "XRP"],
                         help="Assets to show (default: BTC ETH SOL XRP)")
     parser.add_argument("--window",   type=int, default=60,
@@ -183,15 +184,24 @@ def main():
                         help="Refresh interval in seconds (default 2)")
     args = parser.parse_args()
 
+    run_dir  = pick_run_folder(cli_arg=args.run, title="Select run to monitor")
     assets   = [a.upper() for a in args.assets]
+    # Only show assets that have a ticks file in this run
+    assets   = [a for a in assets if (run_dir / f"ticks_{a}.csv").exists()]
+    if not assets:
+        sys.exit(f"No ticks files found in {run_dir}. Is the bot running?")
+
     window_s = args.window * 60
     n        = len(assets)
+
+    print(f"Monitoring: {run_dir}", flush=True)
+    print(f"Assets: {', '.join(assets)}  Window: {args.window}m  Refresh: {args.interval}s",
+          flush=True)
 
     fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n), sharex=False)
     if n == 1:
         axes = [axes]
 
-    # Each row has a twinx; store (ax_spot, ax_yes) pairs
     ax_pairs = []
     for ax in axes:
         ax_yes = ax.twinx()
@@ -202,7 +212,7 @@ def main():
     def _update(_frame):
         for (ax_spot, ax_yes), asset in zip(ax_pairs, assets):
             color = ASSET_COLORS.get(asset, "steelblue")
-            redraw_asset(ax_spot, ax_yes, asset, window_s, color)
+            redraw_asset(ax_spot, ax_yes, run_dir, asset, window_s, color)
         fig.tight_layout(pad=2.5, h_pad=3.0)
 
     _update(0)

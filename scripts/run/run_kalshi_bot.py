@@ -35,6 +35,9 @@ from betbot.kalshi.config import (
     KALSHI_ASSETS, COINBASE_PRODUCTS,
 )
 from betbot.kalshi.orders import get_balance_usd
+from betbot.kalshi.model import load_model
+
+MODEL_FITS_DIR = Path(__file__).resolve().parents[2] / "model_fits"
 
 
 logging.basicConfig(
@@ -67,14 +70,62 @@ def parse_args():
                    help="Hard cap on per-trade bet, fraction of per-asset wallet")
     p.add_argument("--daily-loss-pct", type=float, default=0.05,
                    help="Halt when realized loss exceeds this fraction of per-asset wallet")
+    p.add_argument("--model-file", type=str, default=None,
+                   help="Path to a pre-trained model .pkl (from model_fits/). "
+                        "Skips live warmup — bot trades from tick 1. "
+                        "Example: --model-file model_fits/btc_lgbm_v1.pkl  "
+                        "For per-asset: --model-file BTC=model_fits/btc.pkl,ETH=model_fits/eth.pkl")
     return p.parse_args()
+
+
+def _parse_model_files(model_file_arg: str | None, assets: list[str]) -> dict[str, str | None]:
+    """
+    Parse --model-file into a per-asset dict.
+    Formats:
+      "model_fits/foo.pkl"            -> all assets use this model
+      "BTC=model_fits/b.pkl,ETH=..."  -> per-asset
+    Returns {asset: path_or_none}.
+    """
+    result = {a: None for a in assets}
+    if not model_file_arg:
+        return result
+
+    if "=" in model_file_arg:
+        for part in model_file_arg.split(","):
+            part = part.strip()
+            if "=" in part:
+                a, p = part.split("=", 1)
+                result[a.upper()] = p.strip()
+    else:
+        for a in assets:
+            result[a] = model_file_arg
+
+    return result
+
+
+def _load_model_for_asset(path: str | None):
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_absolute():
+        # Try relative to MODEL_FITS_DIR, then repo root, then cwd
+        for base in (MODEL_FITS_DIR, Path(__file__).resolve().parents[2], Path.cwd()):
+            candidate = base / p
+            if candidate.exists() or Path(str(candidate) + ".pkl").exists():
+                p = candidate
+                break
+    pkl = str(p) if str(p).endswith(".pkl") else str(p) + ".pkl"
+    if not Path(pkl).exists():
+        sys.exit(f"ERROR: model file not found: {pkl}")
+    return load_model(pkl)
 
 
 async def setup_asset(asset: str, pk, wallet_per_asset: float,
                       run_dir: Path, fresh: bool,
                       live_orders: bool, max_bet_pct: float,
                       daily_loss_pct: float,
-                      spot_book: SpotBook):
+                      spot_book: SpotBook,
+                      preloaded_model=None):
     """
     Discover the active Kalshi market for one asset, wire up its
     KalshiBook + KalshiRestFeed + Scheduler, and return them.
@@ -111,9 +162,6 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
     log_path  = run_dir / f"decisions_{asset}.jsonl"
     tick_path = run_dir / f"ticks_{asset}.csv"
 
-    # Bootstrap from last run's ticks if available
-    seed_tick_path = _find_latest_ticks(asset, run_dir)
-
     if fresh and log_path.exists():
         log_path.unlink()
         print(f"  [{asset}] Deleted old {log_path}", flush=True)
@@ -123,31 +171,16 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
         wallet_usd=wallet_per_asset,
         log_path=log_path,
         tick_path=tick_path,
-        seed_tick_path=seed_tick_path,
         pk=pk,
         live_orders=live_orders,
         max_bet_pct=max_bet_pct,
         daily_loss_limit_pct=daily_loss_pct,
         series=series,
+        preloaded_model=preloaded_model,
     )
 
     return kalshi_feed, scheduler, asset
 
-
-def _find_latest_ticks(asset: str, current_run_dir: Path) -> Path | None:
-    """Return the ticks CSV from the most recent prior run, for bootstrap seeding."""
-    if not DATA_DIR.exists():
-        return None
-    prior_runs = sorted(
-        [p for p in DATA_DIR.iterdir()
-         if p.is_dir() and p != current_run_dir],
-        reverse=True,
-    )
-    for run in prior_runs:
-        candidate = run / f"ticks_{asset}.csv"
-        if candidate.exists():
-            return candidate
-    return None
 
 
 async def main():
@@ -164,6 +197,23 @@ async def main():
     print(f"  Assets:     {', '.join(assets)}", flush=True)
     print(f"  Spot feed:  {SPOT_SOURCE}", flush=True)
     print(f"  Run folder: {run_dir}", flush=True)
+
+    # ---- Pre-load models if --model-file was specified ----
+    model_file_map = _parse_model_files(args.model_file, assets)
+    preloaded_models: dict[str, object] = {}
+    for asset in assets:
+        mf = model_file_map.get(asset)
+        if mf:
+            print(f"  [{asset}] Loading pre-trained model from {mf}...", flush=True)
+            preloaded_models[asset] = _load_model_for_asset(mf)
+        else:
+            preloaded_models[asset] = None
+    if any(preloaded_models.values()):
+        print(f"  Mode: PRELOADED MODEL -- bot trades from tick 1, no warmup needed",
+              flush=True)
+    else:
+        print(f"  Mode: DRY RUN (data collection) -- no model loaded, bot will abstain. "
+              f"Pass --model-file to enable trading.", flush=True)
 
     pk = load_private_key()
 
@@ -207,6 +257,7 @@ async def main():
             run_dir, args.fresh,
             args.live_orders, args.max_bet_pct, args.daily_loss_pct,
             spot_books[asset],
+            preloaded_model=preloaded_models[asset],
         )
         for asset in assets
     ])

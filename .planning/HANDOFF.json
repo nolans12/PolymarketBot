@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-07T06:42:50.391Z",
+  "timestamp": "2026-05-07T08:15:03.788Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -22,10 +22,6 @@
     },
     {
       "status": "M",
-      "path": ".gitignore"
-    },
-    {
-      "status": "M",
       "path": ".planning/HANDOFF.json"
     },
     {
@@ -33,74 +29,98 @@
       "path": "CLAUDE.md"
     },
     {
-      "status": "D",
-      "path": "DRYRUN.md"
+      "status": "M",
+      "path": "README.md"
+    },
+    {
+      "status": "M",
+      "path": "RUN.md"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/config.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/features.py"
     },
     {
       "status": "M",
       "path": "betbot/kalshi/model.py"
     },
     {
-      "status": "D",
-      "path": "scripts/analyze_run.py"
+      "status": "M",
+      "path": "betbot/kalshi/scheduler.py"
     },
     {
       "status": "D",
-      "path": "scripts/backtest.py"
+      "path": "betbot/kalshi/training_buffer.py"
     },
     {
       "status": "D",
-      "path": "scripts/check_kalshi_balance.py"
+      "path": "data/first_run/ticks.csv"
     },
     {
       "status": "D",
-      "path": "scripts/compare_models.py"
+      "path": "data/second_run/ticks.csv"
     },
     {
       "status": "D",
-      "path": "scripts/live_plot.py"
+      "path": "lag_plot_btc.png"
+    },
+    {
+      "status": "M",
+      "path": "requirements.txt"
     },
     {
       "status": "D",
-      "path": "scripts/run_kalshi_bot.py"
+      "path": "scripts/analysis/backtest.py"
     },
     {
       "status": "D",
-      "path": "scripts/test_maker_trade.py"
+      "path": "scripts/analysis/compare_models.py"
     },
     {
-      "status": "D",
-      "path": "scripts/test_trade.py"
+      "status": "M",
+      "path": "scripts/analysis/live_plot.py"
     },
     {
-      "status": "D",
-      "path": "scripts/visualize_market.py"
+      "status": "M",
+      "path": "scripts/analysis/replay_window.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/run/run_kalshi_bot.py"
     },
     {
       "status": "??",
-      "path": "README.md"
+      "path": "data/first_run/ticks_BTC.csv"
     },
     {
       "status": "??",
-      "path": "RUN.md"
+      "path": "data/second_run/ticks_BTC.csv"
     },
     {
       "status": "??",
-      "path": "data/"
+      "path": "model_fits/"
     },
     {
       "status": "??",
-      "path": "scripts/analysis/"
+      "path": "scripts/replay_window.py"
     },
     {
       "status": "??",
-      "path": "scripts/run/"
+      "path": "scripts/test_all.py"
     },
     {
       "status": "??",
-      "path": "scripts/test/"
+      "path": "scripts/train_model.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/tune_trading_knobs.py"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\n285a6c7 multi assets\n5dd7470 only coinbase\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)\na2d5e0c Remove Polymarket-era dead code and tidy project metadata"
+  "context_notes": "Recent commits:\n0ca5ba0 before changing model\n285a6c7 multi assets\n5dd7470 only coinbase\n0fd89ec update\n738b9e8 Introduce pluggable SpotFeed abstraction (Coinbase or Binance)"
 }

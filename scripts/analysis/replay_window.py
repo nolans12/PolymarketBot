@@ -33,9 +33,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from betbot.kalshi.features import FEATURE_NAMES, _logit, _sigmoid, _LAG_INDICES, _X0_IDX
+from betbot.kalshi.features import FEATURE_NAMES, _logit, _sigmoid
 from pick_run import pick_run_folder
-from betbot.kalshi.model import KalshiRegressionModel
+from betbot.kalshi.model import LGBMModel, make_model, save_model, load_model
+from betbot.kalshi.config import LGBM_FORECAST_HORIZONS, LGBM_PRIMARY_HORIZON
+
+_MODEL_FITS_DIR = Path(__file__).resolve().parents[2] / "model_fits"
 
 LOOKAHEAD_S_DEFAULT = 5
 SPEED_DEFAULT       = 15    # ticks per second (1 tick = ~1s real data => 15x speedup)
@@ -131,22 +134,51 @@ def build_feature_row(rows: list[dict], idx: int) -> np.ndarray | None:
     ], dtype=np.float64)
 
 
-def settled_array(fv: np.ndarray) -> np.ndarray:
-    a = fv.copy()
-    x0 = a[_X0_IDX]
-    for i in _LAG_INDICES:
-        a[i] = x0
-    return a
-
 
 # ---------------------------------------------------------------------------
 # Model fitting
 # ---------------------------------------------------------------------------
 
-def fit_model(windows: dict[str, list[dict]]) -> KalshiRegressionModel:
-    """Fit on all windows in the ticks file."""
-    model = KalshiRegressionModel()
-    all_X, all_y, all_ts = [], [], []
+def _build_multi_horizon_targets(
+    all_rows: list[dict], all_X: list, all_ts: list, horizons_s: list[int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shift training targets by each horizon for LGBM multi-horizon training."""
+    ts_arr  = np.array(all_ts, dtype=np.int64)
+    X_arr   = np.array(all_X)
+    tol_ns  = [2 * h * 1_000_000_000 for h in horizons_s]
+
+    valid_idx, y_cols = [], [[] for _ in horizons_s]
+
+    for i, ts in enumerate(ts_arr):
+        ok, targets = True, []
+        for h, tol in zip(horizons_s, tol_ns):
+            target_ts = ts + h * 1_000_000_000
+            j = int(np.searchsorted(ts_arr, target_ts))
+            j = min(j, len(ts_arr) - 1)
+            if j > 0 and abs(ts_arr[j-1] - target_ts) < abs(ts_arr[j] - target_ts):
+                j -= 1
+            if abs(ts_arr[j] - target_ts) > tol:
+                ok = False
+                break
+            targets.append(all_rows[j]["yes_mid"])
+        if ok and all(0.001 <= t <= 0.999 for t in targets):
+            valid_idx.append(i)
+            for col, t in enumerate(targets):
+                y_cols[col].append(_logit(t))
+
+    if not valid_idx:
+        return np.empty((0, len(horizons_s))), np.empty((0,)), np.empty((0,))
+
+    idx = np.array(valid_idx)
+    return X_arr[idx], np.column_stack([np.array(c) for c in y_cols]), ts_arr[idx]
+
+
+def fit_model(windows: dict[str, list[dict]]) -> LGBMModel:
+    """Fit a LightGBM model on all windows in the ticks file."""
+    model = make_model()
+
+    all_rows_flat = []
+    all_X, all_ts = [], []
 
     for ticker, rows in windows.items():
         for i, r in enumerate(rows):
@@ -158,18 +190,21 @@ def fit_model(windows: dict[str, list[dict]]) -> KalshiRegressionModel:
             if fv is None:
                 continue
             all_X.append(fv)
-            all_y.append(_logit(r["yes_mid"]))
             all_ts.append(r["ts_ns"])
+            all_rows_flat.append(r)
 
-    if not all_y:
+    if not all_X:
         sys.exit("ERROR: no training data available.")
 
-    X  = np.array(all_X)
-    y  = np.array(all_y)
-    ts = np.array(all_ts)
+    X, y, ts = _build_multi_horizon_targets(all_rows_flat, all_X, all_ts, LGBM_FORECAST_HORIZONS)
+    if len(y) == 0:
+        sys.exit("ERROR: not enough data to build multi-horizon targets (need at least 60s of ticks).")
     diag, _ = model.fit_if_better(X, y, ts)
-    print(f"  Model fit: n={diag.n_train}  R2_in={diag.r2_in_sample:.3f}  "
-          f"R2_hld={diag.r2_held_out:.3f}  lag={diag.estimated_lag_s:.0f}s", flush=True)
+    print(f"  LGBM fit: n={diag.n_train}  "
+          f"R2_hld(primary {LGBM_PRIMARY_HORIZON}s)={diag.r2_held_out:.3f}", flush=True)
+    for k, v in diag.coefs.items():
+        print(f"    {k}={v:.3f}", flush=True)
+
     return model
 
 
@@ -186,6 +221,9 @@ def main():
                         help="Ticks per second to advance (default 15)")
     parser.add_argument("--lookahead", type=float, default=LOOKAHEAD_S_DEFAULT)
     parser.add_argument("--trail",     type=int,   default=TRAIL_S)
+    parser.add_argument("--model-file", type=str,   default=None,
+                        help="Path to a saved model .pkl (skips fitting). "
+                             "E.g. model_fits/my_model.pkl")
     args = parser.parse_args()
 
     run_dir   = pick_run_folder(cli_arg=args.run, title="Select run to replay")
@@ -221,8 +259,18 @@ def main():
           flush=True)
     print(f"  Speed: {args.speed}x   Est. replay time: {est_s:.0f}s", flush=True)
 
-    print("Fitting model...", flush=True)
-    model = fit_model(windows)
+    if args.model_file:
+        mf_path = Path(args.model_file)
+        if not mf_path.is_absolute():
+            # Try relative to repo root first, then model_fits/
+            if (_MODEL_FITS_DIR / mf_path).exists():
+                mf_path = _MODEL_FITS_DIR / mf_path
+        pkl = str(mf_path) + ".pkl" if not str(mf_path).endswith(".pkl") else str(mf_path)
+        print(f"Loading saved model from {pkl}...", flush=True)
+        model = load_model(pkl)
+    else:
+        print("Fitting LightGBM model on all windows...", flush=True)
+        model = fit_model(windows)
     if not model.is_fit:
         sys.exit("ERROR: model did not fit.")
 
@@ -236,7 +284,7 @@ def main():
         if fv is None:
             q_settled_arr.append(float("nan"))
             continue
-        qs = model.q_settled_from_array(settled_array(fv))
+        qs = model.q_settled_from_array(fv)
         q_settled_arr.append(qs if qs is not None else float("nan"))
 
     n_valid = sum(1 for q in q_settled_arr if not math.isnan(q))

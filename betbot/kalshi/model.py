@@ -1,11 +1,20 @@
 """
-model.py - Ridge regression model for Kalshi lead-lag arbitrage.
+model.py - LightGBM multi-horizon prediction model for Kalshi lead-lag arb.
 
-Fits logit(kalshi_yes_mid) ~ f(lagged_coinbase_microprice, tau, momentum, ...).
+Trains one LGBMRegressor per forecast horizon (5s, 10s, 15s, 60s ahead).
+Target for each model: logit(yes_mid_{t + h_seconds}) — a real future value,
+not a lag-substituted proxy.
 
-q_settled(): substitute current microprice into all lag slots to predict
-where Kalshi will quote once it finishes digesting the current spot move.
-That gap between q_settled and q_ask is the raw edge.
+q_settled() returns the primary-horizon prediction at the current feature
+vector, expressed as a probability. This is the edge signal the decision
+loop uses.
+
+Workflow:
+  1. Dry run the bot to collect ticks (no live orders, no model needed)
+  2. scripts/train_model.py        — fit LGBM on collected ticks, save to model_fits/
+  3. scripts/tune_trading_knobs.py — grid-search Kelly tiers and exit thresholds
+  4. scripts/test_all.py           — final simulation with model + tuned config
+  5. scripts/run/run_kalshi_bot.py --model-file model_fits/<name>.pkl --live-orders
 """
 
 import math
@@ -16,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
@@ -24,17 +32,13 @@ from betbot.kalshi.features import (
     FEATURE_NAMES, N_FEATURES, FeatureVec,
     _sigmoid, _logit,
 )
-from betbot.kalshi.config import RIDGE_ALPHAS, HELDOUT_FRACTION
+from betbot.kalshi.config import (
+    HELDOUT_FRACTION,
+    LGBM_FORECAST_HORIZONS, LGBM_PRIMARY_HORIZON,
+)
 
 
 def _clip_r2(r2: float) -> float:
-    """
-    Clip an R^2 to a sane range. R^2 can legitimately be negative (worse than
-    mean baseline), but when held-out target variance is near zero (e.g. early
-    in a run when yes_mid is flat), the formula 1 - SSE/SST explodes to values
-    like -1e30. Clipping to [-10, 1] preserves the "model is bad" signal
-    without producing unreadable garbage in logs.
-    """
     if not np.isfinite(r2):
         return -10.0
     return max(-10.0, min(1.0, float(r2)))
@@ -42,215 +46,376 @@ def _clip_r2(r2: float) -> float:
 
 @dataclass
 class ModelDiagnostics:
-    version_id:           str
-    ts_ns:                int
-    n_train:              int
-    ridge_alpha:          float
-    r2_in_sample:         float
-    r2_cv:                float
-    r2_held_out:          float
-    intercept:            float
-    coefs:                dict   # feature_name -> float
-    estimated_lag_s:      float  # beta-weighted average lag (diagnostic only)
-    coef_delta_l2:        float  # L2 norm of coef change vs previous fit
+    version_id:       str
+    ts_ns:            int
+    n_train:          int
+    ridge_alpha:      float   # always 0.0 (kept for log-format compat)
+    r2_in_sample:     float
+    r2_cv:            float
+    r2_held_out:      float
+    intercept:        float   # always 0.0
+    coefs:            dict    # horizon -> r2_hld, e.g. {"h5s_r2_hld": 0.32, ...}
+    estimated_lag_s:  float
+    coef_delta_l2:    float
 
 
-class KalshiRegressionModel:
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _heldout_split(X: np.ndarray, y: np.ndarray, ts_ns: np.ndarray):
+    """Time-based hold-out: last HELDOUT_FRACTION of span."""
+    span_ns   = ts_ns.max() - ts_ns.min()
+    cutoff_ns = ts_ns.max() - int(span_ns * HELDOUT_FRACTION)
+    train     = ts_ns <= cutoff_ns
+    return train, ~train, int(train.sum())
+
+
+# ---------------------------------------------------------------------------
+# LightGBM multi-horizon model
+# ---------------------------------------------------------------------------
+
+class LGBMModel:
     """
-    Thread-safe ridge regression.  The background refitter calls fit();
-    the decision loop calls q_settled() - no locking needed in CPython
-    because numpy array assignment is atomic under the GIL.
+    One LightGBM regressor per forecast horizon.
+
+    Training:
+        fit(X, y_multi, ts_ns)
+          X:       (n, N_FEATURES)
+          y_multi: (n, n_horizons) — logit(yes_mid_{t+h}) per column
+
+    Inference:
+        q_settled(fv)  -> probability (primary horizon prediction)
+        q_at_horizon(fv, h_s) -> probability for a specific horizon
     """
 
-    def __init__(self):
+    def __init__(self, horizons: list[int] = None, primary_horizon: int = None):
+        import lightgbm as lgb
+        self._lgb = lgb
+
+        self._horizons    = list(horizons or LGBM_FORECAST_HORIZONS)
+        self._primary_h   = primary_horizon or LGBM_PRIMARY_HORIZON
+        self._primary_idx = self._horizons.index(self._primary_h)
+
+        self._models:  list[Optional[object]] = [None] * len(self._horizons)
+        self._scalers: list[Optional[StandardScaler]] = [None] * len(self._horizons)
+        self._version_id: str = ""
+        self._r2s_hld: list[float] = [0.0] * len(self._horizons)
+
         self._lock = threading.Lock()
 
-        self._coefs:     Optional[np.ndarray] = None
-        self._intercept: float = 0.0
-        self._scaler:    Optional[StandardScaler] = None
-        self._version_id: str = ""
-        self._prev_coefs: Optional[np.ndarray] = None
-
-        # Publicly readable diagnostics
-        self.is_fit:        bool  = False
-        self.r2_cv:         float = 0.0
-        self.r2_held_out:   float = 0.0
-        self.last_refit_ns: int   = 0
-        self.estimated_lag_s: float = 0.0
+        self.is_fit:          bool  = False
+        self.r2_cv:           float = 0.0
+        self.r2_held_out:     float = 0.0
+        self.last_refit_ns:   int   = 0
+        self.estimated_lag_s: float = float(self._primary_h)
         self.last_diag: Optional[ModelDiagnostics] = None
 
-    # ------------------------------------------------------------------
-    # Fitting - called by the background refitter
-    # ------------------------------------------------------------------
+        self._lgb_params = {
+            "objective":         "regression",
+            "metric":            "rmse",
+            "n_estimators":      200,
+            "learning_rate":     0.05,
+            "num_leaves":        31,
+            "min_child_samples": 20,
+            "subsample":         0.8,
+            "colsample_bytree":  0.8,
+            "verbose":           -1,
+            "n_jobs":            1,
+            "num_threads":       1,
+            "verbosity":         1,
+        }
 
-    def fit(self, X: np.ndarray, y: np.ndarray,
-            ts_ns: np.ndarray) -> ModelDiagnostics:
+    # ---- Pickle support (strip/restore threading.Lock) ----
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        state.pop("_lgb", None)
+        return state
+
+    def __setstate__(self, state):
+        import lightgbm as lgb
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        self._lgb  = lgb
+        # Ensure attributes exist for models loaded from older pkl files
+        if not hasattr(self, "is_fit"):          self.is_fit          = False
+        if not hasattr(self, "r2_cv"):           self.r2_cv           = 0.0
+        if not hasattr(self, "r2_held_out"):     self.r2_held_out     = 0.0
+        if not hasattr(self, "last_refit_ns"):   self.last_refit_ns   = 0
+        if not hasattr(self, "estimated_lag_s"): self.estimated_lag_s = float(self._primary_h)
+        if not hasattr(self, "last_diag"):       self.last_diag       = None
+
+    # ---- Snapshot / restore for fit_if_better ----
+
+    def _snapshot(self) -> dict:
+        with self._lock:
+            return dict(
+                models   = list(self._models),
+                scalers  = list(self._scalers),
+                r2_hld   = self.r2_held_out,
+                r2_cv    = self.r2_cv,
+                r2s_hld  = list(self._r2s_hld),
+                lag      = self.estimated_lag_s,
+                diag     = self.last_diag,
+                refit_ns = self.last_refit_ns,
+            )
+
+    def _restore(self, snap: dict) -> None:
+        with self._lock:
+            self._models         = snap["models"]
+            self._scalers        = snap["scalers"]
+            self.r2_held_out     = snap["r2_hld"]
+            self.r2_cv           = snap["r2_cv"]
+            self._r2s_hld        = snap["r2s_hld"]
+            self.estimated_lag_s = snap["lag"]
+            self.last_diag       = snap["diag"]
+            self.last_refit_ns   = snap["refit_ns"]
+
+    # ---- Training ----
+
+    def fit(self, X: np.ndarray, y: np.ndarray, ts_ns: np.ndarray) -> ModelDiagnostics:
         """
-        Fit ridge regression on (X, y) with time-series CV.
-        X shape: (n_samples, N_FEATURES)
-        y shape: (n_samples,)  - logit(kalshi_yes_mid)
-        ts_ns: (n_samples,) wall-clock receipt time in nanoseconds
+        X:     (n, N_FEATURES)
+        y:     (n, n_horizons) — each column is logit(yes_mid_{t+h}) for one horizon
+        ts_ns: (n,) nanosecond timestamps of the feature rows
         """
-        n = len(y)
-        if n < 2:
-            raise ValueError(f"need >= 2 samples, got {n}")
+        if y.ndim == 1:
+            y = y[:, np.newaxis]
+
+        n_horizons = y.shape[1]
+        if n_horizons != len(self._horizons):
+            raise ValueError(
+                f"y has {n_horizons} columns but model has {len(self._horizons)} horizons"
+            )
 
         now_ns = time.time_ns()
+        train_mask, val_mask, n_train = _heldout_split(X, y[:, 0], ts_ns)
 
-        # Hold-out: most-recent HELDOUT_FRACTION of the time span
-        span_ns = ts_ns.max() - ts_ns.min()
-        cutoff_ns = ts_ns.max() - int(span_ns * HELDOUT_FRACTION)
-        train_mask = ts_ns <= cutoff_ns
-        val_mask   = ts_ns >  cutoff_ns
+        new_models:  list = []
+        new_scalers: list = []
+        r2s_in, r2s_hld  = [], []
 
-        n_train = int(train_mask.sum())
-        if n_train < 30:
-            X_train, y_train = X, y
-            X_val,   y_val   = None, None
-        else:
-            X_train, y_train = X[train_mask], y[train_mask]
-            X_val,   y_val   = X[val_mask],   y[val_mask]
+        for col_idx in range(n_horizons):
+            h_label = f"h{self._horizons[col_idx]}s"
+            print(f"  Fitting horizon {col_idx+1}/{n_horizons} ({h_label})...",
+                  end=" ", flush=True)
 
-        scaler = StandardScaler()
-        X_tr_s = scaler.fit_transform(X_train)
-        X_va_s = scaler.transform(X_val) if X_val is not None else None
+            yc    = y[:, col_idx]
+            yc_tr = yc[train_mask]
+            yc_va = yc[val_mask]
 
-        tscv = TimeSeriesSplit(n_splits=min(5, max(2, n_train // 50)))
-        mdl  = RidgeCV(alphas=RIDGE_ALPHAS, cv=tscv, scoring="r2",
-                       fit_intercept=True)
-        mdl.fit(X_tr_s, y_train)
+            scaler = StandardScaler()
+            Xtr_s  = scaler.fit_transform(X[train_mask])
+            Xva_s  = scaler.transform(X[val_mask]) if val_mask.sum() > 0 else None
 
-        r2_in  = _clip_r2(mdl.score(X_tr_s, y_train))
-        r2_cv  = _clip_r2(getattr(mdl, "best_score_", r2_in))
-        r2_hld = _clip_r2(mdl.score(X_va_s, y_val)) if X_va_s is not None and len(y_val) > 0 else 0.0
+            params = dict(self._lgb_params)
+            params["verbose"] = 50
+            mdl = self._lgb.LGBMRegressor(**params)
 
-        new_coefs = mdl.coef_.copy()
+            callbacks = [self._lgb.log_evaluation(50)]
+            if Xva_s is not None:
+                callbacks.insert(0, self._lgb.early_stopping(20, verbose=False))
 
-        # beta-weighted average lag - which historical slot explains Kalshi best
-        lag_names = ["x_5", "x_10", "x_15", "x_20", "x_25", "x_30"]
-        lag_secs  = [5,      10,     15,     20,     25,     30]
-        lag_idx   = [FEATURE_NAMES.index(n) for n in lag_names]
-        lag_betas = [abs(float(new_coefs[i])) for i in lag_idx]
-        total_beta = sum(lag_betas)
-        est_lag = (sum(b * s for b, s in zip(lag_betas, lag_secs)) / total_beta
-                   if total_beta > 0 else 0.0)
+            import pandas as _pd
+            Xtr_df = _pd.DataFrame(Xtr_s, columns=FEATURE_NAMES)
+            Xva_df = _pd.DataFrame(Xva_s, columns=FEATURE_NAMES) if Xva_s is not None else None
 
-        prev = self._prev_coefs
-        coef_delta = float(np.linalg.norm(new_coefs - prev)) if (
-            prev is not None and len(prev) == len(new_coefs)) else 0.0
+            mdl.fit(
+                Xtr_df, yc_tr,
+                eval_set=[(Xva_df, yc_va)] if Xva_df is not None else None,
+                callbacks=callbacks,
+            )
+            print(f"  Fitted {h_label}: {mdl.n_estimators_} trees", flush=True)
 
-        version_id = str(uuid.uuid4())
+            r2_in  = _clip_r2(float(1 - np.mean((yc_tr - mdl.predict(Xtr_s))**2) /
+                                    max(1e-9, np.var(yc_tr))))
+            if Xva_s is not None and len(yc_va) > 0:
+                r2_hld = _clip_r2(float(1 - np.mean((yc_va - mdl.predict(Xva_s))**2) /
+                                        max(1e-9, np.var(yc_va))))
+            else:
+                r2_hld = 0.0
+
+            new_models.append(mdl)
+            new_scalers.append(scaler)
+            r2s_in.append(r2_in)
+            r2s_hld.append(r2_hld)
+
+        r2_hld_primary = r2s_hld[self._primary_idx]
+        r2_in_primary  = r2s_in[self._primary_idx]
+        version_id     = str(uuid.uuid4())
+
         diag = ModelDiagnostics(
-            version_id=version_id,
-            ts_ns=now_ns,
-            n_train=n_train if n_train >= 30 else n,
-            ridge_alpha=float(mdl.alpha_),
-            r2_in_sample=r2_in,
-            r2_cv=r2_cv,
-            r2_held_out=r2_hld,
-            intercept=float(mdl.intercept_),
-            coefs={name: float(new_coefs[i]) for i, name in enumerate(FEATURE_NAMES)},
-            estimated_lag_s=est_lag,
-            coef_delta_l2=coef_delta,
+            version_id=version_id, ts_ns=now_ns,
+            n_train=n_train if n_train >= 30 else len(y),
+            ridge_alpha=0.0, intercept=0.0,
+            r2_in_sample=r2_in_primary, r2_cv=r2_in_primary, r2_held_out=r2_hld_primary,
+            coefs={f"h{h}s_r2_hld": r2s_hld[i] for i, h in enumerate(self._horizons)},
+            estimated_lag_s=float(self._primary_h),
+            coef_delta_l2=0.0,
         )
 
         with self._lock:
-            self._prev_coefs    = self._coefs
-            self._coefs         = new_coefs
-            self._intercept     = float(mdl.intercept_)
-            self._scaler        = scaler
-            self._version_id    = version_id
-            self.is_fit         = True
-            self.r2_cv          = r2_cv
-            self.r2_held_out    = r2_hld
-            self.last_refit_ns  = now_ns
-            self.estimated_lag_s = est_lag
-            self.last_diag      = diag
+            self._models         = new_models
+            self._scalers        = new_scalers
+            self._r2s_hld        = r2s_hld
+            self._version_id     = version_id
+            self.is_fit          = True
+            self.r2_cv           = r2_in_primary
+            self.r2_held_out     = r2_hld_primary
+            self.last_refit_ns   = now_ns
+            self.estimated_lag_s = float(self._primary_h)
+            self.last_diag       = diag
 
         return diag
 
     def fit_if_better(self, X: np.ndarray, y: np.ndarray,
-                      ts_ns: np.ndarray) -> tuple["ModelDiagnostics", bool]:
-        """
-        Fit a candidate model. Only keep the new coefficients if R2_hld
-        strictly improves (or the model was never fit — first fit always accepted).
-        Returns (diag, was_accepted).
-        """
-        # Snapshot current live state before we touch anything
+                      ts_ns: np.ndarray) -> tuple[ModelDiagnostics, bool]:
+        """Fit a candidate; keep only if R2_hld improves (or first fit)."""
         with self._lock:
-            snap_coefs       = self._coefs.copy() if self._coefs is not None else None
-            snap_intercept   = self._intercept
-            snap_scaler      = self._scaler
-            snap_r2_hld      = self.r2_held_out
-            snap_r2_cv       = self.r2_cv
-            snap_lag         = self.estimated_lag_s
-            snap_diag        = self.last_diag
-            snap_refit_ns    = self.last_refit_ns
-            first_fit        = not self.is_fit
+            snap_r2_hld = self.r2_held_out
+            first_fit   = not self.is_fit
+            snap_state  = self._snapshot()
 
-        diag = self.fit(X, y, ts_ns)   # always computes + swaps inside
+        diag = self.fit(X, y, ts_ns)
 
         if first_fit or diag.r2_held_out > snap_r2_hld:
             return diag, True
 
-        # New fit is worse — restore prior state
-        with self._lock:
-            self._coefs          = snap_coefs
-            self._intercept      = snap_intercept
-            self._scaler         = snap_scaler
-            self.r2_held_out     = snap_r2_hld
-            self.r2_cv           = snap_r2_cv
-            self.estimated_lag_s = snap_lag
-            self.last_diag       = snap_diag
-            self.last_refit_ns   = snap_refit_ns
-            # keep is_fit=True, version_id stays updated (harmless)
+        self._restore(snap_state)
         return diag, False
 
-    # ------------------------------------------------------------------
-    # Prediction - called by scheduler tick (must be fast)
-    # ------------------------------------------------------------------
+    # ---- Inference ----
 
-    def _predict_raw(self, vec: np.ndarray) -> Optional[float]:
-        coefs, intercept, scaler = self._coefs, self._intercept, self._scaler
-        if coefs is None or scaler is None:
+    def _predict_horizon(self, vec: np.ndarray, horizon_idx: int) -> Optional[float]:
+        import pandas as _pd
+        mdl    = self._models[horizon_idx]
+        scaler = self._scalers[horizon_idx]
+        if mdl is None or scaler is None:
             return None
-        x = scaler.transform([vec])[0]
-        return float(np.dot(coefs, x) + intercept)
+        x_scaled = scaler.transform([vec])[0]
+        x_df = _pd.DataFrame([x_scaled], columns=FEATURE_NAMES)
+        return float(mdl.predict(x_df)[0])
 
-    def q_predicted(self, fv: FeatureVec) -> Optional[float]:
-        """
-        What should Kalshi be quoting NOW given lagged spot history?
-        Sanity check - should track yes_mid closely when model is healthy.
-        """
+    def q_settled(self, fv: "FeatureVec") -> Optional[float]:
+        """Primary edge signal: probability at primary horizon."""
         if not self.is_fit or not fv.complete:
             return None
-        logit = self._predict_raw(fv.as_array())
+        logit = self._predict_horizon(fv.as_array(), self._primary_idx)
         return _sigmoid(logit) if logit is not None else None
 
-    def q_settled(self, fv: FeatureVec) -> Optional[float]:
-        """
-        Where will Kalshi quote once it has digested current spot?
-        Uses settled_array() which substitutes x_0 into all lag slots.
-        This is the primary signal for edge calculation.
-        """
-        if not self.is_fit or not fv.complete:
-            return None
-        logit = self._predict_raw(fv.settled_array())
-        return _sigmoid(logit) if logit is not None else None
+    def q_predicted(self, fv: "FeatureVec") -> Optional[float]:
+        """Alias for q_settled — LGBM predicts future directly, no lag substitution."""
+        return self.q_settled(fv)
 
     def q_settled_from_array(self, vec: np.ndarray) -> Optional[float]:
-        """q_settled from a raw pre-built numpy feature array (used by replay_window.py)."""
+        """q_settled from a raw pre-built numpy feature array (analysis scripts)."""
         if not self.is_fit:
             return None
-        logit = self._predict_raw(vec)
+        logit = self._predict_horizon(vec, self._primary_idx)
         return _sigmoid(logit) if logit is not None else None
+
+    def q_all_horizons_from_array(self, vec: np.ndarray) -> dict[int, float]:
+        """Returns {horizon_s: probability} for all fitted horizons. Skips None predictions."""
+        if not self.is_fit:
+            return {}
+        result = {}
+        for idx, h in enumerate(self._horizons):
+            logit = self._predict_horizon(vec, idx)
+            if logit is not None:
+                result[h] = _sigmoid(logit)
+        return result
+
+    def q_at_horizon(self, fv: "FeatureVec", horizon_s: int) -> Optional[float]:
+        """Prediction at a specific horizon in seconds."""
+        if not self.is_fit or not fv.complete:
+            return None
+        if horizon_s not in self._horizons:
+            return None
+        logit = self._predict_horizon(fv.as_array(), self._horizons.index(horizon_s))
+        return _sigmoid(logit) if logit is not None else None
+
+    def stale_s(self) -> float:
+        if self.last_refit_ns == 0:
+            return float("inf")
+        return (time.time_ns() - self.last_refit_ns) / 1e9
 
     @property
     def version_id(self) -> str:
         return self._version_id
 
-    def stale_s(self) -> float:
-        """Seconds since last refit."""
-        if self.last_refit_ns == 0:
-            return float("inf")
-        return (time.time_ns() - self.last_refit_ns) / 1e9
+    @property
+    def horizons(self) -> list[int]:
+        return list(self._horizons)
+
+    @property
+    def r2s_by_horizon(self) -> dict[int, float]:
+        return {h: self._r2s_hld[i] for i, h in enumerate(self._horizons)}
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+import pickle as _pickle
+import json as _json
+
+
+def save_model(model: LGBMModel, path) -> None:
+    """
+    Save a trained model to disk.
+      <path>.pkl  — full model object (pickle)
+      <path>.json — human-readable metadata
+    """
+    from pathlib import Path as _Path
+    p = _Path(str(path))
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    pkl_path = str(p) + ".pkl" if not str(p).endswith(".pkl") else str(p)
+    with open(pkl_path, "wb") as f:
+        _pickle.dump(model, f, protocol=_pickle.HIGHEST_PROTOCOL)
+
+    meta = {
+        "model_type":      "LGBMModel",
+        "is_fit":          model.is_fit,
+        "r2_held_out":     model.r2_held_out,
+        "estimated_lag_s": model.estimated_lag_s,
+        "horizons":        model.horizons,
+        "primary_horizon": model._primary_h,
+        "r2s_by_horizon":  model.r2s_by_horizon,
+        "n_samples":       model.last_diag.n_train if model.last_diag else None,
+    }
+    if model.last_diag is not None:
+        d = model.last_diag
+        meta["diag"] = {
+            "n_train": d.n_train,
+            "r2_in":   d.r2_in_sample,
+            "r2_hld":  d.r2_held_out,
+            "coefs":   d.coefs,
+        }
+
+    json_path = str(p.with_suffix("")) + ".json" if str(p).endswith(".pkl") else str(p) + ".json"
+    with open(json_path, "w") as f:
+        _json.dump(meta, f, indent=2)
+
+    base = pkl_path[:-4] if pkl_path.endswith(".pkl") else pkl_path
+    print(f"  Saved model -> {base}.pkl  (LGBMModel  R2_hld={model.r2_held_out:.3f})",
+          flush=True)
+
+
+def load_model(path) -> LGBMModel:
+    """Load a model saved with save_model(). Returns ready-to-predict LGBMModel."""
+    from pathlib import Path as _Path
+    p   = _Path(str(path))
+    pkl = str(p) if str(p).endswith(".pkl") else str(p) + ".pkl"
+    with open(pkl, "rb") as f:
+        model = _pickle.load(f)
+    print(f"  Loaded model <- {pkl}  (LGBMModel  R2_hld={model.r2_held_out:.3f})",
+          flush=True)
+    return model
+
+
+def make_model() -> LGBMModel:
+    """Return a fresh, unfitted LGBMModel."""
+    return LGBMModel()
