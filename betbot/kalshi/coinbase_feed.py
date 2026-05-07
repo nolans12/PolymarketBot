@@ -1,8 +1,7 @@
 """
 coinbase_feed.py — Coinbase Advanced Trade WebSocket ticker feed.
 
-Self-contained: no dependency on betbot.clients.coinbase_ws (which has
-broken polybot.* imports). Feeds a CoinbaseBook at up to 20 Hz.
+Feeds a CoinbaseBook at up to 20 Hz.
 """
 
 import asyncio
