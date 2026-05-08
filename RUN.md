@@ -50,6 +50,28 @@ Stop after 24+ hours with `Ctrl+C`.
 
 ---
 
+## Step 1b — Merge runs (optional, multi-session)
+
+If you collected data across multiple dry run sessions, merge them before training.
+The merge groups by `window_ticker` (the actual 15-min market ID), sorts by `ts_ns`,
+and deduplicates. Gaps within a merged window are handled correctly — training
+automatically rejects samples whose future target falls across a gap.
+
+```bash
+# Interactive: select runs from a list
+python scripts/merge_runs.py
+
+# Specify directly
+python scripts/merge_runs.py --runs data/run1 data/run2 data/run3
+
+# Custom output name
+python scripts/merge_runs.py --runs data/run1 data/run2 --name week1
+```
+
+Output is saved to `data/merged_<name>/ticks_<ASSET>.csv`. Use that path in Step 2.
+
+---
+
 ## Step 2 — Train model
 
 One model per asset. Run separately for each.
@@ -60,6 +82,9 @@ python scripts/train_model.py
 
 # Specify run folder directly
 python scripts/train_model.py --run data/2026-05-07_00-00-00_BTC_ETH_SOL_XRP
+
+# Train on merged data
+python scripts/train_model.py --run data/merged_week1
 
 # List saved models
 python scripts/train_model.py --list

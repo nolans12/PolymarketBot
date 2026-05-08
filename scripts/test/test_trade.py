@@ -111,11 +111,12 @@ async def place_order(session: aiohttp.ClientSession, pk,
     body = {
         "ticker":          ticker,
         "client_order_id": str(uuid.uuid4()),
-        "type":            "limit",
+        "type":            "market",
+        "time_in_force":   "immediate_or_cancel",
         "action":          action,
         "side":            "yes",
         "count":           count,
-        "yes_price":       yes_price_cents,
+        "yes_price":       99 if action == "buy" else 1,
     }
 
     label = "BUY " if action == "buy" else "SELL"
@@ -196,28 +197,34 @@ async def main():
                 print("Aborted.")
                 return
 
-        # â”€â”€ 2. BUY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        print(f"\n[1/3] Placing BUY {count}x YES @ {yes_ask_cents}c...")
+        # -- 2. BUY (market FoK — fills at whatever the book offers) -----------
+        print(f"\n[1/3] Placing market BUY {count}x YES (IOC)...")
         buy_resp = await place_order(session, pk, ticker,
                                      "buy", yes_ask_cents, count, args.dry_run)
         if not buy_resp:
-            sys.exit("Buy failed â€” aborting before any sell.")
+            sys.exit("Buy failed -- aborting before any sell.")
 
-        buy_order = buy_resp.get("order", buy_resp)
+        buy_order  = buy_resp.get("order", buy_resp)
         buy_id     = buy_order.get("order_id", buy_order.get("id", "?"))
-        buy_filled = buy_order.get("filled_count", 0)
+        buy_filled = int(buy_order.get("filled_count") or 0)
         print(f"    Order ID: {buy_id}")
         print(f"    Status:   {buy_order.get('status', '?')}")
         print(f"    Filled:   {buy_filled} / {count}")
 
-        # â”€â”€ 3. WAIT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if buy_filled <= 0:
+            sys.exit("  BUY filled 0 contracts -- no position opened, nothing to sell.")
+
+        actual_buy_cents = yes_ask_cents
+        actual_cost      = buy_filled * (actual_buy_cents / 100.0)
+
+        # -- 3. WAIT -----------------------------------------------------------
         print(f"\n[2/3] Holding for {HOLD_SECONDS}s...")
         for remaining in range(HOLD_SECONDS, 0, -1):
             print(f"    {remaining}s...", end="\r", flush=True)
             await asyncio.sleep(1)
         print()
 
-        # â”€â”€ 4. Get current bid for sell price â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- 4. Get current bid for sell price ---------------------------------
         print("[3/3] Fetching current market price for sell...")
         fresh = await refresh_market(session, pk, ticker)
         if fresh and not args.dry_run:
@@ -226,35 +233,39 @@ async def main():
             yes_bid_cents = round(float(yes_bid_now) * 100)
             print(f"    YES bid/ask now: ${yes_bid_now} / ${yes_ask_now}")
         else:
-            # dry-run: invent a bid 1c below ask
             yes_bid_cents = max(1, yes_ask_cents - 1)
             print(f"    [DRY RUN] Using simulated bid: {yes_bid_cents}c")
 
-        # â”€â”€ 5. SELL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        print(f"    Placing SELL {count}x YES @ {yes_bid_cents}c...")
+        # -- 5. SELL (market FoK) ----------------------------------------------
+        print(f"    Placing market SELL {buy_filled}x YES (IOC)...")
         sell_resp = await place_order(session, pk, ticker,
-                                      "sell", yes_bid_cents, count, args.dry_run)
+                                      "sell", yes_bid_cents, buy_filled, args.dry_run)
         if not sell_resp:
-            print("  SELL FAILED â€” position may still be open, check Kalshi UI")
+            print("  SELL FAILED -- position may still be open, check Kalshi UI")
             sys.exit(1)
 
         sell_order  = sell_resp.get("order", sell_resp)
         sell_id     = sell_order.get("order_id", sell_order.get("id", "?"))
-        sell_filled = sell_order.get("filled_count", 0)
+        sell_filled = int(sell_order.get("filled_count") or 0)
         print(f"    Order ID: {sell_id}")
         print(f"    Status:   {sell_order.get('status', '?')}")
-        print(f"    Filled:   {sell_filled} / {count}")
+        print(f"    Filled:   {sell_filled} / {buy_filled}")
 
-        # â”€â”€ 6. P&L summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        gross_in  = count * yes_ask_usd
-        gross_out = count * (yes_bid_cents / 100.0)
+        if sell_filled <= 0:
+            print(f"  WARNING: sell filled 0 -- {buy_filled} contracts may still be open, check Kalshi UI")
+
+        # -- 6. P&L summary ----------------------------------------------------
+        gross_in  = buy_filled  * (actual_buy_cents / 100.0)
+        gross_out = sell_filled * (yes_bid_cents / 100.0)
         pnl       = gross_out - gross_in
         print(f"\n  Round-trip summary:")
-        print(f"    Bought {count}x @ {yes_ask_cents}c  = ${gross_in:.2f}")
-        print(f"    Sold   {count}x @ {yes_bid_cents}c  = ${gross_out:.2f}")
-        print(f"    P&L:   ${pnl:+.2f}  (before fees)")
+        print(f"    Bought {buy_filled}x @ {actual_buy_cents}c  = ${gross_in:.2f}")
+        print(f"    Sold   {sell_filled}x @ {yes_bid_cents}c  = ${gross_out:.2f}")
+        print(f"    P&L:   ${pnl:+.2f}  (before fees, approx)")
+        if buy_filled != sell_filled:
+            print(f"  WARNING: {buy_filled - sell_filled} contracts unsold -- check Kalshi UI")
         if args.dry_run:
-            print("  [DRY RUN â€” no real orders placed]")
+            print("  [DRY RUN -- no real orders placed]")
 
 
 if __name__ == "__main__":

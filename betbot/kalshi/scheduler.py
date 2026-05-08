@@ -32,6 +32,7 @@ from betbot.kalshi.config import (
     DECISION_YES_MID_MIN, DECISION_YES_MID_MAX,
     ENTRY_MODE, MAX_HOLD_S, MIN_ENTRY_INTERVAL_S,
     COINBASE_STALE_MS_MAX, KALSHI_STALE_MS_MAX,
+    SIZE_MAX_USD, SIZE_MIN_USD, EXIT_SLIP_CENTS,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
 from betbot.kalshi.orders import place_order as kalshi_place_order
@@ -67,7 +68,7 @@ def _kelly_size(edge: float, wallet: float) -> tuple[float, int]:
     """Return (bet_usd, tier_index 1-5).  Returns (0, 0) if below floor."""
     for tier_idx, (floor, frac) in enumerate(KELLY_TIERS, start=1):
         if edge >= floor:
-            return wallet * frac, tier_idx
+            return min(wallet * frac, SIZE_MAX_USD), tier_idx
     return 0.0, 0
 
 
@@ -110,6 +111,7 @@ class Position:
     entry_edge:      float  # signed edge at entry
     size_usd:        float
     contracts:       float
+    entry_mono_s:    float = 0.0  # wall-clock monotonic time at entry
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +128,7 @@ async def _list_active_markets(series: str = KALSHI_SERIES) -> list[dict]:
             async with session.get(url, params=params,
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status != 200:
-                    log.warning("list_markets HTTP %s", r.status)
+                    log.debug("list_markets HTTP %s", r.status)
                     return []
                 data = await r.json()
 
@@ -145,7 +147,7 @@ async def _list_active_markets(series: str = KALSHI_SERIES) -> list[dict]:
         active.sort(key=lambda m: (m["_close_epoch"], float(m.get("floor_strike") or 0.0)))
         return active
     except Exception as e:
-        log.warning("list_markets error: %s", e)
+        log.debug("list_markets error: %s", e)
         return []
 
 
@@ -161,7 +163,7 @@ async def _discover_market(series: str = KALSHI_SERIES,
     """
     active = await _list_active_markets(series)
     if not active:
-        log.warning("discover_market: no active markets in series %s", series)
+        log.debug("discover_market: no active markets in series %s", series)
         return None
 
     # Group by close time — there may be multiple strike levels closing together
@@ -226,7 +228,10 @@ class Scheduler:
         self._model: Optional[LGBMModel] = preloaded_model
         self._pos:    Optional[Position] = None
         self._running = False
-        self._last_entry_t: float = 0.0  # monotonic time of last entry
+        self._last_entry_t: float = 0.0
+        self._last_heartbeat_s: float = 0.0
+        self._last_stale_warn_s: float = 0.0
+        self._asset: str = series.replace("KXBTC15M", "BTC").replace("KXETH15M", "ETH").replace("KXSOL15M", "SOL").replace("KXXRP15M", "XRP")
 
         # Track window transitions in sampler — skip first 30s of samples after
         # a window change so lagged spot features don't bleed from prior window.
@@ -328,7 +333,7 @@ class Scheduler:
             try:
                 await self._tick()
             except Exception as e:
-                log.warning("decision tick error: %s", e)
+                log.debug("decision tick error: %s", e)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, DECISION_INTERVAL_S - elapsed))
 
@@ -390,8 +395,8 @@ class Scheduler:
         slip_up  = _slippage(kb.yes_depth, rough_size)
         slip_no  = _slippage(kb.no_depth, rough_size)
 
-        edge_up_net = edge_up_raw - fee_up - slip_up
-        edge_no_net = edge_no_raw - fee_no - slip_no
+        edge_up_net = edge_up_raw - fee_up - slip_up - EXIT_SLIP_CENTS
+        edge_no_net = edge_no_raw - fee_no - slip_no - EXIT_SLIP_CENTS
 
         if edge_up_net >= edge_no_net:
             edge_signed = edge_up_net
@@ -453,7 +458,7 @@ class Scheduler:
         else:
             entry_price = yes_ask if favored == "yes" else (1.0 - yes_bid)
 
-        bet_usd   = min(bet_usd, self._max_bet_usd)
+        bet_usd   = min(bet_usd, self._max_bet_usd, SIZE_MAX_USD)  # hard cap, dollars
         contracts = bet_usd / max(entry_price, 1e-6)
 
         # ---- Live order placement (if enabled) ----
@@ -463,34 +468,46 @@ class Scheduler:
             else:
                 action, side, price_cents = "buy", "no",  round((1.0 - yes_bid) * 100)
             count_int = max(1, int(contracts))
-            if count_int < 1:
-                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "size_too_small")
-                return
             order = await kalshi_place_order(
                 self._session, self._pk, kb.ticker, action, side, price_cents, count_int,
             )
             if not order:
-                log.error(f"ENTRY ORDER REJECTED side={favored} -- staying flat")
-                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_order_rejected")
+                log.debug("entry order rejected/unfilled, staying flat")
+                self._last_entry_t = time.monotonic()
+                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_order_rejected",
+                                  edge=edge_mag, side=favored, q_pred=q_pred, q_set=q_set,
+                                  edge_raw=edge_up_raw, edge_net=edge_up_net,
+                                  attempted_price=price_cents / 100.0)
                 return
             filled = int(order.get("filled_count") or 0)
             if filled <= 0:
-                log.warning(f"Entry order accepted but unfilled (resting): {order}")
-                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_unfilled")
+                log.debug("entry FoK returned 0 fills")
+                self._last_entry_t = time.monotonic()
+                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_unfilled",
+                                  edge=edge_mag, side=favored, q_pred=q_pred, q_set=q_set,
+                                  edge_raw=edge_up_raw, edge_net=edge_up_net,
+                                  attempted_price=price_cents / 100.0)
                 return
             actual_entry_price = price_cents / 100.0
             actual_size_usd    = filled * actual_entry_price
             self._pos = Position(
                 side=favored, entry_price=actual_entry_price, entry_tau_s=tau,
                 entry_edge=edge_signed, size_usd=actual_size_usd, contracts=float(filled),
+                entry_mono_s=time.monotonic(),
             )
             self._last_entry_t = time.monotonic()
-            print(f"\n  [LIVE ENTRY] side={favored} filled={filled}@{price_cents}c "
-                  f"=${actual_size_usd:.2f} edge={edge_mag:.3f} tier={tier}", flush=True)
+            cost_usd = filled * actual_entry_price
+            print(
+                f"\n  *** ENTRY [{self._asset}] {favored.upper()}  "
+                f"{filled} contracts @ {price_cents}¢  cost=${cost_usd:.2f}  "
+                f"edge={edge_mag:.3f}  tier={tier}  tau={tau:.0f}s ***",
+                flush=True,
+            )
         else:
             self._pos = Position(
                 side=favored, entry_price=entry_price, entry_tau_s=tau,
                 entry_edge=edge_signed, size_usd=bet_usd, contracts=contracts,
+                entry_mono_s=time.monotonic(),
             )
             self._last_entry_t = time.monotonic()
 
@@ -523,10 +540,10 @@ class Scheduler:
             exit_price = 1.0 - yes_ask
 
         reason = None
-        hold_s = pos.entry_tau_s - tau
+        hold_s = time.monotonic() - pos.entry_mono_s  # wall-clock hold time
         if edge_now < LAG_CLOSE_THRESHOLD:
             reason = "exit_lag_closed"
-        elif edge_now < pos.entry_edge - STOP_THRESHOLD:
+        elif STOP_THRESHOLD is not None and edge_now < pos.entry_edge - STOP_THRESHOLD:
             reason = "exit_stopped"
         elif hold_s >= MAX_HOLD_S:
             reason = "exit_max_hold"
@@ -538,35 +555,44 @@ class Scheduler:
             actual_gross      = pos.contracts * exit_price
             if self._live_orders and "resolution" not in reason:
                 if pos.side == "yes":
-                    action, side, price_cents = "sell", "yes", round(yes_bid * 100)
+                    action, side = "sell", "yes"
+                    price_cents  = round(yes_bid * 100)
                 else:
-                    action, side, price_cents = "sell", "no",  round((1.0 - yes_ask) * 100)
+                    action, side = "sell", "no"
+                    price_cents  = round((1.0 - yes_ask) * 100)
                 count_int = max(1, int(pos.contracts))
+
                 order = await kalshi_place_order(
                     self._session, self._pk, self._kb.ticker,
                     action, side, price_cents, count_int,
                 )
-                if not order:
-                    log.error(f"EXIT ORDER REJECTED reason={reason} -- KEEPING position open, "
-                              f"will retry next tick")
+
+                if not order or int(order.get("filled_count") or 0) <= 0:
+                    if hold_s >= MAX_HOLD_S * 2:
+                        print(
+                            f"\n  *** EXIT ABANDONED [{self._asset}] after {hold_s:.0f}s — "
+                            f"clearing position, CHECK KALSHI UI ***",
+                            flush=True,
+                        )
+                        self._pos = None
+                    else:
+                        print(f"  *** EXIT FAILED [{self._asset}] hold={hold_s:.0f}s — retrying next tick ***", flush=True)
                     return
+
                 filled = int(order.get("filled_count") or 0)
-                if filled <= 0:
-                    log.warning(f"Exit order accepted but unfilled (resting); will retry: {order}")
-                    return
                 actual_exit_price = price_cents / 100.0
                 actual_gross      = filled * actual_exit_price
-                if filled < count_int:
-                    log.warning(f"Partial exit fill: {filled}/{count_int} contracts")
 
             entry_fee = _entry_fee(pos.entry_price) * pos.size_usd
             exit_fee  = _fee(actual_exit_price) * actual_gross if "resolution" not in reason else 0.0
             pnl = actual_gross - pos.size_usd - entry_fee - exit_fee
 
-            tag = "LIVE EXIT" if self._live_orders and "resolution" not in reason else "EXIT"
+            live_tag = "LIVE " if self._live_orders and "resolution" not in reason else ""
+            pnl_sign = "+" if pnl >= 0 else ""
             print(
-                f"\n  [{tag}:{reason}] side={pos.side} entry={pos.entry_price:.3f} "
-                f"exit={actual_exit_price:.3f} pnl={pnl:+.2f} USD hold={hold_s:.0f}s",
+                f"\n  *** {live_tag}EXIT [{self._asset}] {reason}  "
+                f"{pos.side.upper()}  entry={pos.entry_price:.3f} → exit={actual_exit_price:.3f}  "
+                f"pnl=${pnl_sign}{pnl:.2f}  hold={hold_s:.0f}s ***",
                 flush=True,
             )
             self._pos = None
@@ -575,10 +601,6 @@ class Scheduler:
                 self._realized_pnl += pnl
                 if self._realized_pnl < self._daily_loss_cap and not self._halted:
                     self._halted = True
-                    log.error(
-                        f"DAILY LOSS LIMIT TRIPPED: realized=${self._realized_pnl:.2f} "
-                        f"<= cap ${self._daily_loss_cap:.2f}. Bot halted."
-                    )
                     print(
                         f"\n  *** DAILY LOSS LIMIT TRIPPED: realized=${self._realized_pnl:.2f} "
                         f"-- HALTING (no new entries) ***", flush=True,
@@ -600,17 +622,19 @@ class Scheduler:
         self._log_decision(row)
         self._print_tick(row)
 
-    def _log_abstain(self, now_ns, tau, yes_bid, yes_ask, yes_mid, reason) -> None:
+    def _log_abstain(self, now_ns, tau, yes_bid, yes_ask, yes_mid, reason,
+                     edge=-99.0, side=None, q_pred=None, q_set=None,
+                     edge_raw=None, edge_net=None, attempted_price=None) -> None:
         model = self._model
         r2    = model.r2_held_out if model is not None else 0.0
         lag   = model.estimated_lag_s if model is not None else 0.0
         row = DecisionRow(
             ts_ns=now_ns, tau_s=tau, yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=yes_mid,
-            q_predicted=None, q_settled=None,
-            edge_up_raw=None, edge_up_net=None,
-            edge_magnitude=-99.0, favored_side=None,
+            q_predicted=q_pred, q_settled=q_set,
+            edge_up_raw=edge_raw, edge_up_net=edge_net,
+            edge_magnitude=edge, favored_side=side,
             event="abstain", abstention_reason=reason,
-            tier=0, would_bet_usd=0.0,
+            tier=0, would_bet_usd=attempted_price or 0.0,
             has_open=self._pos is not None,
             model_r2_hld=r2,
             model_lag_s=lag,
@@ -635,7 +659,7 @@ class Scheduler:
                 mkt = await _discover_market(self._series)
                 if mkt and mkt["ticker"] != self._kb.ticker:
                     next_mkt = mkt
-                    log.info("pre-discovered next window: %s", mkt["ticker"])
+                    log.debug("pre-discovered next window: %s", mkt["ticker"])
 
             # Switch when current window has closed
             if tau <= 0:
@@ -653,8 +677,7 @@ class Scheduler:
                             self._do_rollover(mkt)
                             next_mkt = None
                             break
-                        log.info("window gap: waiting for next market (attempt %d, %.0fs elapsed)",
-                                 attempt, attempt * 5)
+                        log.debug("window gap: waiting for next market (attempt %d)", attempt)
 
             await asyncio.sleep(10)
 
@@ -669,7 +692,7 @@ class Scheduler:
             import datetime as _dt2
             close_time = _dt2.datetime.now(_dt2.timezone.utc) + _dt2.timedelta(minutes=15)
 
-        log.info("window rollover -> %s  K=%.2f", ticker, floor_strike)
+        log.debug("window rollover -> %s  K=%.2f", ticker, floor_strike)
         self._kb.set_window(ticker, floor_strike, close_time)
         self._ws.update_ticker(ticker)
         self._pos = None    # positions don't carry across windows
@@ -706,26 +729,30 @@ class Scheduler:
         self._log_fh.flush()
 
     def _print_tick(self, row: DecisionRow) -> None:
-        q_s    = f"{row.q_settled:.3f}"   if row.q_settled   is not None else "---"
-        q_p    = f"{row.q_predicted:.3f}" if row.q_predicted is not None else "---"
-        edge_s = f"{row.edge_magnitude:.4f}" if row.edge_magnitude > -50 else "---"
-
+        # Only print feed staleness warnings and non-abstain events — no per-tick spam.
         cb_stale_ms = int((time.time_ns() - self._cb.last_update_ns) / 1e6)
         kb_stale_ms = int((time.time_ns() - self._kb.last_update_ns) / 1e6)
-        cb_ok = "CB:OK " if cb_stale_ms < 5000 else f"CB:STALE({cb_stale_ms}ms)"
-        kb_ok = "KB:OK" if kb_stale_ms < 15000 else f"KB:STALE({kb_stale_ms}ms)"
 
-        r2 = self._model.r2_held_out if self._model is not None else 0.0
+        now_mono = time.monotonic()
+        if now_mono - self._last_stale_warn_s >= 30:
+            warned = False
+            if self._cb.last_update_ns > 0 and cb_stale_ms >= 5000:
+                print(f"  *** CB:STALE {cb_stale_ms}ms — Coinbase feed silent ***", flush=True)
+                warned = True
+            if self._kb.last_update_ns > 0 and kb_stale_ms >= 15000:
+                print(f"  *** KB:STALE {kb_stale_ms}ms — Kalshi feed silent ***", flush=True)
+                warned = True
+            if warned:
+                self._last_stale_warn_s = now_mono
 
-        print(
-            f"[{row.event:22s}] "
-            f"tau={row.tau_s:5.0f}s  "
-            f"BTC=${self._cb.microprice:,.2f}  "
-            f"bid={row.yes_bid:.3f} ask={row.yes_ask:.3f}  "
-            f"q_set={q_s} q_pred={q_p}  "
-            f"edge={edge_s}  "
-            f"R2hld={r2:.2f}  "
-            f"{cb_ok} {kb_ok}  "
-            f"{row.abstention_reason or ''}",
-            flush=True,
-        )
+        # Print a heartbeat line every 60s so you know it's alive
+        now_s = time.monotonic()
+        if now_s - self._last_heartbeat_s >= 60:
+            self._last_heartbeat_s = now_s
+            edge_s = f"{row.edge_magnitude:.4f}" if row.edge_magnitude > -50 else "---"
+            pos_str = f"OPEN {self._pos.side}@{self._pos.entry_price:.3f}" if self._pos else "flat"
+            print(
+                f"  [heartbeat] {self._asset}  tau={row.tau_s:.0f}s  "
+                f"bid={row.yes_bid:.3f} ask={row.yes_ask:.3f}  edge={edge_s}  {pos_str}",
+                flush=True,
+            )

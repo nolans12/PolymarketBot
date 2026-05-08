@@ -46,7 +46,7 @@ from betbot.kalshi.config import (
     LAG_CLOSE_THRESHOLD, MAX_HOLD_S, FALLBACK_TAU_S,
     KELLY_TIERS, ENTRY_MODE, MIN_ENTRY_INTERVAL_S,
     LGBM_FORECAST_HORIZONS, LGBM_PRIMARY_HORIZON,
-    TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX,
+    TRAIN_PRICE_MIN, TRAIN_PRICE_MAX,
     SIZE_MIN_USD, SIZE_MAX_USD,
 )
 from pick_run import pick_run_folder
@@ -551,9 +551,12 @@ def main():
     flat_rows: list[dict] = []
     flat_X:    list       = []
     for rows in sorted(windows.values(), key=lambda v: v[0]["ts_ns"]):
+        entry_tau_s = rows[0]["tau_s"]
         for i, r in enumerate(rows):
+            elapsed = entry_tau_s - r["tau_s"]
+            fv = build_feature_row(rows, i) if elapsed >= 30 else None
             flat_rows.append(r)
-            flat_X.append(None if i < 30 else build_feature_row(rows, i))
+            flat_X.append(fv)
 
     valid = sum(1 for x in flat_X if x is not None)
     print(f"  {valid} ticks with complete features", flush=True)

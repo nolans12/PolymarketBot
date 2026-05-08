@@ -89,10 +89,16 @@ SAMPLE_INTERVAL_S = 0.1   # write a training sample every 100ms during dry run
 
 # ---------------------------------------------------------------------------
 # Training-sample filter (applied in train_model.py / tune_trading_knobs.py / test_all.py)
+# Filters both the feature rows (yes_mid) and target rows (yes_bid) to exclude
+# extreme near-0 / near-1 prices where the market is essentially resolved already.
 # ---------------------------------------------------------------------------
 
-TRAIN_YES_MID_MIN = 0.001
-TRAIN_YES_MID_MAX = 0.999
+TRAIN_PRICE_MIN = 0.001
+TRAIN_PRICE_MAX = 0.999
+
+# Legacy aliases — kept so old code doesn't break during transition
+TRAIN_YES_MID_MIN = TRAIN_PRICE_MIN
+TRAIN_YES_MID_MAX = TRAIN_PRICE_MAX
 
 HELDOUT_FRACTION = 0.2   # last 20% of time-span held out for model validation
 
@@ -115,10 +121,22 @@ DECISION_YES_MID_MAX = 0.99
 
 THETA_FEE_TAKER = 0.07
 THETA_FEE_MAKER = 0.0
+EXIT_SLIP_CENTS = 0.01   # guaranteed 1¢ undercut on every exit to ensure fill
 
 ENTRY_MODE = os.getenv("ENTRY_MODE", "taker").strip().lower()
 if ENTRY_MODE not in ("taker", "maker"):
     raise ValueError(f"ENTRY_MODE must be 'taker' or 'maker', got {ENTRY_MODE!r}")
+
+
+# Total wallet the bot is allowed to use.
+# With --live-orders the real Kalshi balance is fetched, then CAPPED to this value.
+# Set this to however much you want at risk (real balance can be higher, bot won't touch the rest).
+WALLET_BALANCE = 100.0
+
+# Hard cap: bot will NEVER place a single order worth more than SIZE_MAX_USD.
+# Enforced twice: in dollar sizing AND in contract count — two independent checks.
+SIZE_MIN_USD = 0.25
+SIZE_MAX_USD = 2.0
 
 # ---------------------------------------------------------------------------
 # Kelly tier table  (edge_floor, wallet_fraction)
@@ -126,21 +144,19 @@ if ENTRY_MODE not in ("taker", "maker"):
 # ---------------------------------------------------------------------------
 
 KELLY_TIERS = [
-    (0.10, 0.03),   # edge > 10c → 3% of wallet
-    (0.06, 0.02),   # edge > 6c  → 2% of wallet
+    (0.10, 0.06),
+    (0.06, 0.04),
+    (0.02, 0.02),   # add a small-size tier for ETH-level edges
 ]
-
-SIZE_MIN_USD = 1.0
-SIZE_MAX_USD = 25.0
 
 # ---------------------------------------------------------------------------
 # Exit rules
 # ---------------------------------------------------------------------------
 
-LAG_CLOSE_THRESHOLD = 0.02   # exit when edge compresses below this
-STOP_THRESHOLD      = 0.03    # cut loss if edge erodes this much below entry price
+LAG_CLOSE_THRESHOLD = 0.005   # exit when edge compresses below this
+STOP_THRESHOLD      = None    # set to a float (e.g. 0.03) to enable stop-loss; None = disabled
 FALLBACK_TAU_S      = 60      # hold to resolution when < this many seconds remain
-MAX_HOLD_S          = 20      # force-exit if still open after this many seconds
+MAX_HOLD_S          = 15      # force-exit if still open after this many seconds
 
 # ---------------------------------------------------------------------------
 # Circuit breakers

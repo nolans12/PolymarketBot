@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "analysis"))
 
 from betbot.kalshi.features import _logit, FEATURE_NAMES
 from betbot.kalshi.model import LGBMModel, make_model, save_model, load_model
-from betbot.kalshi.config import LGBM_FORECAST_HORIZONS, LGBM_PRIMARY_HORIZON, TRAIN_YES_MID_MIN, TRAIN_YES_MID_MAX
+from betbot.kalshi.config import LGBM_FORECAST_HORIZONS, LGBM_PRIMARY_HORIZON, TRAIN_PRICE_MIN, TRAIN_PRICE_MAX
 from pick_run import pick_run_folder
 
 MODEL_FITS_DIR = _REPO / "model_fits"
@@ -131,6 +131,10 @@ def build_multi_horizon_targets_for_window(
     """
     Build shifted targets for one window only. Never looks across window boundaries.
     rows, X_list, ts_list must all be from the same window_ticker.
+
+    Target for each horizon h: yes_bid at t+h seconds.
+    This is the price we expect to EXIT at (sell into the bid), so edge =
+    predicted_future_bid - current_ask. Using bid (not mid) avoids overstating P&L.
     """
     if not X_list:
         return np.empty((0, len(horizons_s))), np.empty((0, len(horizons_s))), np.empty((0,))
@@ -152,8 +156,8 @@ def build_multi_horizon_targets_for_window(
             if abs(ts_arr[j] - target_ts) > tol:
                 ok = False
                 break
-            targets.append(rows[j]["yes_mid"])
-        if ok and all(TRAIN_YES_MID_MIN <= t <= TRAIN_YES_MID_MAX for t in targets):
+            targets.append(rows[j]["yes_bid"])
+        if ok and all(TRAIN_PRICE_MIN <= t <= TRAIN_PRICE_MAX for t in targets):
             valid_idx.append(i)
             for col, t in enumerate(targets):
                 y_cols[col].append(_logit(t))
@@ -236,10 +240,23 @@ def main():
         win_X:    list       = []
         win_ts:   list[int]  = []
 
+        # tau_s of the first tick tells us how late into the window we joined.
+        # Lag features look back up to 30s, so only use ticks where we've been
+        # collecting for at least 30s within this window's actual timeline.
+        # Target builder needs tau_s >= max_horizon + 5s buffer.
+        entry_tau_s  = rows[0]["tau_s"]
+        max_horizon  = max(LGBM_FORECAST_HORIZONS)
+        min_tau_needed = max_horizon + 5  # must have this much window left for target to exist
+
         for i, r in enumerate(rows):
-            if i < 30:
+            # Elapsed time since we started collecting in this window
+            elapsed_in_window = entry_tau_s - r["tau_s"]
+            if elapsed_in_window < 30:
                 continue
-            if not (TRAIN_YES_MID_MIN <= r["yes_mid"] <= TRAIN_YES_MID_MAX):
+            # Target must exist within this window
+            if r["tau_s"] < min_tau_needed:
+                continue
+            if not (TRAIN_PRICE_MIN <= r["yes_mid"] <= TRAIN_PRICE_MAX):
                 continue
             fv = build_feature_row(rows, i)
             if fv is None:

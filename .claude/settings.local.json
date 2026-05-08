@@ -61,7 +61,13 @@
       "Skill(office-hours:*)",
       "Bash(python -c \"import lightgbm; print\\(lightgbm.__version__\\)\")",
       "PowerShell(New-Item -ItemType Directory -Path \"C:\\\\Users\\\\steve\\\\Repos\\\\PolymarketBot\\\\model_fits\" -Force)",
-      "Bash(Remove-Item \"c:\\\\Users\\\\steve\\\\Repos\\\\PolymarketBot\\\\scripts\\\\test_model.py\")"
+      "Bash(Remove-Item \"c:\\\\Users\\\\steve\\\\Repos\\\\PolymarketBot\\\\scripts\\\\test_model.py\")",
+      "Bash(python scripts/merge_runs.py --runs data/2026-05-07_02-27-02_BTC_ETH_SOL_XRP data/2026-05-07_08-51-08_BTC_ETH_SOL_XRP --name 20260507)",
+      "Bash(python scripts/tune_trading_knobs.py --model-file model_fits/merged_20260507_v2_SOL_20260507_150124/model.pkl --run data/merged_20260507_v2 --asset SOL --train-frac 0.7)",
+      "Bash(python -c \"from betbot.kalshi.scheduler import Scheduler; from betbot.kalshi.orders import place_order; print\\('OK'\\)\")",
+      "WebFetch(domain:docs.kalshi.com)",
+      "WebFetch(domain:help.kalshi.com)",
+      "WebSearch"
     ]
   }
 }

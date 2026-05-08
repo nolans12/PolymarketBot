@@ -33,6 +33,7 @@ from betbot.kalshi.scheduler import Scheduler, _discover_market
 from betbot.kalshi.config import (
     KALSHI_KEY_ID, SPOT_SOURCE,
     KALSHI_ASSETS, COINBASE_PRODUCTS,
+    WALLET_BALANCE,
 )
 from betbot.kalshi.orders import get_balance_usd
 from betbot.kalshi.model import load_model
@@ -45,6 +46,8 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%H:%M:%S",
 )
+# Suppress LightGBM's own logger (it prints noisy warnings during inference)
+logging.getLogger("lightgbm").setLevel(logging.ERROR)
 log = logging.getLogger("kalshi_bot")
 
 ALL_ASSETS = list(KALSHI_ASSETS.keys())   # ["BTC", "ETH", "SOL", "XRP"]
@@ -225,8 +228,8 @@ async def main():
             real_balance = await get_balance_usd(s, pk)
         if real_balance <= 0:
             sys.exit("ERROR: --live-orders requires positive Kalshi balance.")
-        wallet_usd = real_balance
-        print(f"  Live wallet (Kalshi balance): ${wallet_usd:,.2f}", flush=True)
+        wallet_usd = min(real_balance, WALLET_BALANCE)
+        print(f"  Live wallet (Kalshi balance): ${real_balance:,.2f}  capped to: ${wallet_usd:,.2f}  (WALLET_BALANCE in config.py)", flush=True)
     else:
         print(f"  Wallet:     ${wallet_usd:,.0f} (simulated, split across {len(assets)} assets)",
               flush=True)
@@ -241,12 +244,12 @@ async def main():
     if SPOT_SOURCE == "coinbase":
         spot_feed = CoinbaseFeed(books=product_to_book)
     elif SPOT_SOURCE == "binance":
-        # Binance multi-asset: one feed per asset (each has its own WS stream URL)
-        # For simplicity we still use CoinbaseFeed for multi-asset; Binance
-        # multi-asset support can be added if needed.
-        print("  WARNING: Binance multi-asset not yet supported; falling back to Coinbase.",
-              flush=True)
-        spot_feed = CoinbaseFeed(books=product_to_book)
+        if len(assets) == 1 and assets[0] == "BTC":
+            spot_feed = BinanceFeed(spot_books["BTC"])
+        else:
+            print("  WARNING: Binance multi-asset not yet supported; falling back to Coinbase.",
+                  flush=True)
+            spot_feed = CoinbaseFeed(books=product_to_book)
     else:
         raise RuntimeError(f"Unknown SPOT_SOURCE: {SPOT_SOURCE!r}")
 

@@ -2,8 +2,8 @@
 model.py - LightGBM multi-horizon prediction model for Kalshi lead-lag arb.
 
 Trains one LGBMRegressor per forecast horizon (5s, 10s, 15s, 60s ahead).
-Target for each model: logit(yes_mid_{t + h_seconds}) — a real future value,
-not a lag-substituted proxy.
+Target for each model: logit(yes_bid_{t + h_seconds}) — the future bid price,
+so edge = predicted_future_bid - current_ask reflects actual fill prices.
 
 q_settled() returns the primary-horizon prediction at the current feature
 vector, expressed as a probability. This is the edge signal the decision
@@ -123,7 +123,7 @@ class LGBMModel:
             "verbose":           -1,
             "n_jobs":            1,
             "num_threads":       1,
-            "verbosity":         1,
+            "verbosity":         -1,
         }
 
     # ---- Pickle support (strip/restore threading.Lock) ----
@@ -146,6 +146,20 @@ class LGBMModel:
         if not hasattr(self, "last_refit_ns"):   self.last_refit_ns   = 0
         if not hasattr(self, "estimated_lag_s"): self.estimated_lag_s = float(self._primary_h)
         if not hasattr(self, "last_diag"):       self.last_diag       = None
+
+        # Strip stale `verbose` param baked into older pkl models — it conflicts
+        # with `verbosity=-1` and prints "verbose=50 will be ignored" on every predict.
+        for mdl in (self._models or []):
+            if mdl is None:
+                continue
+            try:
+                params = mdl.get_params()
+                if params.get("verbose") not in (None, -1):
+                    mdl.set_params(verbose=-1)
+                if hasattr(mdl, "_other_params"):
+                    mdl._other_params.pop("verbose", None)
+            except Exception:
+                pass
 
     # ---- Snapshot / restore for fit_if_better ----
 
@@ -178,7 +192,7 @@ class LGBMModel:
     def fit(self, X: np.ndarray, y: np.ndarray, ts_ns: np.ndarray) -> ModelDiagnostics:
         """
         X:     (n, N_FEATURES)
-        y:     (n, n_horizons) — each column is logit(yes_mid_{t+h}) for one horizon
+        y:     (n, n_horizons) — each column is logit(yes_bid_{t+h}) for one horizon
         ts_ns: (n,) nanosecond timestamps of the feature rows
         """
         if y.ndim == 1:
@@ -211,10 +225,9 @@ class LGBMModel:
             Xva_s  = scaler.transform(X[val_mask]) if val_mask.sum() > 0 else None
 
             params = dict(self._lgb_params)
-            params["verbose"] = 50
             mdl = self._lgb.LGBMRegressor(**params)
 
-            callbacks = [self._lgb.log_evaluation(50)]
+            callbacks = [self._lgb.log_evaluation(period=-1)]
             if Xva_s is not None:
                 callbacks.insert(0, self._lgb.early_stopping(20, verbose=False))
 
@@ -289,14 +302,24 @@ class LGBMModel:
     # ---- Inference ----
 
     def _predict_horizon(self, vec: np.ndarray, horizon_idx: int) -> Optional[float]:
-        import pandas as _pd
+        import os, pandas as _pd
         mdl    = self._models[horizon_idx]
         scaler = self._scalers[horizon_idx]
         if mdl is None or scaler is None:
             return None
         x_scaled = scaler.transform([vec])[0]
         x_df = _pd.DataFrame([x_scaled], columns=FEATURE_NAMES)
-        return float(mdl.predict(x_df)[0])
+        # Suppress LightGBM's C++ stderr warnings (verbosity conflict) at the fd level
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        try:
+            result = float(mdl.predict(x_df)[0])
+        finally:
+            os.dup2(old_stderr, 2)
+            os.close(old_stderr)
+            os.close(devnull_fd)
+        return result
 
     def q_settled(self, fv: "FeatureVec") -> Optional[float]:
         """Primary edge signal: probability at primary horizon."""

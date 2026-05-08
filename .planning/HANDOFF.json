@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-07T08:25:25.541Z",
+  "timestamp": "2026-05-08T06:09:54.741Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -18,7 +18,7 @@
   "uncommitted_files": [
     {
       "status": "M",
-      "path": ".gitignore"
+      "path": ".claude/settings.local.json"
     },
     {
       "status": "M",
@@ -26,13 +26,61 @@
     },
     {
       "status": "M",
-      "path": "README.md"
+      "path": "RUN.md"
     },
     {
       "status": "M",
-      "path": "RUN.md"
+      "path": "betbot/kalshi/coinbase_feed.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/config.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/model.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/orders.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/scheduler.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/run/run_kalshi_bot.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/test/test_trade.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/test_all.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/train_model.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/tune_trading_knobs.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/merge_runs.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/watch_decisions.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/window_replay.py"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work\n0ca5ba0 before changing model\n285a6c7 multi assets\n5dd7470 only coinbase"
+  "context_notes": "Recent commits:\n7741d00 update\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work\n0ca5ba0 before changing model\n285a6c7 multi assets"
 }

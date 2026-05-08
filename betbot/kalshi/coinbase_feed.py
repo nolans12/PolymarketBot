@@ -55,15 +55,20 @@ class CoinbaseFeed:
             try:
                 async with websockets.connect(
                     COINBASE_WS,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    open_timeout=15,
+                    ping_interval=10,
+                    ping_timeout=5,
+                    open_timeout=10,
+                    close_timeout=5,
                 ) as ws:
                     await ws.send(json.dumps(sub))
 
-                    async for raw in ws:
-                        if not self._running:
-                            return
+                    while self._running:
+                        # Watchdog: if no message in 15s, force a reconnect
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            print("  *** Coinbase WS silent >15s, reconnecting ***", flush=True)
+                            break
                         try:
                             msg = json.loads(raw)
                         except Exception:
