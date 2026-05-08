@@ -33,9 +33,13 @@ from betbot.kalshi.config import (
     ENTRY_MODE, MAX_HOLD_S, MIN_ENTRY_INTERVAL_S,
     COINBASE_STALE_MS_MAX, KALSHI_STALE_MS_MAX,
     SIZE_MAX_USD, SIZE_MIN_USD, EXIT_SLIP_CENTS,
+    MAKER_AT_BID_PLUS_1, MAKER_TTL_S, MAKER_POLL_S,
 )
 from betbot.kalshi.features import FeatureVec, _logit, _sigmoid, build_features
-from betbot.kalshi.orders import place_order as kalshi_place_order
+from betbot.kalshi.orders import (
+    place_order as kalshi_place_order,
+    place_resting_limit, get_order, cancel_order,
+)
 from betbot.kalshi.model import LGBMModel, make_model, load_model
 from betbot.kalshi.tick_logger import TickLogger
 
@@ -52,10 +56,23 @@ def _fee(p: float) -> float:
 
 
 def _entry_fee(p: float) -> float:
-    """Entry-leg fee per dollar bet. Zero in maker mode."""
+    """Entry-leg fee per dollar bet. Zero in maker mode (the default)."""
     if ENTRY_MODE == "maker":
         return 0.0
     return _fee(p)
+
+
+def _maker_entry_price(yes_bid: float, yes_ask: float, side: str) -> float:
+    """Return the cents-rounded price the bot would post a maker bid at."""
+    offset = 0.01 if MAKER_AT_BID_PLUS_1 else 0.0
+    if side == "yes":
+        raw = yes_bid + offset
+        cap = yes_ask
+    else:
+        raw = (1.0 - yes_ask) + offset
+        cap = 1.0 - yes_bid
+    px_c = max(1, min(99, round(raw * 100)))
+    return min(px_c / 100.0, cap)
 
 
 def _slippage(book_depth: float, size_usd: float) -> float:
@@ -302,8 +319,9 @@ class Scheduler:
                     self._sampler_ticker = cur_ticker
                     self._sampler_window_start = t0
 
-                # Write raw tick to CSV regardless of feature completeness
+                # Write raw tick to parquet regardless of feature completeness
                 if self._tick_logger and cb.ready and kb.ready:
+                    yes_top, no_top = kb.top_n_levels(10)
                     self._tick_logger.log(
                         ts_ns=time.time_ns(),
                         tau_s=kb.tau_s(),
@@ -317,6 +335,8 @@ class Scheduler:
                         yes_mid=kb.yes_mid,
                         floor_strike=kb.floor_strike,
                         window_ticker=kb.ticker,
+                        yes_book_top10=yes_top,
+                        no_book_top10=no_top,
                     )
             except Exception as e:
                 log.debug("sampler error: %s", e)
@@ -384,19 +404,33 @@ class Scheduler:
             self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "model_disagrees_market")
             return
 
-        # ---- Edge calculation ----
-        edge_up_raw  = q_set - yes_ask
-        edge_no_raw  = (1.0 - q_set) - (1.0 - yes_bid)
+        # ---- Edge calculation (maker entry, taker exit) ----
+        # Entry price = bid + 1c if MAKER_AT_BID_PLUS_1 else bid (resting limit, fills passively)
+        # Exit price  = bid (sweeps as taker IOC, gets at most the current bid)
+        # Maker fee = 0; taker exit fee = THETA * p_exit * (1 - p_exit)
+        entry_offset_yes = 0.01 if MAKER_AT_BID_PLUS_1 else 0.0
+        entry_offset_no  = 0.01 if MAKER_AT_BID_PLUS_1 else 0.0
 
-        fee_up   = _entry_fee(yes_ask)
-        fee_no   = _entry_fee(1.0 - yes_bid)
+        # YES side: buy YES at yes_bid+1c, exit selling YES at yes_bid (after lag closes,
+        # the bid should drift up to q_set so exit price ≈ q_set).
+        entry_yes = min(yes_bid + entry_offset_yes, yes_ask)   # never cross the ask
+        exit_yes  = q_set                                      # predicted future bid
+        edge_up_raw  = exit_yes - entry_yes
+        fee_up       = _fee(exit_yes)                          # taker fee on exit only
+
+        # NO side: buy NO at no_bid+1c (= 1 - yes_ask + 1c), exit selling NO at no_bid (= 1 - yes_ask).
+        # Equivalently in YES terms: pay (1 - yes_ask) + 1c, receive (1 - q_set) at exit.
+        entry_no = min((1.0 - yes_ask) + entry_offset_no, 1.0 - yes_bid)
+        exit_no  = 1.0 - q_set
+        edge_no_raw = exit_no - entry_no
+        fee_no      = _fee(exit_no)
 
         rough_size = self._wallet * KELLY_TIERS[-1][1]
         slip_up  = _slippage(kb.yes_depth, rough_size)
         slip_no  = _slippage(kb.no_depth, rough_size)
 
-        edge_up_net = edge_up_raw - fee_up - slip_up - EXIT_SLIP_CENTS
-        edge_no_net = edge_no_raw - fee_no - slip_no - EXIT_SLIP_CENTS
+        edge_up_net = edge_up_raw - fee_up - slip_up
+        edge_no_net = edge_no_raw - fee_no - slip_no
 
         if edge_up_net >= edge_no_net:
             edge_signed = edge_up_net
@@ -453,59 +487,82 @@ class Scheduler:
             self._print_tick(row)
             return
 
-        if ENTRY_MODE == "maker":
-            entry_price = yes_bid if favored == "yes" else (1.0 - yes_ask)
+        # Maker entry: post resting limit at bid+1c on the favored side, poll for fill,
+        # cancel after MAKER_TTL_S. If fully filled → take the position. If not, abandon.
+        offset_c = 1 if MAKER_AT_BID_PLUS_1 else 0
+        if favored == "yes":
+            action, side    = "buy", "yes"
+            entry_price_c   = max(1, min(99, round(yes_bid * 100) + offset_c))
         else:
-            entry_price = yes_ask if favored == "yes" else (1.0 - yes_bid)
+            action, side    = "buy", "no"
+            entry_price_c   = max(1, min(99, round((1.0 - yes_ask) * 100) + offset_c))
+        entry_price_dollars = entry_price_c / 100.0
 
-        bet_usd   = min(bet_usd, self._max_bet_usd, SIZE_MAX_USD)  # hard cap, dollars
-        contracts = bet_usd / max(entry_price, 1e-6)
+        bet_usd   = min(bet_usd, self._max_bet_usd, SIZE_MAX_USD)
+        contracts = max(1, int(bet_usd / max(entry_price_dollars, 1e-6)))
 
-        # ---- Live order placement (if enabled) ----
+        # ---- Live order placement (maker workflow) ----
         if self._live_orders:
-            if favored == "yes":
-                action, side, price_cents = "buy", "yes", round(yes_ask * 100)
-            else:
-                action, side, price_cents = "buy", "no",  round((1.0 - yes_bid) * 100)
-            count_int = max(1, int(contracts))
-            order = await kalshi_place_order(
-                self._session, self._pk, kb.ticker, action, side, price_cents, count_int,
+            order = await place_resting_limit(
+                self._session, self._pk, kb.ticker, action, side,
+                entry_price_c, contracts,
             )
             if not order:
-                log.debug("entry order rejected/unfilled, staying flat")
+                log.debug("maker post rejected, staying flat")
                 self._last_entry_t = time.monotonic()
-                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_order_rejected",
+                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "maker_post_rejected",
                                   edge=edge_mag, side=favored, q_pred=q_pred, q_set=q_set,
                                   edge_raw=edge_up_raw, edge_net=edge_up_net,
-                                  attempted_price=price_cents / 100.0)
+                                  attempted_price=entry_price_dollars)
                 return
-            filled = int(order.get("filled_count") or 0)
-            if filled <= 0:
-                log.debug("entry FoK returned 0 fills")
-                self._last_entry_t = time.monotonic()
-                self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "entry_unfilled",
-                                  edge=edge_mag, side=favored, q_pred=q_pred, q_set=q_set,
-                                  edge_raw=edge_up_raw, edge_net=edge_up_net,
-                                  attempted_price=price_cents / 100.0)
-                return
-            actual_entry_price = price_cents / 100.0
-            actual_size_usd    = filled * actual_entry_price
+
+            order_id = order.get("order_id")
+
+            # Poll for fill until TTL expires
+            t_start = time.monotonic()
+            final   = order
+            while time.monotonic() - t_start < MAKER_TTL_S:
+                cur = await get_order(self._session, self._pk, order_id)
+                if cur:
+                    final = cur
+                    cur_filled = int(float(cur.get("fill_count_fp") or 0))
+                    if cur_filled >= contracts:
+                        break
+                await asyncio.sleep(MAKER_POLL_S)
+
+            filled = int(float(final.get("fill_count_fp") or 0))
+            if filled < contracts:
+                # TTL expired — cancel the rest
+                await cancel_order(self._session, self._pk, order_id)
+                final = await get_order(self._session, self._pk, order_id) or final
+                filled = int(float(final.get("fill_count_fp") or 0))
+                if filled <= 0:
+                    self._last_entry_t = time.monotonic()
+                    self._log_abstain(now_ns, tau, yes_bid, yes_ask, yes_mid, "maker_ttl_no_fill",
+                                      edge=edge_mag, side=favored, q_pred=q_pred, q_set=q_set,
+                                      edge_raw=edge_up_raw, edge_net=edge_up_net,
+                                      attempted_price=entry_price_dollars)
+                    return
+                # Partial fill — proceed with what we got
+
+            cost_usd       = float(final.get("maker_fill_cost_dollars") or 0) \
+                           + float(final.get("taker_fill_cost_dollars") or 0)
+            actual_entry_p = (cost_usd / filled) if cost_usd > 0 else entry_price_dollars
             self._pos = Position(
-                side=favored, entry_price=actual_entry_price, entry_tau_s=tau,
-                entry_edge=edge_signed, size_usd=actual_size_usd, contracts=float(filled),
+                side=favored, entry_price=actual_entry_p, entry_tau_s=tau,
+                entry_edge=edge_signed, size_usd=cost_usd, contracts=float(filled),
                 entry_mono_s=time.monotonic(),
             )
             self._last_entry_t = time.monotonic()
-            cost_usd = filled * actual_entry_price
             print(
-                f"\n  *** ENTRY [{self._asset}] {favored.upper()}  "
-                f"{filled} contracts @ {price_cents}¢  cost=${cost_usd:.2f}  "
+                f"\n  *** MAKER ENTRY [{self._asset}] {favored.upper()}  "
+                f"{filled}/{contracts} @ ${actual_entry_p:.3f}  cost=${cost_usd:.2f}  "
                 f"edge={edge_mag:.3f}  tier={tier}  tau={tau:.0f}s ***",
                 flush=True,
             )
         else:
             self._pos = Position(
-                side=favored, entry_price=entry_price, entry_tau_s=tau,
+                side=favored, entry_price=entry_price_dollars, entry_tau_s=tau,
                 entry_edge=edge_signed, size_usd=bet_usd, contracts=contracts,
                 entry_mono_s=time.monotonic(),
             )
@@ -553,6 +610,7 @@ class Scheduler:
         if reason:
             actual_exit_price = exit_price
             actual_gross      = pos.contracts * exit_price
+            exit_fees         = 0.0
             if self._live_orders and "resolution" not in reason:
                 if pos.side == "yes":
                     action, side = "sell", "yes"
@@ -567,7 +625,12 @@ class Scheduler:
                     action, side, price_cents, count_int,
                 )
 
-                if not order or int(order.get("filled_count") or 0) <= 0:
+                fill_n     = int(float(order.get("fill_count_fp") or 0)) if order else 0
+                # For SELL orders, taker_fill_cost_dollars is what the BUYER paid.
+                # Our actual proceeds = count - taker_fill_cost_dollars (Kalshi reciprocal).
+                buyer_cost = float(order.get("taker_fill_cost_dollars") or 0) if order else 0.0
+                proceeds   = max(0.0, fill_n - buyer_cost) if fill_n > 0 else 0.0
+                if fill_n <= 0:
                     if hold_s >= MAX_HOLD_S * 2:
                         print(
                             f"\n  *** EXIT ABANDONED [{self._asset}] after {hold_s:.0f}s — "
@@ -579,12 +642,14 @@ class Scheduler:
                         print(f"  *** EXIT FAILED [{self._asset}] hold={hold_s:.0f}s — retrying next tick ***", flush=True)
                     return
 
-                filled = int(order.get("filled_count") or 0)
-                actual_exit_price = price_cents / 100.0
-                actual_gross      = filled * actual_exit_price
+                filled = fill_n
+                actual_exit_price = (proceeds / fill_n) if proceeds > 0 else (price_cents / 100.0)
+                actual_gross      = proceeds
+                exit_fees         = float(order.get("taker_fees_dollars") or 0)
 
-            entry_fee = _entry_fee(pos.entry_price) * pos.size_usd
-            exit_fee  = _fee(actual_exit_price) * actual_gross if "resolution" not in reason else 0.0
+            entry_fee = _entry_fee(pos.entry_price) * pos.size_usd if "resolution" not in reason else 0.0
+            exit_fee  = exit_fees if (self._live_orders and "resolution" not in reason) else (
+                _fee(actual_exit_price) * actual_gross if "resolution" not in reason else 0.0)
             pnl = actual_gross - pos.size_usd - entry_fee - exit_fee
 
             live_tag = "LIVE " if self._live_orders and "resolution" not in reason else ""

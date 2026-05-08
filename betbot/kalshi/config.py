@@ -45,7 +45,7 @@ KALSHI_ASSETS = {
 # SPOT_SOURCE = "coinbase"  — US-legal, no VPN required (default)
 # SPOT_SOURCE = "binance"   — geo-blocked from US IPs, requires VPN
 
-SPOT_SOURCE = os.getenv("SPOT_SOURCE", "coinbase").strip().lower()
+SPOT_SOURCE = os.getenv("SPOT_SOURCE", "binance").strip().lower()
 if SPOT_SOURCE not in ("coinbase", "binance"):
     raise ValueError(f"SPOT_SOURCE must be 'coinbase' or 'binance', got {SPOT_SOURCE!r}")
 
@@ -117,15 +117,29 @@ DECISION_YES_MID_MAX = 0.99
 # Fees
 # ---------------------------------------------------------------------------
 # Kalshi taker fee = THETA * p * (1 - p) per dollar bet, per leg.
-# Maker orders pay 0. Entry mode is configurable; exit is always taker.
+# Maker orders pay 0. Entry is maker (post resting); exit is taker (sweep IOC).
 
 THETA_FEE_TAKER = 0.07
 THETA_FEE_MAKER = 0.0
-EXIT_SLIP_CENTS = 0.01   # guaranteed 1¢ undercut on every exit to ensure fill
+EXIT_SLIP_CENTS = 0.0    # taker IOC sweeps at the bid — no extra slippage modeled here
 
-ENTRY_MODE = os.getenv("ENTRY_MODE", "taker").strip().lower()
+ENTRY_MODE = os.getenv("ENTRY_MODE", "maker").strip().lower()
 if ENTRY_MODE not in ("taker", "maker"):
     raise ValueError(f"ENTRY_MODE must be 'taker' or 'maker', got {ENTRY_MODE!r}")
+
+# ---------------------------------------------------------------------------
+# Maker entry parameters (used only when ENTRY_MODE=maker)
+# ---------------------------------------------------------------------------
+# Maker post price: at bid (cheapest) or bid+1c (faster fills, 1c more expensive).
+# Default is bid+1 — joins inside the spread for higher fill probability.
+MAKER_AT_BID_PLUS_1 = True
+
+# How many seconds to wait for the resting limit to fill before cancelling.
+# Short TTL = miss more entries but stay fresh on edge calc.
+MAKER_TTL_S = 5.0
+
+# Polling cadence for maker fill check. Kalshi limit is 20 reads/sec.
+MAKER_POLL_S = 0.5
 
 
 # Total wallet the bot is allowed to use.

@@ -19,7 +19,10 @@ import numpy as np
 
 from betbot.kalshi.book import SpotBook, KalshiBook
 
-# Ordered feature names — must match as_array() order exactly
+# Ordered feature names — must match as_array() order exactly.
+# NOTE: The 4 depth features at the end were added when WS feed launched.
+# Models trained before then have 13 features; models trained after have 17.
+# `model.json["feature_names"]` records what each saved model expects.
 FEATURE_NAMES = [
     "x_0",            # log(microprice_now / K)
     "x_5",            # log(microprice_{t-5s} / K)
@@ -34,6 +37,10 @@ FEATURE_NAMES = [
     "kalshi_lag_5s",  # yes_mid_now - yes_mid_{t-5s}
     "kalshi_lag_10s", # yes_mid_now - yes_mid_{t-10s}
     "kalshi_lag_30s", # yes_mid_now - yes_mid_{t-30s}
+    "yes_bid_size",   # contracts at best YES bid
+    "yes_ask_size",   # contracts at best YES ask (= best NO bid size)
+    "yes_depth_5c",   # total YES bid contracts within 5c of best
+    "no_depth_5c",    # total NO  bid contracts within 5c of best
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -71,6 +78,10 @@ class FeatureVec:
     kalshi_lag_5s:  float
     kalshi_lag_10s: float
     kalshi_lag_30s: float
+    yes_bid_size:   float
+    yes_ask_size:   float
+    yes_depth_5c:   float
+    no_depth_5c:    float
     complete: bool    # False during cold-start (ring buffer not warm yet)
 
     def as_array(self) -> np.ndarray:
@@ -79,6 +90,8 @@ class FeatureVec:
             self.tau_s, self.inv_sqrt_tau,
             self.kalshi_spread,
             self.kalshi_lag_5s, self.kalshi_lag_10s, self.kalshi_lag_30s,
+            self.yes_bid_size, self.yes_ask_size,
+            self.yes_depth_5c, self.no_depth_5c,
         ], dtype=np.float64)
 
 
@@ -119,6 +132,15 @@ def build_features(spot: SpotBook, kb: KalshiBook) -> Optional[FeatureVec]:
     kalshi_lag_10s = (kb.yes_mid - km10) if km10 is not None else 0.0
     kalshi_lag_30s = (kb.yes_mid - km30) if km30 is not None else 0.0
 
+    # ---- Depth features (zero if WS feed not in use) ----
+    yes_top, no_top = kb.top_n_levels(10)
+    yes_bid_size = yes_top[0][1] if yes_top else 0.0
+    yes_ask_size = no_top[0][1]  if no_top  else 0.0
+    yes_best     = yes_top[0][0] if yes_top else 0.0
+    no_best      = no_top[0][0]  if no_top  else 0.0
+    yes_depth_5c = sum(s for p, s in yes_top if p >= yes_best - 0.05) if yes_top else 0.0
+    no_depth_5c  = sum(s for p, s in no_top  if p >= no_best  - 0.05) if no_top  else 0.0
+
     # complete = ring buffer has at least 30s of real history
     complete = (mp30 is not None) and spot.ready and kb.ready
 
@@ -127,5 +149,7 @@ def build_features(spot: SpotBook, kb: KalshiBook) -> Optional[FeatureVec]:
         tau_s=tau, inv_sqrt_tau=inv_sqrt_tau,
         kalshi_spread=kalshi_spread,
         kalshi_lag_5s=kalshi_lag_5s, kalshi_lag_10s=kalshi_lag_10s, kalshi_lag_30s=kalshi_lag_30s,
+        yes_bid_size=yes_bid_size, yes_ask_size=yes_ask_size,
+        yes_depth_5c=yes_depth_5c, no_depth_5c=no_depth_5c,
         complete=complete,
     )

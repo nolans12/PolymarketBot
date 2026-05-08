@@ -124,30 +124,43 @@ class KalshiBook:
     # -- Book updates -------------------------------------------------------
 
     def apply_snapshot(self, yes_fp: list, no_fp: list) -> None:
-        self._yes_book = {float(p): float(s) for p, s in yes_fp}
-        self._no_book  = {float(p): float(s) for p, s in no_fp}
+        # Drop any zero/negative-size levels that come in the snapshot (Kalshi
+        # sometimes includes them); they'd otherwise stick as phantom levels.
+        self._yes_book = {float(p): float(s) for p, s in yes_fp if float(s) >= 1.0}
+        self._no_book  = {float(p): float(s) for p, s in no_fp  if float(s) >= 1.0}
         self._recompute()
 
     def apply_delta(self, side: str, price: float, delta: float) -> None:
         book = self._yes_book if side == "yes" else self._no_book
-        book[price] = book.get(price, 0.0) + delta
-        if book[price] <= 0:
+        new_size = book.get(price, 0.0) + delta
+        # Pop the level as soon as it falls below 1 contract (Kalshi rounding
+        # can leave tiny residues like 0.0001 that would never decay otherwise).
+        if new_size < 1.0:
             book.pop(price, None)
+        else:
+            book[price] = new_size
         self._recompute()
+
+    def _live_max(self, book: dict[float, float]) -> float:
+        """Highest price in the book that has >=1 live contract. 0.0 if empty."""
+        live_prices = [p for p, s in book.items() if s >= 1.0]
+        return max(live_prices) if live_prices else 0.0
 
     def _recompute(self) -> None:
         # Always stamp the update time — even if book is empty, we received data
         now_ns = time.time_ns()
         self.last_update_ns = now_ns
 
-        if not self._yes_book or not self._no_book:
+        yb = self._live_max(self._yes_book)
+        nb = self._live_max(self._no_book)
+        if yb <= 0 or nb <= 0:
             return
-        yb = max(self._yes_book)
-        ya = 1.0 - max(self._no_book)
+        ya = 1.0 - nb
         if ya < yb:
-            return   # genuinely crossed book — skip (equal spread is valid)
+            # Genuine cross or stale phantom — drop any sub-1c levels and retry once
+            return
         self.yes_bid = yb
-        self.yes_ask = max(ya, yb)  # never let ask go below bid
+        self.yes_ask = ya
         self.yes_mid = (self.yes_bid + self.yes_ask) / 2.0
         self.ready = True
 
@@ -207,13 +220,23 @@ class KalshiBook:
 
     @property
     def yes_depth(self) -> float:
-        """Total resting dollar size on the YES bid side."""
-        return sum(self._yes_book.values())
+        """Total live (>=1c) resting size on the YES bid side."""
+        return sum(s for s in self._yes_book.values() if s >= 1.0)
 
     @property
     def no_depth(self) -> float:
-        """Total resting dollar size on the NO bid side."""
-        return sum(self._no_book.values())
+        """Total live (>=1c) resting size on the NO bid side."""
+        return sum(s for s in self._no_book.values() if s >= 1.0)
+
+    def top_n_levels(self, n: int = 10) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Return (yes_top_n, no_top_n) as lists of (price, size) sorted best-first.
+        Each side is the top-of-book first. Levels with size < 1 are filtered out.
+        Returns empty lists if no live levels."""
+        yes_live = [(p, s) for p, s in self._yes_book.items() if s >= 1.0]
+        no_live  = [(p, s) for p, s in self._no_book.items()  if s >= 1.0]
+        yes_live.sort(key=lambda x: -x[0])   # YES bid: highest price first
+        no_live.sort(key=lambda x: -x[0])    # NO bid: highest price first
+        return yes_live[:n], no_live[:n]
 
     def stale_ms(self) -> int:
         if self.last_update_ns == 0:

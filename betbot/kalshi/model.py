@@ -307,8 +307,15 @@ class LGBMModel:
         scaler = self._scalers[horizon_idx]
         if mdl is None or scaler is None:
             return None
+        # Backwards compat: old models were trained on the first 13 features only.
+        # If the saved scaler expects fewer features than the current FeatureVec,
+        # truncate the input vector to match (drops the depth features at the tail).
+        n_expected = getattr(scaler, "n_features_in_", len(vec))
+        if n_expected < len(vec):
+            vec = vec[:n_expected]
+        names = FEATURE_NAMES[:len(vec)]
         x_scaled = scaler.transform([vec])[0]
-        x_df = _pd.DataFrame([x_scaled], columns=FEATURE_NAMES)
+        x_df = _pd.DataFrame([x_scaled], columns=names)
         # Suppress LightGBM's C++ stderr warnings (verbosity conflict) at the fd level
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         old_stderr = os.dup(2)

@@ -158,10 +158,28 @@ def tail_file(path: Path, pos: int) -> tuple[list[dict], int]:
     return rows, pos
 
 
-def read_last_tick(path: Path) -> dict | None:
-    """Read the last row of a ticks CSV and return as a dict. None if empty/missing."""
+def read_last_tick(run_dir: Path, asset: str) -> dict | None:
+    """Read the latest tick from parquet (preferred) or CSV (legacy).
+    Returns {'spot': ..., 'strike': ...} or None."""
+    parquet = run_dir / f"ticks_{asset}.parquet"
+    if parquet.exists():
+        try:
+            import pyarrow.parquet as pq
+            t = pq.read_table(parquet, columns=["btc_microprice", "floor_strike"])
+            if t.num_rows == 0:
+                return None
+            return {
+                "spot":   float(t.column("btc_microprice")[-1].as_py() or 0.0),
+                "strike": float(t.column("floor_strike")[-1].as_py() or 0.0),
+            }
+        except Exception:
+            return None
+
+    csv = run_dir / f"ticks_{asset}.csv"
+    if not csv.exists():
+        return None
     try:
-        with open(path, "rb") as f:
+        with open(csv, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             if size < 2:
@@ -176,8 +194,8 @@ def read_last_tick(path: Path) -> dict | None:
             if len(parts) < 12:
                 return None
             return {
-                "spot":   float(parts[2])  if parts[2]  else 0.0,  # btc_microprice
-                "strike": float(parts[10]) if parts[10] else 0.0,  # floor_strike
+                "spot":   float(parts[2])  if parts[2]  else 0.0,
+                "strike": float(parts[10]) if parts[10] else 0.0,
             }
     except Exception:
         return None
@@ -222,10 +240,9 @@ def main():
                 print(f"{DIM}  + tracking {asset}{RST}", flush=True)
                 print_status()
 
-        # Refresh spot prices from ticks_*.csv
+        # Refresh spot prices from ticks file (parquet preferred, csv fallback)
         for asset in list(asset_states):
-            tick_path = run_dir / f"ticks_{asset}.csv"
-            tick = read_last_tick(tick_path)
+            tick = read_last_tick(run_dir, asset)
             if tick:
                 asset_states[asset]["spot"]   = tick["spot"]
                 asset_states[asset]["strike"] = tick["strike"]

@@ -29,6 +29,7 @@ from betbot.kalshi.book import SpotBook, KalshiBook
 from betbot.kalshi.coinbase_feed import CoinbaseFeed
 from betbot.kalshi.binance_feed import BinanceFeed
 from betbot.kalshi.kalshi_rest_feed import KalshiRestFeed
+from betbot.kalshi.kalshi_ws_feed   import KalshiWsFeed
 from betbot.kalshi.scheduler import Scheduler, _discover_market
 from betbot.kalshi.config import (
     KALSHI_KEY_ID, SPOT_SOURCE,
@@ -73,6 +74,9 @@ def parse_args():
                    help="Hard cap on per-trade bet, fraction of per-asset wallet")
     p.add_argument("--daily-loss-pct", type=float, default=0.05,
                    help="Halt when realized loss exceeds this fraction of per-asset wallet")
+    p.add_argument("--rest", action="store_true",
+                   help="Use Kalshi REST 100ms polling instead of WebSocket. "
+                        "Default: WebSocket (lower latency).")
     p.add_argument("--model-file", type=str, default=None,
                    help="Path to a pre-trained model .pkl (from model_fits/). "
                         "Skips live warmup — bot trades from tick 1. "
@@ -128,7 +132,8 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
                       live_orders: bool, max_bet_pct: float,
                       daily_loss_pct: float,
                       spot_book: SpotBook,
-                      preloaded_model=None):
+                      preloaded_model=None,
+                      use_ws: bool = False):
     """
     Discover the active Kalshi market for one asset, wire up its
     KalshiBook + KalshiRestFeed + Scheduler, and return them.
@@ -160,10 +165,13 @@ async def setup_asset(asset: str, pk, wallet_per_asset: float,
 
     kb_book = KalshiBook()
     kb_book.set_window(ticker, floor_strike, close_time)
-    kalshi_feed = KalshiRestFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
+    if use_ws:
+        kalshi_feed = KalshiWsFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
+    else:
+        kalshi_feed = KalshiRestFeed(kb_book, key_id=KALSHI_KEY_ID, pk=pk)
 
     log_path  = run_dir / f"decisions_{asset}.jsonl"
-    tick_path = run_dir / f"ticks_{asset}.csv"
+    tick_path = run_dir / f"ticks_{asset}.parquet"
 
     if fresh and log_path.exists():
         log_path.unlink()
@@ -254,6 +262,7 @@ async def main():
         raise RuntimeError(f"Unknown SPOT_SOURCE: {SPOT_SOURCE!r}")
 
     # ---- Per-asset setup - all assets discover markets in parallel ----
+    use_ws = not args.rest
     results = await asyncio.gather(*[
         setup_asset(
             asset, pk, wallet_per_asset,
@@ -261,6 +270,7 @@ async def main():
             args.live_orders, args.max_bet_pct, args.daily_loss_pct,
             spot_books[asset],
             preloaded_model=preloaded_models[asset],
+            use_ws=use_ws,
         )
         for asset in assets
     ])
@@ -274,7 +284,8 @@ async def main():
     if not asset_configs:
         sys.exit("ERROR: no assets could be initialized.")
 
-    print(f"\n  Starting feeds ({SPOT_SOURCE} WS + {len(asset_configs)}x Kalshi REST)...\n",
+    kalshi_kind = "REST" if args.rest else "WS"
+    print(f"\n  Starting feeds ({SPOT_SOURCE} WS + {len(asset_configs)}x Kalshi {kalshi_kind})...\n",
           flush=True)
 
     try:

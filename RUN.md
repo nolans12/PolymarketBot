@@ -1,4 +1,4 @@
-# RUN.md - Running the Kalshi Lag-Arb Bot
+# RUN.md — Running the Kalshi Lag-Arb Bot
 
 ## Prerequisites
 
@@ -6,257 +6,244 @@
 .env file with:
   KALSHI_API_KEY_ID=<your key>
   KALSHI_PRIVATE_KEY_FILE=~/.kalshi/kalshi_rsa.pem
-  DRY_RUN=true
+  SPOT_SOURCE=binance        # or coinbase (US-legal, no VPN required)
 ```
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Verify auth works:
+Verify auth + WS feed both work:
 ```bash
 python scripts/test/check_kalshi_balance.py
+python scripts/test/watch_kalshi_ws.py             # live book, top-of-book sizes
+python scripts/test/test_trade.py                  # ~$1 round-trip taker test
+python scripts/test/test_trade_maker.py            # ~$1 round-trip maker entry test
 ```
 
 ---
 
-## Step 1 — Dry run (collect training data)
+## Pipeline overview
 
-Run the bot in dry mode for at least 24 hours. No real orders are placed. All ticks are saved to CSV.
+```
+1. COLLECT — 24h+ of fresh ticks via WebSocket (parquet + top-10 depth per side)
+2. TRAIN  — fit a LightGBM 17-feature model on those ticks
+3. BACKTEST — replay with realistic maker entry / taker exit fill model
+4. TUNE — sweep Kelly tier configs to maximize net P&L
+5. GO LIVE — bot uses maker entries (bid+1c, 5s TTL) and taker IOC exits
+```
+
+The bot writes parquet (`ticks_BTC.parquet`) with top-10 book depth on both
+sides — that depth feeds 4 new model features (`yes_bid_size`, `yes_ask_size`,
+`yes_depth_5c`, `no_depth_5c`) that the bot has access to live.
+
+---
+
+## Step 1 — Collect fresh data (dry run)
 
 ```bash
-# All 4 assets (recommended — more data, trains better models)
-python scripts/run/run_kalshi_bot.py --assets BTC ETH SOL XRP
+# Default: Binance WS spot + Kalshi WS book + parquet ticks with depth
+python scripts/run/run_kalshi_bot.py --assets BTC
 
-# BTC only
-python scripts/run/run_kalshi_bot.py
+# Multi-asset
+python scripts/run/run_kalshi_bot.py --assets BTC ETH SOL XRP
 ```
 
 Output is saved to `data/<YYYY-MM-DD_HH-MM-SS>_<ASSETS>/`:
-- `ticks_BTC.csv` — raw 1Hz ticks (spot + Kalshi book)
-- `decisions_BTC.jsonl` — decision log (all abstain, no model loaded)
+- `ticks_BTC.parquet` — 10Hz raw ticks with full top-10 book depth
+- `decisions_BTC.jsonl` — decision log (all abstain — no model loaded)
 
-**What you'll see:**
+**Storage**: ~80 MB per asset per 24h with snappy compression.
+
+Watch the bot in another terminal:
+```bash
+python scripts/watch_decisions.py
 ```
-=== Kalshi Lead-Lag Arbitrage Bot ===
-  Assets:     BTC, ETH, SOL, XRP
-  Mode: DRY RUN (data collection) -- no model loaded, bot will abstain.
-  [BTC] Ticker: KXBTC15M-26MAY071400-15  Strike: 97,500  Closes: 14:15:00 UTC
 
-[abstain] tau=720s  BTC-K=+$32  bid=0.510 ask=0.520  q_set=--- edge=---  model_not_loaded
+Live book sanity check:
+```bash
+python scripts/test/watch_kalshi_ws.py
 ```
 
 Stop after 24+ hours with `Ctrl+C`.
 
 ---
 
-## Step 1b — Merge runs (optional, multi-session)
-
-If you collected data across multiple dry run sessions, merge them before training.
-The merge groups by `window_ticker` (the actual 15-min market ID), sorts by `ts_ns`,
-and deduplicates. Gaps within a merged window are handled correctly — training
-automatically rejects samples whose future target falls across a gap.
-
-```bash
-# Interactive: select runs from a list
-python scripts/merge_runs.py
-
-# Specify directly
-python scripts/merge_runs.py --runs data/run1 data/run2 data/run3
-
-# Custom output name
-python scripts/merge_runs.py --runs data/run1 data/run2 --name week1
-```
-
-Output is saved to `data/merged_<name>/ticks_<ASSET>.csv`. Use that path in Step 2.
-
----
-
 ## Step 2 — Train model
 
-One model per asset. Run separately for each.
-
 ```bash
-# Interactive: prompts for run folder and asset
+# Interactive: prompts for run folder + asset
 python scripts/train_model.py
 
-# Specify run folder directly
-python scripts/train_model.py --run data/2026-05-07_00-00-00_BTC_ETH_SOL_XRP
-
-# Train on merged data
-python scripts/train_model.py --run data/merged_week1
-
-# List saved models
-python scripts/train_model.py --list
+# Direct
+python scripts/train_model.py --run data/2026-05-08_<run>_BTC --asset BTC
 ```
 
-Model is saved to `model_fits/<run>_<ASSET>_<date>/`:
-- `model.pkl` — the trained LightGBM model
-- `model.json` — metadata (R2 scores, feature names, horizons)
+Model is saved to `model_fits/<run>_<ASSET>_<date>/model.pkl` with metadata in
+`model.json`. Targets `R2_hld(10s) > 0.25` to be viable.
 
-**Expected output:**
-```
-Loading ticks from data/2026-05-07_BTC_ETH_SOL_XRP/ticks_BTC.csv...
-  12 windows  43200 ticks  (detected ~1.0 Hz)
-  Filtering: 42850 rows in [0.001, 0.999] yes_mid range
-  Building features [12/12  100%]  KXBTC15M-26MAY150000-00...
-  Multi-horizon samples: 41920  horizons: [5, 10, 15, 60]s
-  Fitting horizon 1/4 (h5s)...
-  Fitting horizon 2/4 (h10s)...
-  Fitting horizon 3/4 (h15s)...
-  Fitting horizon 4/4 (h60s)...
-  R2_hld(primary=10s): 0.347
-  Saved -> model_fits/2026-05-07_BTC_ETH_SOL_XRP_BTC_20260507_020000/model.pkl
-```
+The new feature set is 17 columns (13 lag/momentum + 4 depth):
 
-A model with `R2_hld > 0.25` on the 10s horizon is viable.
+| Feature | What it captures |
+|---|---|
+| `x_0` … `x_30` | log(microprice_lag / strike) at 0,5,10,15,20,25,30s lags |
+| `tau_s`, `inv_sqrt_tau` | seconds until window close, plus its inverse-sqrt |
+| `kalshi_spread` | yes_ask − yes_bid |
+| `kalshi_lag_5s/10s/30s` | yes_mid drift over the last 5s/10s/30s |
+| `yes_bid_size`, `yes_ask_size` | size at top YES bid and at top NO bid (= YES ask) |
+| `yes_depth_5c`, `no_depth_5c` | total contracts within 5c of best bid on each side |
 
 ---
 
-## Step 3 — Tune trading knobs
-
-Grid-sweeps Kelly tier configurations and exit thresholds on the held-out data to find the optimal config.
+## Step 3 — Backtest with realistic fills
 
 ```bash
-# Interactive: prompts for model dir and run folder
-python scripts/tune_trading_knobs.py
-
-# Specify both directly
-python scripts/tune_trading_knobs.py \
-  --model-file model_fits/2026-05-07_BTC_ETH_SOL_XRP_BTC_20260507_020000/model.pkl \
-  --run data/2026-05-07_00-00-00_BTC_ETH_SOL_XRP
+python scripts/backtest.py \
+  --run data/<run> \
+  --asset BTC \
+  --model-file model_fits/<dir>/model.pkl
 ```
 
-**Expected output:**
-```
-Running sweep...
-  Top results by Sharpe:
-  Tier config         exit    hold_s    n   win%     pnl    sharpe
-  conservative_lo    0.005      60    120   62%   +0.840    +2.341
+The new backtest models the actual Kalshi maker workflow:
 
-  Suggested config.py snippet:
-  KELLY_TIERS = [(0.10, 0.03), (0.06, 0.02)]
-  LAG_CLOSE_THRESHOLD = 0.005
-  MAX_HOLD_S = 60
-```
+| Stage | What it does |
+|---|---|
+| **Entry decision** | Same as live bot — model edge clears a Kelly floor |
+| **Maker post** | Posts a resting limit at `bid + 1c` |
+| **Maker fill** | Conservative: fills only if the live ask drops to ≤ post price within `MAKER_TTL_S` (5s). If TTL expires unfilled, no trade is taken. |
+| **Exit triggers** | `exit_lag_closed` (edge ≤ 0.005) > `exit_stopped` > `exit_max_hold` (15s) > `fallback_resolution` (tau < 60s) |
+| **Taker exit** | Sweeps current bid as IOC; proceeds = `count − taker_fill_cost` per Kalshi reciprocal pricing. Real taker fee = `0.07 × p × (1 − p) × count` |
+| **P&L** | Per-trade: `gross = contracts × (exit − entry)`, `fees = taker_fee(exit) × contracts`, `net = gross − fees` |
 
-Apply the suggested snippet to `betbot/kalshi/config.py`, then verify with Step 4.
-
----
-
-## Step 4 — Full simulation
-
-Replays all data with the trained model and tuned config to verify end-to-end performance.
-
-```bash
-# Interactive: prompts for model and run folder
-python scripts/test_all.py
-
-# Specify directly
-python scripts/test_all.py \
-  --model-file model_fits/2026-05-07_BTC_ETH_SOL_XRP_BTC_20260507_020000/model.pkl \
-  --run data/2026-05-07_00-00-00_BTC_ETH_SOL_XRP
-```
-
-Output: 4-panel chart showing:
-1. YES price + entry/exit markers
-2. Cumulative P&L
-3. Edge over time with Kelly tier floors
-4. q_settled vs P&L scatter
+Output: total trades, win rate, gross/fees/net P&L, breakdown by exit reason and Kelly tier.
 
 **Advance to live trading when all hold:**
-- R2_hld (10s horizon) > 0.25
+- `R2_hld(10s) > 0.25`
 - Net P&L positive after fees
 - Win rate > 50%
-- > 50% of exits are `lag_closed`
-- Avg hold time 15–90s
+- > 50% of exits are `exit_lag_closed`
+- Avg hold time 5–15s
 
 ---
 
-## Step 5 — Live trading
+## Step 4 — Tune Kelly tiers
+
+```bash
+python scripts/tune.py \
+  --run data/<run> \
+  --asset BTC \
+  --model-file model_fits/<dir>/model.pkl
+```
+
+Sweeps tier `(edge_floor, wallet_fraction)` configurations through the same
+realistic backtest. Prints the top-N configs by net P&L plus a copy-pasteable
+snippet for `betbot/kalshi/config.py`:
+
+```
+=== Best configuration — paste into config.py ===
+
+KELLY_TIERS = [
+    (0.10, 0.06),
+    (0.06, 0.04),
+    (0.03, 0.02),
+]
+
+  Net P&L: $+12.45  Trades: 87  Wins: 53
+```
+
+Apply the snippet, then re-run `backtest.py` to confirm the new tiers.
+
+---
+
+## Step 5 — Go live
 
 ```bash
 # Single asset
 python scripts/run/run_kalshi_bot.py \
-  --model-file model_fits/<dir>/model.pkl \
-  --live-orders
+  --assets BTC \
+  --live-orders \
+  --model-file model_fits/<dir>/model.pkl
 
 # Multi-asset with per-asset models
 python scripts/run/run_kalshi_bot.py \
-  --assets BTC ETH SOL XRP \
-  --model-file BTC=model_fits/btc_dir/model.pkl,ETH=model_fits/eth_dir/model.pkl \
-  --live-orders
+  --assets BTC ETH SOL \
+  --live-orders \
+  --model-file BTC=model_fits/btc/model.pkl,ETH=model_fits/eth/model.pkl,SOL=model_fits/sol/model.pkl
 
 # Cap bet size and daily loss
 python scripts/run/run_kalshi_bot.py \
-  --model-file model_fits/<dir>/model.pkl \
+  --assets BTC \
   --live-orders \
+  --model-file model_fits/<dir>/model.pkl \
   --max-bet-pct 0.05 \
   --daily-loss-pct 0.03
 ```
 
-**What you'll see:**
-```
-  Mode: PRELOADED MODEL -- bot trades from tick 1, no warmup needed
+**Bot defaults (set in `betbot/kalshi/config.py`):**
 
-[entry      ] tau=580s  BTC-K=+$32  bid=0.510 ask=0.520  q_set=0.591 edge=0.052
-  [LIVE ENTRY] side=yes filled=5@52c =$2.60 edge=0.052 tier=2
+| Knob | Default | Meaning |
+|---|---|---|
+| `ENTRY_MODE` | `maker` | post resting limit, wait for fill |
+| `MAKER_AT_BID_PLUS_1` | `True` | post at bid+1c (faster fills than at bid) |
+| `MAKER_TTL_S` | `5.0` | cancel if not filled in 5s |
+| `MAX_HOLD_S` | `15` | force-exit after 15s |
+| `LAG_CLOSE_THRESHOLD` | `0.005` | exit when edge compresses below 0.5c |
+| `WALLET_BALANCE` | `100.0` | wallet cap (real balance can be higher) |
+| `SIZE_MAX_USD` | `2.0` | per-order ceiling |
 
-[exit_lag_closed] tau=560s  BTC-K=+$28  bid=0.572 ask=0.582  q_set=0.576 edge=0.002
-  [LIVE EXIT] entry=0.520 exit=0.572 pnl=+0.24 USD hold=20s
+**What the live bot does on every entry:**
+
 ```
+*** MAKER ENTRY [BTC] YES  3/3 @ $0.485  cost=$1.46  edge=0.072  tier=2  tau=620s ***
+*** LIVE EXIT [BTC] exit_lag_closed  YES  entry=0.485 → exit=0.518  pnl=+$0.08  hold=8s ***
+```
+
+If the maker post doesn't fill within 5s, you'll see the bot back off and the
+watcher logs an `entry_unfilled` abstain. No money was committed.
+
+**Watch the bot live:**
+```bash
+python scripts/watch_decisions.py
+```
+
+Status bar: live spot price, Δ-from-strike, edge, position, bid/ask, tau.
+Events: BUY/EXIT lines color-coded by outcome.
 
 ---
 
-## Analysis tools
+## Diagnostics
 
-```bash
-# Animated replay of a 15-min window with multi-horizon model projections
-# LEFT axis: Kalshi YES bid/ask + model projections at t+5s/10s/15s/60s
-# RIGHT axis: BTC microprice − strike (centered near zero)
-python scripts/replay_window.py --model-file model_fits/<dir>/model.pkl
-python scripts/replay_window.py --model-file model_fits/<dir>/model.pkl --speed 3 --trail 60
-python scripts/replay_window.py --model-file model_fits/<dir>/model.pkl --window KXBTC15M-26MAY070200-00
-
-# Visualize decisions log from a completed run
-python scripts/analysis/analyze_run.py
-
-# Live scrolling chart while bot is running
-python scripts/analysis/live_plot.py
-```
+| Script | Purpose |
+|---|---|
+| `scripts/test/check_kalshi_balance.py` | auth + balance smoke check |
+| `scripts/test/watch_kalshi_ws.py` | standalone WS book viewer with depth |
+| `scripts/test/test_trade.py` | $1 taker round-trip via WS |
+| `scripts/test/test_trade_maker.py` | $1 maker entry / taker exit round-trip via WS |
+| `scripts/watch_decisions.py` | tail decisions log + live status bar |
+| `scripts/analysis/analyze_run.py` | post-run charts (price, edge, P&L, abstains) |
+| `scripts/analysis/live_plot.py` | rolling chart while bot is running |
 
 ---
 
 ## Health check
 
 | Metric | Healthy | Bad |
-|--------|---------|-----|
-| R2_hld (10s horizon) | > 0.25 | < 0.10 |
-| Net P&L (simulation) | positive | negative |
+|---|---|---|
+| `R2_hld(10s)` | > 0.25 | < 0.10 |
+| Net P&L (backtest) | positive | negative |
 | Win rate | > 50% | < 40% |
-| % exits lag_closed | > 50% | < 30% |
-| Avg hold time | 15–90s | > 120s or < 5s |
+| % exits `lag_closed` | > 50% | < 30% |
+| Avg hold | 5–15s | > 30s or < 2s |
+| Maker fill rate | > 30% | < 10% |
 
----
-
-## Useful PowerShell one-liners
-
-```powershell
-# Count ticks collected
-(Get-Content data\<run>\ticks_BTC.csv | Measure-Object -Line).Lines
-
-# Watch decisions live
-Get-Content data\<run>\decisions_BTC.jsonl -Wait -Tail 5
-
-# Count entries only
-Select-String '"event":"entry"' data\<run>\decisions_BTC.jsonl | Measure-Object
-
-# Count abstains
-Select-String '"event":"abstain"' data\<run>\decisions_BTC.jsonl | Measure-Object
-```
+If maker fill rate is too low, raise `MAKER_AT_BID_PLUS_1` confidence (already
+on by default) or extend `MAKER_TTL_S`. If it's too high, the entry edge
+threshold is too generous — re-tune.
 
 ---
 
 ## Stop
 
 `Ctrl+C` — drains gracefully, prints `Bot stopped.` and the run folder path.
+Any open positions on Kalshi will NOT be force-closed automatically — check
+the Kalshi UI manually if a window is mid-trade when you stop.

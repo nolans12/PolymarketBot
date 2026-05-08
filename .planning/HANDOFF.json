@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-08T06:09:54.741Z",
+  "timestamp": "2026-05-08T07:19:12.694Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -26,15 +26,27 @@
     },
     {
       "status": "M",
+      "path": "CLAUDE.md"
+    },
+    {
+      "status": "M",
+      "path": "README.md"
+    },
+    {
+      "status": "M",
       "path": "RUN.md"
     },
     {
       "status": "M",
-      "path": "betbot/kalshi/coinbase_feed.py"
+      "path": "betbot/kalshi/book.py"
     },
     {
       "status": "M",
       "path": "betbot/kalshi/config.py"
+    },
+    {
+      "status": "M",
+      "path": "betbot/kalshi/features.py"
     },
     {
       "status": "M",
@@ -50,6 +62,10 @@
     },
     {
       "status": "M",
+      "path": "betbot/kalshi/tick_logger.py"
+    },
+    {
+      "status": "M",
       "path": "scripts/run/run_kalshi_bot.py"
     },
     {
@@ -58,29 +74,49 @@
     },
     {
       "status": "M",
-      "path": "scripts/test_all.py"
-    },
-    {
-      "status": "M",
       "path": "scripts/train_model.py"
     },
     {
       "status": "M",
-      "path": "scripts/tune_trading_knobs.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/merge_runs.py"
-    },
-    {
-      "status": "??",
       "path": "scripts/watch_decisions.py"
     },
     {
       "status": "??",
-      "path": "scripts/window_replay.py"
+      "path": "betbot/kalshi/kalshi_ws_feed.py"
+    },
+    {
+      "status": "??",
+      "path": "\"body\\357\\200\\272\""
+    },
+    {
+      "status": "??",
+      "path": "scripts/__init__.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/analysis/__init__.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/analysis/tick_loader.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/backtest.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/test/test_trade_maker.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/test/watch_kalshi_ws.py"
+    },
+    {
+      "status": "??",
+      "path": "scripts/tune.py"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\n7741d00 update\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work\n0ca5ba0 before changing model\n285a6c7 multi assets"
+  "context_notes": "Recent commits:\nf036622 pre websocket\n7741d00 update\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work\n0ca5ba0 before changing model"
 }
