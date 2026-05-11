@@ -26,12 +26,20 @@ python scripts/test/test_trade_maker.py            # ~$1 round-trip maker entry 
 ## Pipeline overview
 
 ```
-1. COLLECT — 24h+ of fresh ticks via WebSocket (parquet + top-10 depth per side)
-2. TRAIN  — fit a LightGBM 17-feature model on those ticks
-3. BACKTEST — replay with realistic maker entry / taker exit fill model
-4. TUNE — sweep Kelly tier configs to maximize net P&L
-5. GO LIVE — bot uses maker entries (bid+1c, 5s TTL) and taker IOC exits
+1. COLLECT  — 24h+ of fresh ticks via WebSocket (parquet + top-10 depth per side)
+2. TRAIN    — fit a LightGBM 17-feature model on those ticks
+3. TUNE     — sweep Kelly tier configs through the realistic backtest;
+              paste the winning KELLY_TIERS into config.py
+4. BACKTEST — re-run with the tuned config to confirm net P&L / win rate /
+              exit-reason distribution before risking real money
+5. GO LIVE  — bot uses maker entries (bid+1c, 5s TTL) and taker IOC exits
 ```
+
+**Tune before backtest:** `backtest.py` reads `KELLY_TIERS` from `config.py` at
+runtime, so running it before tuning gives you a meaningless number tied to
+whatever the current tier config happens to be. `tune.py` already runs the
+backtest internally for every candidate config — it just sweeps and reports
+the best one.
 
 The bot writes parquet (`ticks_BTC.parquet`) with top-10 book depth on both
 sides — that depth feeds 4 new model features (`yes_bid_size`, `yes_ask_size`,
@@ -95,7 +103,44 @@ The new feature set is 17 columns (13 lag/momentum + 4 depth):
 
 ---
 
-## Step 3 — Backtest with realistic fills
+## Step 3 — Tune Kelly tiers
+
+Run this **before** the standalone backtest. The tuner sweeps every
+`(edge_floor, wallet_fraction)` configuration through the exact same backtest
+engine that `backtest.py` uses, so it's the right tool for *finding* the
+config. `backtest.py` is the right tool for *confirming* the chosen config.
+
+```bash
+python scripts/tune.py \
+  --run data/<run> \
+  --asset BTC \
+  --model-file model_fits/<dir>/model.pkl
+```
+
+Prints the top-N configs by net P&L plus a copy-pasteable snippet for
+`betbot/kalshi/config.py`:
+
+```
+=== Best configuration — paste into config.py ===
+
+KELLY_TIERS = [
+    (0.10, 0.06),
+    (0.06, 0.04),
+    (0.03, 0.02),
+]
+
+  Net P&L: $+12.45  Trades: 87  Wins: 53
+```
+
+Paste the snippet into `betbot/kalshi/config.py` (replace the existing
+`KELLY_TIERS`), then move to Step 4.
+
+---
+
+## Step 4 — Backtest the tuned config
+
+Now that `KELLY_TIERS` reflects the tuner's choice, this gives you the full
+per-trade picture:
 
 ```bash
 python scripts/backtest.py \
@@ -104,7 +149,7 @@ python scripts/backtest.py \
   --model-file model_fits/<dir>/model.pkl
 ```
 
-The new backtest models the actual Kalshi maker workflow:
+The backtest models the actual Kalshi maker workflow:
 
 | Stage | What it does |
 |---|---|
@@ -123,35 +168,6 @@ Output: total trades, win rate, gross/fees/net P&L, breakdown by exit reason and
 - Win rate > 50%
 - > 50% of exits are `exit_lag_closed`
 - Avg hold time 5–15s
-
----
-
-## Step 4 — Tune Kelly tiers
-
-```bash
-python scripts/tune.py \
-  --run data/<run> \
-  --asset BTC \
-  --model-file model_fits/<dir>/model.pkl
-```
-
-Sweeps tier `(edge_floor, wallet_fraction)` configurations through the same
-realistic backtest. Prints the top-N configs by net P&L plus a copy-pasteable
-snippet for `betbot/kalshi/config.py`:
-
-```
-=== Best configuration — paste into config.py ===
-
-KELLY_TIERS = [
-    (0.10, 0.06),
-    (0.06, 0.04),
-    (0.03, 0.02),
-]
-
-  Net P&L: $+12.45  Trades: 87  Wins: 53
-```
-
-Apply the snippet, then re-run `backtest.py` to confirm the new tiers.
 
 ---
 

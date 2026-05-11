@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-08T07:19:12.694Z",
+  "timestamp": "2026-05-11T07:33:33.048Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -38,27 +38,7 @@
     },
     {
       "status": "M",
-      "path": "betbot/kalshi/book.py"
-    },
-    {
-      "status": "M",
       "path": "betbot/kalshi/config.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/features.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/model.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/orders.py"
-    },
-    {
-      "status": "M",
-      "path": "betbot/kalshi/scheduler.py"
     },
     {
       "status": "M",
@@ -66,57 +46,21 @@
     },
     {
       "status": "M",
-      "path": "scripts/run/run_kalshi_bot.py"
-    },
-    {
-      "status": "M",
-      "path": "scripts/test/test_trade.py"
-    },
-    {
-      "status": "M",
-      "path": "scripts/train_model.py"
-    },
-    {
-      "status": "M",
-      "path": "scripts/watch_decisions.py"
-    },
-    {
-      "status": "??",
-      "path": "betbot/kalshi/kalshi_ws_feed.py"
-    },
-    {
-      "status": "??",
-      "path": "\"body\\357\\200\\272\""
-    },
-    {
-      "status": "??",
-      "path": "scripts/__init__.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/analysis/__init__.py"
-    },
-    {
-      "status": "??",
       "path": "scripts/analysis/tick_loader.py"
     },
     {
-      "status": "??",
+      "status": "M",
       "path": "scripts/backtest.py"
     },
     {
-      "status": "??",
-      "path": "scripts/test/test_trade_maker.py"
-    },
-    {
-      "status": "??",
-      "path": "scripts/test/watch_kalshi_ws.py"
-    },
-    {
-      "status": "??",
+      "status": "M",
       "path": "scripts/tune.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/window_replay.py"
     }
   ],
   "next_action": null,
-  "context_notes": "Recent commits:\nf036622 pre websocket\n7741d00 update\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work\n0ca5ba0 before changing model"
+  "context_notes": "Recent commits:\n16ddb98 update for dry test\nf036622 pre websocket\n7741d00 update\n03619cb Merge pull request #1 from nolans12/kalshi\n66cc5d5 I think this will work"
 }

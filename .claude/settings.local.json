@@ -71,7 +71,9 @@
       "WebFetch(domain:github.com)",
       "Bash(python3 -c \"import pyarrow; print\\('pyarrow', pyarrow.__version__\\)\")",
       "Bash(python3 -c \"import pandas; print\\('pandas', pandas.__version__\\)\")",
-      "WebFetch(domain:news.kalshi.com)"
+      "WebFetch(domain:news.kalshi.com)",
+      "Bash(xxd)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'.'\\); from scripts.tune import main; print\\('tune OK'\\)\")"
     ]
   }
 }

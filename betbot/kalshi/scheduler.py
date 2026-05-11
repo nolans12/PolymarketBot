@@ -589,11 +589,15 @@ class Scheduler:
         if pos is None or model is None:
             return
 
+        # For exit decision, edge = (predicted future bid) - (what we'd sell at NOW).
+        # We already own the position — the entry price is sunk. The question is
+        # "is there still room left between current bid and where the model says
+        # the bid is heading?" If yes_bid has caught up to q_set, exit.
         if pos.side == "yes":
-            edge_now   = q_set - yes_ask
+            edge_now   = q_set - yes_bid                       # YES exit = sell at bid
             exit_price = yes_bid
         else:
-            edge_now   = (1.0 - q_set) - (1.0 - yes_bid)
+            edge_now   = (1.0 - q_set) - (1.0 - yes_ask)       # NO exit = sell NO at 1-yes_ask
             exit_price = 1.0 - yes_ask
 
         reason = None

@@ -67,14 +67,14 @@ model_fits/<run>_<ASSET>_<date>/        saved trained models (gitignored)
 2. TRAIN — fit a 17-feature LightGBM model:
      python scripts/train_model.py --run data/<run> --asset BTC
 
-3. BACKTEST — realistic maker-entry / taker-exit fill model:
-     python scripts/backtest.py --run data/<run> --asset BTC \
-       --model-file model_fits/<dir>/model.pkl
-
-4. TUNE — sweep Kelly tier (edge_floor, wallet_fraction) configurations:
+3. TUNE — sweep Kelly tier (edge_floor, wallet_fraction) configurations:
      python scripts/tune.py --run data/<run> --asset BTC \
        --model-file model_fits/<dir>/model.pkl
    Paste the suggested KELLY_TIERS into config.py.
+
+4. BACKTEST — confirm the tuned config (realistic maker/taker fill model):
+     python scripts/backtest.py --run data/<run> --asset BTC \
+       --model-file model_fits/<dir>/model.pkl
 
 5. GO LIVE:
      python scripts/run/run_kalshi_bot.py --assets BTC --live-orders \

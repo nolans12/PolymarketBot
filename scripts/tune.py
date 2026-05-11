@@ -45,6 +45,11 @@ def main():
     ap.add_argument("--wallet", type=float, default=1000.0)
     ap.add_argument("--top", type=int, default=10,
                     help="show top-N configurations by net P&L")
+    ap.add_argument("--max-windows", type=int, default=80,
+                    help="cap on number of windows to evaluate per config "
+                         "(default 80; pass 0 for all). With 100+ configs in "
+                         "the sweep this matters a lot — 80 windows is plenty "
+                         "to pick good tiers.")
     args = ap.parse_args()
 
     run_dir    = pick_run_folder(cli_arg=args.run, title="Select run to tune on")
@@ -61,6 +66,15 @@ def main():
     if not windows:
         sys.exit("  no tick data")
     print(f"  {len(windows)} windows  {sum(len(rs) for rs in windows.values())} ticks")
+
+    # Subsample windows so the sweep finishes in reasonable time
+    window_items = [(k, v) for k, v in windows.items() if len(v) >= 60]
+    if args.max_windows and args.max_windows > 0 and len(window_items) > args.max_windows:
+        # Take a stratified sample (evenly spaced) for variety
+        step = len(window_items) // args.max_windows
+        window_items = window_items[::step][:args.max_windows]
+        print(f"  Sampled {len(window_items)} windows for the sweep "
+              f"(use --max-windows 0 to use all)")
 
     print(f"Loading model from {model_path}...")
     model = load_model(str(model_path))
@@ -79,14 +93,15 @@ def main():
             ])
     print(f"  Sweeping {len(configs)} tier configurations...")
 
+    import time
     results = []
+    t0 = time.monotonic()
+    last_report = t0
     for i, tiers in enumerate(configs, 1):
         # Patch config.KELLY_TIERS in place — backtest reads it dynamically
         cfg.KELLY_TIERS[:] = tiers
         all_trades: list[Trade] = []
-        for window_ticker, rows in windows.items():
-            if len(rows) < 60:
-                continue
+        for window_ticker, rows in window_items:
             all_trades.extend(backtest_window(rows, window_ticker, asset, model, args.wallet))
 
         n = len(all_trades)
@@ -98,8 +113,14 @@ def main():
             "tiers": tiers, "trades": n, "wins": wins, "net": net,
             "win_rate": wins / n,
         })
-        if i % 25 == 0:
-            print(f"  ... {i}/{len(configs)} configs evaluated", flush=True)
+        now = time.monotonic()
+        if now - last_report >= 10.0:
+            pct = 100 * i / len(configs)
+            rate = i / (now - t0) if now > t0 else 0
+            eta = (len(configs) - i) / rate if rate > 0 else 0
+            print(f"  ... {i}/{len(configs)} configs ({pct:.0f}%)  "
+                  f"ETA {eta:.0f}s", flush=True)
+            last_report = now
 
     if not results:
         sys.exit("  no configurations produced any trades")

@@ -198,6 +198,11 @@ class Trade:
     tier:         int
 
 
+# Match live bot: decision tick every 500ms = every 5th sampler tick at 10Hz.
+# Cuts feature builds + model predictions 5x without changing fidelity.
+DECISION_EVERY_N_TICKS = 5
+
+
 def compute_exit(
     rows: list[dict], fill_idx: int, side: str, contracts: int,
     entry_price: float, q_set_at_entry: float, model,
@@ -214,7 +219,8 @@ def compute_exit(
     """
     fill_ts = rows[fill_idx]["ts_ns"]
 
-    for j in range(fill_idx + 1, len(rows)):
+    # Match live bot: re-check exit conditions every 500ms (every 5th tick at 10Hz)
+    for j in range(fill_idx + 1, len(rows), DECISION_EVERY_N_TICKS):
         r = rows[j]
         hold_s = (r["ts_ns"] - fill_ts) / 1e9
         tau    = r["tau_s"]
@@ -231,11 +237,13 @@ def compute_exit(
         except Exception:
             continue
 
+        # Exit-side edge: how much room is left between current sell price (bid)
+        # and where the model thinks it's heading. Matches scheduler.py.
         if side == "yes":
-            edge_now   = q_now - r["yes_ask"]
-            exit_price = r["yes_bid"]   # sell into the bid as taker
+            edge_now   = q_now - r["yes_bid"]
+            exit_price = r["yes_bid"]
         else:
-            edge_now   = (1.0 - q_now) - (1.0 - r["yes_bid"])
+            edge_now   = (1.0 - q_now) - (1.0 - r["yes_ask"])
             exit_price = 1.0 - r["yes_ask"]
 
         # Triggers (priority: lag close > stop > max hold > fallback)
@@ -282,7 +290,7 @@ def backtest_window(rows: list[dict], window: str, asset: str,
     last_entry_ts_ns = 0
     open_until_idx = -1  # don't enter while a previous trade is still "open"
 
-    for i in range(len(rows)):
+    for i in range(0, len(rows), DECISION_EVERY_N_TICKS):
         r = rows[i]
 
         # Don't double-enter while a previous position is still open
@@ -387,13 +395,27 @@ def run_backtest(run_dir: Path, asset: str, model_path: Path, wallet_usd: float 
     model = load_model(str(model_path))
     print(f"  R2_hld={model.r2_held_out:.3f}")
 
+    import time
     all_trades: list[Trade] = []
-    for window_ticker, rows in windows.items():
+    n_windows = len(windows)
+    t0 = time.monotonic()
+    last_report = t0
+    for w_idx, (window_ticker, rows) in enumerate(windows.items(), 1):
         if len(rows) < 60:
             continue
         ts = backtest_window(rows, window_ticker, asset, model, wallet_usd)
         all_trades.extend(ts)
+        now = time.monotonic()
+        if now - last_report >= 5.0 or w_idx == n_windows:
+            pct = 100 * w_idx / n_windows
+            rate = w_idx / (now - t0) if now > t0 else 0
+            eta = (n_windows - w_idx) / rate if rate > 0 else 0
+            print(f"    window {w_idx}/{n_windows} ({pct:.0f}%)  "
+                  f"{rate:.1f} win/s  ETA {eta:.0f}s  "
+                  f"trades so far: {len(all_trades)}", flush=True)
+            last_report = now
 
+    print(f"  backtest done in {time.monotonic()-t0:.0f}s — {len(all_trades)} trades")
     return all_trades
 
 

@@ -23,12 +23,13 @@ doesn't matter, only whether Kalshi catches up before the window closes.
 2. TRAIN    — Fit a 17-feature LightGBM model (13 lag/momentum + 4 depth).
               python scripts/train_model.py --run data/<run> --asset BTC
 
-3. BACKTEST — Realistic maker-entry / taker-exit fill model on the saved ticks.
-              python scripts/backtest.py --run data/<run> --asset BTC \
+3. TUNE     — Sweep Kelly tier (edge_floor, wallet_fraction) configs and
+              paste the winning KELLY_TIERS into config.py.
+              python scripts/tune.py --run data/<run> --asset BTC \
                 --model-file model_fits/<dir>/model.pkl
 
-4. TUNE     — Sweep Kelly tier (edge_floor, wallet_fraction) configs.
-              python scripts/tune.py --run data/<run> --asset BTC \
+4. BACKTEST — Confirm the tuned config: full per-trade P&L, exit reasons.
+              python scripts/backtest.py --run data/<run> --asset BTC \
                 --model-file model_fits/<dir>/model.pkl
 
 5. GO LIVE  — Static model, trades from tick 1 with the tuned tiers.

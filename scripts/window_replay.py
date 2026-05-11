@@ -57,26 +57,8 @@ _HORIZON_COLORS = ["#2ecc71", "#e67e22", "#e74c3c", "#9b59b6"]
 # ---------------------------------------------------------------------------
 
 def load_ticks(path: Path) -> dict[str, list[dict]]:
-    windows: dict[str, list[dict]] = defaultdict(list)
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            try:
-                windows[r["window_ticker"]].append({
-                    "ts_ns":     int(r["ts_ns"]),
-                    "tau_s":     float(r["tau_s"]),
-                    "btc_micro": float(r["btc_microprice"]),
-                    "yes_bid":   float(r["yes_bid"]),
-                    "yes_ask":   float(r["yes_ask"]),
-                    "yes_mid":   float(r["yes_mid"]),
-                    "K":         float(r["floor_strike"]),
-                    "window_ticker": r["window_ticker"],
-                })
-            except (KeyError, ValueError):
-                pass
-    for rows in windows.values():
-        rows.sort(key=lambda r: r["ts_ns"])
-    return windows
+    from analysis.tick_loader import load_ticks as _load
+    return _load(path)
 
 
 def build_feature_row(rows: list[dict], idx: int) -> np.ndarray | None:
@@ -127,12 +109,24 @@ def build_feature_row(rows: list[dict], idx: int) -> np.ndarray | None:
     km10 = lagged_ym(10_000_000_000)
     km30 = lagged_ym(30_000_000_000)
 
+    # Depth features (zero on legacy CSV ticks that lack them)
+    yes_book = r.get("yes_book") or []
+    no_book  = r.get("no_book")  or []
+    yes_bid_size = yes_book[0][1] if yes_book else 0.0
+    yes_ask_size = no_book[0][1]  if no_book  else 0.0
+    yes_best     = yes_book[0][0] if yes_book else 0.0
+    no_best      = no_book[0][0]  if no_book  else 0.0
+    yes_depth_5c = sum(s for p, s in yes_book if p >= yes_best - 0.05) if yes_book else 0.0
+    no_depth_5c  = sum(s for p, s in no_book  if p >= no_best  - 0.05) if no_book  else 0.0
+
     return np.array([
         x_0, x_5, x_10, x_15, x_20, x_25, x_30,
         tau, inv_sqrt_tau, spread,
         r["yes_mid"] - km5,
         r["yes_mid"] - km10,
         r["yes_mid"] - km30,
+        yes_bid_size, yes_ask_size,
+        yes_depth_5c, no_depth_5c,
     ], dtype=np.float64)
 
 
@@ -378,12 +372,13 @@ def main():
     horizons = model.horizons
     colors   = (_HORIZON_COLORS + ["gray"] * len(horizons))[:len(horizons)]
 
-    # --- Load ticks ---
+    # --- Load ticks (prefer parquet, fall back to csv) ---
     run_dir   = pick_run_folder(cli_arg=args.run, title="Select run to replay")
     asset     = args.asset.upper()
-    tick_path = run_dir / f"ticks_{asset}.csv"
-    if not tick_path.exists():
-        sys.exit(f"ERROR: {tick_path} not found.")
+    from analysis.tick_loader import find_ticks_path
+    tick_path = find_ticks_path(run_dir, asset)
+    if tick_path is None:
+        sys.exit(f"ERROR: no ticks_{asset}.parquet or .csv in {run_dir}")
 
     print(f"Loading ticks: {tick_path}", flush=True)
     all_windows = load_ticks(tick_path)
